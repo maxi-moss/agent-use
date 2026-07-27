@@ -1,0 +1,125 @@
+"""Claude Code hook client. `python -m broker.hook`.
+
+Import closure: stdlib + broker.protocol.constants ONLY (plan §1.3). This
+process starts on the synchronous permission path of every tool call in every
+supervised session — pydantic here would tax every single tool call.
+
+Invariants (spec constraints 11-12, §9.5 — binding):
+- stdout carries the PreToolUse allow-decision JSON or NOTHING. Never "deny",
+  never allow-by-default.
+- exit 0 on every path, including every exception. A dead broker degrades the
+  session to stock Claude Code; it never breaks one.
+- BROKER_SOCKET unset -> immediate silent no-op (the isolation gate).
+"""
+
+import json
+import os
+import socket
+import sys
+import uuid
+from typing import Any, cast
+
+from broker.protocol.constants import (
+    DECISION_ALLOW,
+    HOOK_WAIT_SECONDS,
+    MAX_LINE_BYTES,
+    PROTOCOL_VERSION,
+    T_HOOK_EVENT,
+    T_PERMISSION_REQUEST,
+)
+
+_ALLOW_OUTPUT = {
+    "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "permissionDecisionReason": "broker approved",
+    }
+}
+
+
+def _timeout_seconds() -> float:
+    try:
+        return float(os.environ["BROKER_HOOK_TIMEOUT"])
+    except (KeyError, ValueError):
+        return float(HOOK_WAIT_SECONDS)
+
+
+def _read_line(sock: socket.socket, timeout: float) -> bytes | None:
+    """Read one \\n-terminated reply line, capped at MAX_LINE_BYTES."""
+    sock.settimeout(timeout)
+    buf = b""
+    while b"\n" not in buf:
+        if len(buf) > MAX_LINE_BYTES:
+            return None
+        chunk = sock.recv(65536)
+        if not chunk:
+            return None
+        buf += chunk
+    return buf.split(b"\n", 1)[0]
+
+
+def main() -> None:
+    raw_payload: Any = json.load(sys.stdin)
+    if not isinstance(raw_payload, dict):
+        return
+    payload = cast(dict[str, Any], raw_payload)
+    sock_path = os.environ.get("BROKER_SOCKET")
+    if not sock_path:
+        return  # isolation gate (spec §4.1 step 6)
+
+    event = payload.get("hook_event_name")
+    timeout = _timeout_seconds()
+
+    if event == "PreToolUse":
+        envelope = {
+            "v": PROTOCOL_VERSION,
+            "id": uuid.uuid4().hex,
+            "type": T_PERMISSION_REQUEST,
+            "session_id": payload.get("session_id"),
+            "payload": {
+                "tool_name": payload.get("tool_name", ""),
+                "tool_input": payload.get("tool_input", {}),
+                "tool_use_id": payload.get("tool_use_id", ""),
+                "cwd": payload.get("cwd", ""),
+                "transcript_path": payload.get("transcript_path", ""),
+                "permission_mode": payload.get("permission_mode"),
+            },
+        }
+    else:
+        envelope = {
+            "v": PROTOCOL_VERSION,
+            "id": uuid.uuid4().hex,
+            "type": T_HOOK_EVENT,
+            "session_id": payload.get("session_id"),
+            "payload": {"hook_event_name": event, "raw": payload},
+        }
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        sock.connect(sock_path)
+        sock.sendall(json.dumps(envelope).encode() + b"\n")
+        if event != "PreToolUse":
+            return  # fire-and-forget
+
+        line = _read_line(sock, timeout)
+        if line is None:
+            return
+        raw_reply: Any = json.loads(line)
+        if not isinstance(raw_reply, dict):
+            return
+        raw_decision: Any = cast(dict[str, Any], raw_reply).get("payload")
+        if not isinstance(raw_decision, dict):
+            return
+        decision_payload = cast(dict[str, Any], raw_decision)
+        if decision_payload.get("decision") == DECISION_ALLOW:
+            # The ONE sanctioned stdout write. Anything but an explicit allow
+            # (escalated / malformed / timeout) prints nothing -> native flow.
+            print(json.dumps(_ALLOW_OUTPUT))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass  # ALWAYS — degradation, never breakage
+    sys.exit(0)
