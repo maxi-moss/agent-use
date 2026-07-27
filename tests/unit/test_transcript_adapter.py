@@ -1,0 +1,147 @@
+"""Adapter determinism + real-fixture behaviour (PRP Level 2 binding names)."""
+
+from pathlib import Path
+
+import pytest
+
+from broker.transcript.adapter import (
+    ReadReport,
+    read_cleaned,
+    read_cleaned_with_report,
+    render,
+)
+from broker.transcript.schemas import (
+    VALIDATED_AGAINST,
+    AskUserAnswer,
+    AskUserQuestion,
+    ExitPlanMode,
+    ExitPlanResult,
+)
+
+FIXTURES = Path(__file__).parent.parent / "fixtures" / "transcripts"
+
+MINIMAL_ASK = FIXTURES / "8753fe50-2884-4cb6-9728-ba9c1101b617.jsonl"
+ASK_VARIANTS = FIXTURES / "71a46971-27ec-40fc-8379-ff5351eddf90.jsonl"
+REJECTED_ASK = FIXTURES / "d4032982-9753-4cce-ac1a-589ee8fe7e19.jsonl"
+EXIT_PLAN = FIXTURES / "4f98b564-4f25-4a62-bee0-7808a82cd868.jsonl"
+MULTISELECT_ABSENT = FIXTURES / "3ec7ee94-4dd8-4e26-a8fa-6b047e3382e2.jsonl"
+APPROVED_PLAN_SYNTHETIC = FIXTURES / "approved-exit-plan.jsonl"
+
+READABLE_FIXTURES = [
+    MINIMAL_ASK,
+    ASK_VARIANTS,
+    REJECTED_ASK,
+    EXIT_PLAN,
+    MULTISELECT_ABSENT,
+    APPROVED_PLAN_SYNTHETIC,
+]
+
+
+@pytest.mark.parametrize("path", READABLE_FIXTURES, ids=lambda p: p.name)
+def test_double_read_is_equal(path: Path) -> None:
+    assert read_cleaned(path) == read_cleaned(path)
+
+
+@pytest.mark.parametrize("path", READABLE_FIXTURES, ids=lambda p: p.name)
+def test_render_is_byte_deterministic(path: Path) -> None:
+    events = read_cleaned(path)
+    first = render(events)
+    second = render(read_cleaned(path))
+    assert first.encode() == second.encode()
+
+
+def test_minimal_ask_user_question_answered() -> None:
+    events = read_cleaned(MINIMAL_ASK)
+    questions = [e for e in events if isinstance(e, AskUserQuestion)]
+    answers = [e for e in events if isinstance(e, AskUserAnswer)]
+    assert len(questions) == 2
+    assert len(answers) == 2
+    by_id = {a.id: a for a in answers}
+    answered = by_id[questions[0].id]
+    assert answered.rejected is False
+    assert 'answered: "Which database should this project use?"="PostgreSQL"' in (
+        answered.raw
+    )
+    # single-select question shape
+    assert questions[0].questions[0].multiSelect is False
+    assert [o.label for o in questions[0].questions[0].options] == [
+        "PostgreSQL",
+        "MySQL",
+    ]
+
+
+def test_rejected_ask_user_question_is_error_path() -> None:
+    events = read_cleaned(REJECTED_ASK)
+    answers = [e for e in events if isinstance(e, AskUserAnswer)]
+    assert len(answers) == 1
+    assert answers[0].rejected is True
+
+
+def test_ask_prose_variants_pass_through_verbatim() -> None:
+    """Multi-question batch and multiSelect comma-join answers arrive as raw prose."""
+    events = read_cleaned(ASK_VARIANTS)
+    questions = [e for e in events if isinstance(e, AskUserQuestion)]
+    answers = {a.id: a for a in events if isinstance(a, AskUserAnswer)}
+    assert len(questions) == 3
+    assert set(answers) == {q.id for q in questions}
+    raws = [answers[q.id].raw for q in questions]
+    # 2-question batch: two "q"="label" pairs joined by ", "
+    assert raws[0].count('"=') == 2
+    # multiSelect: several labels comma-joined inside one answer value
+    assert "Bundle + Claude Code skills (Recommended), Auto-capture" in raws[1]
+    # multiSelect 2-question batch
+    assert raws[2].count('"=') == 2
+    for raw in raws:
+        assert raw.startswith("Your questions have been answered: ")
+
+
+def test_multiselect_absent_defaults_false() -> None:
+    events = read_cleaned(MULTISELECT_ABSENT)
+    questions = [e for e in events if isinstance(e, AskUserQuestion)]
+    flags = [q.multiSelect for e in questions for q in e.questions]
+    assert False in flags  # at least one record lacked the key -> default
+
+
+def test_exit_plan_mode_inputs_and_rejected_results() -> None:
+    events = read_cleaned(EXIT_PLAN)
+    plans = [e for e in events if isinstance(e, ExitPlanMode)]
+    results = {r.id: r for r in events if isinstance(r, ExitPlanResult)}
+    assert len(plans) == 3
+    for plan in plans:
+        assert plan.plan  # non-empty plan text
+        assert plan.plan_file_path is not None
+        assert plan.plan_file_path.endswith(".md")
+        assert results[plan.id].rejected is True  # only rejected samples exist
+
+
+def test_approved_exit_plan_synthetic_fixture() -> None:
+    """SYNTHETIC shape — replaced by the Task 10 developer capture."""
+    events = read_cleaned(APPROVED_PLAN_SYNTHETIC)
+    results = [e for e in events if isinstance(e, ExitPlanResult)]
+    assert len(results) == 1
+    assert results[0].rejected is False
+
+
+def test_render_sections() -> None:
+    events = read_cleaned(MINIMAL_ASK)
+    rendered = render(events)
+    assert "## user\n" in rendered
+    assert "## assistant\n" in rendered
+    assert "## question (id=" in rendered
+    assert "## answer (id=" in rendered
+    assert "- PostgreSQL: " in rendered
+
+
+def test_version_collected_and_warning_shape() -> None:
+    _, report = read_cleaned_with_report(MINIMAL_ASK)
+    assert isinstance(report, ReadReport)
+    assert VALIDATED_AGAINST in report.versions
+    # this fixture is pure 2.1.220 -> no version warning
+    assert report.warnings == []
+
+
+def test_unknown_types_counted_not_fatal() -> None:
+    _, report = read_cleaned_with_report(MINIMAL_ASK)
+    assert report.unknown_types["ai-title"] > 0
+    assert "assistant" not in report.unknown_types
+    assert "user" not in report.unknown_types

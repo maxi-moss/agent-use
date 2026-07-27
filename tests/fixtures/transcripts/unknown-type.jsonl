@@ -1,0 +1,3 @@
+{"type": "future-thing", "version": "2.1.220", "payload": {"anything": 1}}
+{"type": "user", "version": "2.1.220", "isSidechain": false, "uuid": "u1", "origin": {"kind": "human"}, "promptSource": "typed", "message": {"role": "user", "content": "still parses"}}
+{"type": "assistant", "version": "2.1.220", "isSidechain": false, "uuid": "a1", "message": {"role": "assistant", "content": [{"type": "text", "text": "ack"}]}}
