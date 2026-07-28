@@ -26,6 +26,7 @@ from broker.master.registry import Registry, SessionRecord
 from broker.master.runtime import MasterRuntime, render_escalation
 from broker.protocol import client
 from broker.protocol.constants import (
+    SessionState,
     T_BUDGET_UPDATE,
     T_COMPLETION,
     T_DISPATCH_DECISION,
@@ -175,7 +176,7 @@ async def rt(
             socket_path=str(home / "s" / "s1.sock"),
             cwd="/private/tmp",
             anchor_pane="%1",
-            state="driving",
+            state=SessionState.DRIVING,
         )
     )
     posts: list[Any] = []
@@ -554,7 +555,7 @@ async def test_reactivate_relays_the_intent_and_supersedes_the_old_one(
 ) -> None:
     runtime, _ = rt
     record = runtime.registry.get("s1")
-    record.state = "completed"
+    record.state = SessionState.COMPLETED
     record.approved_prompt = "the first task"
     record.budget_count = 4
     runtime.registry.upsert(record)

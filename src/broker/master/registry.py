@@ -13,23 +13,9 @@ from typing import Any, cast
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from broker.claude.atomic import atomic_update_json
+from broker.protocol.constants import SessionState
 
 NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
-
-STATES = frozenset(
-    {
-        "spawning",
-        "grounding",
-        "awaiting_approval",
-        "driving",
-        "escalated",
-        "blocked_permission",
-        "completed",
-        "error",
-        "stopped",
-        "unmanaged",
-    }
-)
 
 
 class SessionRecord(BaseModel):
@@ -39,7 +25,7 @@ class SessionRecord(BaseModel):
     socket_path: str  # allocated ONCE, persisted, never re-derived
     cwd: str
     anchor_pane: str
-    state: str = "spawning"
+    state: SessionState = SessionState.SPAWNING
     pane_id: str | None = None
     claude_session_id: str | None = None
     transcript_path: str | None = None

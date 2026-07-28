@@ -24,6 +24,7 @@ from broker.llm import build_client
 from broker.master.llm import bind_call_turn
 from broker.master.registry import Registry
 from broker.master.tui.app import BrokerMasterApp
+from broker.protocol.constants import SessionState
 
 # Core hook events plus observability extras
 EVENTS = [
@@ -94,8 +95,8 @@ def main() -> None:
 
     # 3. Sessions found at startup are unmanaged.
     for record in registry.records.values():
-        if record.state != "unmanaged":
-            record.state = "unmanaged"
+        if record.state != SessionState.UNMANAGED:
+            record.state = SessionState.UNMANAGED
             warnings.append(
                 f"session {record.name} found in registry — marked unmanaged"
             )

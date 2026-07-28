@@ -5,6 +5,7 @@ import sys
 import typing
 
 from broker.protocol import constants
+from broker.protocol.constants import SessionState
 from broker.protocol.schemas import (
     PermissionDecisionPayload,
     StatusPayload,
@@ -40,7 +41,7 @@ def test_status_payload_extension_is_additive() -> None:
     assert old.claude_session_id is None
     assert old.transcript_path is None
     new = StatusPayload(
-        state="driving",
+        state=SessionState.DRIVING,
         pane_id="w3:p2",
         claude_session_id="sess-1",
         transcript_path="/private/tmp/t.jsonl",

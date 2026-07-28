@@ -4,6 +4,8 @@ Anything beyond the standard library added here lands on the synchronous
 permission path of every tool call in every supervised session.
 """
 
+from enum import StrEnum
+
 PROTOCOL_VERSION = 1
 MAX_LINE_BYTES = 1_048_576  # 1 MiB; observed real max 857 KiB (2026-07-27 survey)
 
@@ -31,6 +33,31 @@ T_BUDGET_UPDATE = "budget_update"  # broker -> master
 # "escalated" deliberately avoids colliding with Claude Code's own "defer"
 DECISION_ALLOW = "allow"
 DECISION_ESCALATED = "escalated"
+
+
+class SessionState(StrEnum):
+    """Every state a session may be in, on both the broker and master sides.
+
+    Lives here because master and session may not import each other, and both
+    sides set states.
+    """
+
+    SPAWNING = "spawning"
+    GROUNDING = "grounding"
+    AWAITING_APPROVAL = "awaiting_approval"
+    DRIVING = "driving"
+    ESCALATED = "escalated"
+    BLOCKED_PERMISSION = "blocked_permission"
+    COMPLETED = "completed"
+    ERROR = "error"
+    STOPPED = "stopped"
+    UNMANAGED = "unmanaged"
+
+
+# A session live enough to accept a decision or a prompt.
+ACTIVE_STATES = frozenset(
+    {SessionState.DRIVING, SessionState.BLOCKED_PERMISSION}
+)
 
 # The hook's own deadline must always expire first, so it exits 0 on its own
 # terms and degrades the session predictably. If Claude Code's settings.json

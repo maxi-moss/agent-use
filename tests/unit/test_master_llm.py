@@ -19,6 +19,7 @@ from broker.config import BrokerConfig
 from broker.llm import ToolCall, TurnResult
 from broker.master.llm import MAX_TOOL_ROUNDS, MASTER_TOOLS, MasterLLM
 from broker.master.registry import Registry, SessionRecord
+from broker.protocol.constants import SessionState
 from broker.master.runtime import (
     MasterRuntime,
     PendingProposal,
@@ -122,7 +123,7 @@ def runtime(home: Path) -> RecordingRuntime:
             socket_path=str(home / "s" / "s1.sock"),
             cwd="/private/tmp",
             anchor_pane="%1",
-            state="driving",
+            state=SessionState.DRIVING,
         )
     )
     return RecordingRuntime(registry, cfg)

@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from broker.protocol.constants import PROTOCOL_VERSION
+from broker.protocol.constants import PROTOCOL_VERSION, SessionState
 
 
 class Envelope(BaseModel):
@@ -83,7 +83,7 @@ class StatusPayload(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    state: str
+    state: SessionState
     pane_id: str | None = None
     claude_session_id: str | None = None
     transcript_path: str | None = None

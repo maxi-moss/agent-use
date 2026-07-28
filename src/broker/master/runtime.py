@@ -39,6 +39,7 @@ from broker.master.messages import (
 from broker.master.registry import Registry, SessionRecord
 from broker.protocol import client
 from broker.protocol.constants import (
+    SessionState,
     T_APPROVE_PROMPT,
     T_BUDGET_UPDATE,
     T_COMPLETION,
@@ -348,7 +349,7 @@ class MasterRuntime:
             return await self._on_escalation(env, name)
         if env.type == T_COMPLETION:
             p = CompletionPayload.model_validate(env.payload)
-            self._set_state(name, "completed")
+            self._set_state(name, SessionState.COMPLETED)
             self.app_post(CompletionArrived(name, p.summary))
             await self._notify(
                 notifier.notify_done, f"Session {name} complete", p.summary
@@ -356,7 +357,7 @@ class MasterRuntime:
             return self._ack(env, ok=True)
         if env.type == T_FATAL_ERROR:
             p = FatalErrorPayload.model_validate(env.payload)
-            self._set_state(name, "error")
+            self._set_state(name, SessionState.ERROR)
             self.app_post(
                 Notice(f"session {name} FATAL [{p.error_class}]: {p.detail}")
             )
@@ -381,7 +382,7 @@ class MasterRuntime:
         if env.type == T_PROMPT_PROPOSAL:
             p = PromptProposalPayload.model_validate(env.payload)
             self.proposals[p.proposal_id] = PendingProposal(name, p)
-            self._set_state(name, "awaiting_approval")
+            self._set_state(name, SessionState.AWAITING_APPROVAL)
             self.app_post(
                 ProposalArrived(name, p.proposal_id, render_proposal(p))
             )
@@ -422,7 +423,7 @@ class MasterRuntime:
         except ProtocolViolation as exc:
             self.app_post(Notice(f"PROTOCOL VIOLATION: {exc}"))
             return self._ack(env, ok=False)
-        self._set_state(p.session_id, "escalated")
+        self._set_state(p.session_id, SessionState.ESCALATED)
         self.app_post(
             EscalationArrived(
                 p.session_id, p.escalation_id, render_escalation(p)
@@ -503,7 +504,7 @@ class MasterRuntime:
         record.pid = proc.pid
         self._procs[session_id] = proc
         self.registry.upsert(record)
-        self._set_state(session_id, "spawning")
+        self._set_state(session_id, SessionState.SPAWNING)
         return (
             f"session {session_id} reassigned to a new broker (pid {proc.pid})"
         )
@@ -535,7 +536,7 @@ class MasterRuntime:
         record.approved_prompt = None  # superseded; set again on approval
         record.budget_count = 0
         self.registry.upsert(record)
-        self._set_state(session_id, "grounding")
+        self._set_state(session_id, SessionState.GROUNDING)
         return f"session {session_id} reactivated — grounding the new task"
 
     async def approve_prompt(self, proposal_id: str, prompt: str) -> str:
@@ -620,7 +621,7 @@ class MasterRuntime:
             self.app_post(Notice(rejected))
             return rejected
         self.slot.resolve(escalation_id)
-        self._set_state(record.name, "driving")
+        self._set_state(record.name, SessionState.DRIVING)
         return f"decision dispatched to session {record.name}"
 
     async def send_prompt(self, session_id: str, text: str) -> str:
@@ -722,7 +723,7 @@ class MasterRuntime:
             except TimeoutError:
                 proc.terminate()
                 await proc.wait()
-        self._set_state(session_id, "stopped")
+        self._set_state(session_id, SessionState.STOPPED)
         return f"session {session_id} stopped"
 
     def pending_proposals(self) -> list[PendingProposal]:
@@ -814,12 +815,12 @@ class MasterRuntime:
                 )
             await asyncio.sleep(SOCKET_POLL_S)
 
-    def _set_state(self, name: str, state: str) -> None:
+    def _set_state(self, name: str, state: SessionState) -> None:
         """Record a session's new state and tell the TUI.
 
         Args:
             name: Registry name of the session.
-            state: New state string to persist.
+            state: New state to persist.
         """
         try:
             record = self.registry.get(name)

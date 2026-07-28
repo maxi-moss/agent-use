@@ -27,7 +27,9 @@ from broker.herdr import driver
 from broker.claude.paths import transcript_dir_for_cwd
 from broker.protocol import client
 from broker.protocol.constants import (
+    ACTIVE_STATES,
     DECISION_ESCALATED,
+    SessionState,
     T_APPROVE_PROMPT,
     T_BUDGET_UPDATE,
     T_COMPLETION,
@@ -156,7 +158,7 @@ class SessionBroker:
             broker_home=cfg.broker_home,
         )
         self._llm_call = llm_call
-        self.state = "spawning"
+        self.state: SessionState = SessionState.SPAWNING
         self.pane_id: str | None = None
         self.claude_session_id: str | None = None
         self.transcript_path: Path | None = None
@@ -293,7 +295,7 @@ class SessionBroker:
         """
         self.intent = intent
         self.approved_prompt = None  # superseded until the developer approves
-        self._set_state("grounding")
+        self._set_state(SessionState.GROUNDING)
         assert self._llm_call is not None
         proposal = await ground_intent(
             self._llm_call,
@@ -304,7 +306,7 @@ class SessionBroker:
         self._proposal_id = uuid.uuid4().hex
         loop = asyncio.get_running_loop()
         self._approval = loop.create_future()
-        self._set_state("awaiting_approval")
+        self._set_state(SessionState.AWAITING_APPROVAL)
         await self._to_master(
             T_PROMPT_PROPOSAL,
             {
@@ -317,7 +319,7 @@ class SessionBroker:
         approved = await self._approval
         self.approved_prompt = approved.prompt
         await self._submit(approved.prompt)
-        self._set_state("driving")
+        self._set_state(SessionState.DRIVING)
 
     async def _event_loop(self) -> None:
         """Run queued jobs one at a time until shutdown or the sentinel."""
@@ -400,7 +402,7 @@ class SessionBroker:
 
         if env.type == T_REACTIVATE:
             reactivate = ReactivatePayload.model_validate(env.payload)
-            if self.state != "completed":
+            if self.state != SessionState.COMPLETED:
                 return Response(
                     id=env.id,
                     ok=False,
@@ -414,7 +416,7 @@ class SessionBroker:
                 )
             # Closes the gate here, not in the job: a second reactivate
             # arriving before the queue drains must not pass it too.
-            self._set_state("grounding")
+            self._set_state(SessionState.GROUNDING)
             self.queue.put_nowait(lambda: self._reactivate(reactivate))
             return Response(id=env.id, ok=True)
 
@@ -470,7 +472,7 @@ class SessionBroker:
             self._bind_session(raw)
         elif name == "Stop":
             message = str(raw.get("last_assistant_message", "") or "")
-            if self.state == "escalated":
+            if self.state == SessionState.ESCALATED:
                 self.queue.put_nowait(self._check_out_of_band_resolution)
             else:
                 self.queue.put_nowait(lambda: self._classify(message))
@@ -482,15 +484,15 @@ class SessionBroker:
             # Surfaced, NOT a completed turn.
             self.queue.put_nowait(lambda: self._fatal(error_class, detail))
         elif name in {"UserPromptSubmit", "PostToolUse"}:
-            if self.state == "escalated":
+            if self.state == SessionState.ESCALATED:
                 self.queue.put_nowait(self._check_out_of_band_resolution)
         elif name == "Notification":
             self._log("notification", "", str(raw.get("message", "")))
             if raw.get("notification_type") == "permission_prompt":
-                if self.state == "driving":
-                    self._set_state("blocked_permission")
+                if self.state == SessionState.DRIVING:
+                    self._set_state(SessionState.BLOCKED_PERMISSION)
         elif name == "SessionEnd":
-            self._set_state("stopped")
+            self._set_state(SessionState.STOPPED)
             self._log("session_end", "", "SessionEnd hook received")
         elif name in {"PreCompact", "PostCompact"}:
             self._log("compaction", "", name)  # continue normally
@@ -546,8 +548,8 @@ class SessionBroker:
             self._seen_ask_ids.add(p.tool_use_id)
             await self._ask_user_question(p.tool_input, p.tool_use_id)
         else:
-            if self.state == "driving":
-                self._set_state("blocked_permission")
+            if self.state == SessionState.DRIVING:
+                self._set_state(SessionState.BLOCKED_PERMISSION)
 
     async def _classify(self, last_assistant_message: str) -> None:
         """Triage one turn boundary into an answer, escalation or completion.
@@ -562,14 +564,14 @@ class SessionBroker:
                 payload, or the last assistant text when the watchdog
                 reconciles.
         """
-        if self.state not in {"driving", "blocked_permission"}:
+        if self.state not in ACTIVE_STATES:
             self._log(
                 "no_action",
                 f"turn boundary ignored in state {self.state!r}",
                 "",
             )
             return
-        self._set_state("driving")
+        self._set_state(SessionState.DRIVING)
         events = self._read_transcript()  # context ONLY; input is the message
         self._last_event_count = len(events)
         assert self._llm_call is not None
@@ -731,7 +733,7 @@ class SessionBroker:
         self._user_prompt_baseline = (
             _count_user_prompts(events) if events is not None else -1
         )
-        self._set_state("escalated")  # QUIESCENT until dispatch or retract
+        self._set_state(SessionState.ESCALATED)  # QUIESCENT until dispatch or retract
         await self._to_master(T_ESCALATION, payload.model_dump())
 
     async def _check_out_of_band_resolution(self) -> None:
@@ -741,7 +743,7 @@ class SessionBroker:
         otherwise a user prompt beyond the recorded baseline counts as
         resolution. Resolving returns the session to driving.
         """
-        if self.state != "escalated" or self._active_escalation is None:
+        if self.state != SessionState.ESCALATED or self._active_escalation is None:
             return
         events = self._read_transcript()
         resolved = False
@@ -758,7 +760,7 @@ class SessionBroker:
         self._log("retracted", "resolved in pane", escalation_id)
         self._active_escalation = None
         self._pending_ask_id = None
-        self._set_state("driving")
+        self._set_state(SessionState.DRIVING)
         await self._to_master(
             T_RETRACT,
             {"escalation_id": escalation_id, "reason": "resolved in pane"},
@@ -790,7 +792,7 @@ class SessionBroker:
         self._pending_ask_id = None
         self.budget_count = 0
         await self._to_master(T_BUDGET_UPDATE, {"count": 0})
-        self._set_state("driving")
+        self._set_state(SessionState.DRIVING)
         self._log("dispatched", "developer decision delivered", decision.response)
 
     async def _reactivate(self, payload: ReactivatePayload) -> None:
@@ -823,7 +825,7 @@ class SessionBroker:
         await self._to_master(T_BUDGET_UPDATE, {"count": 0})
         self._active_escalation = None
         self._pending_ask_id = None
-        self._set_state("driving")
+        self._set_state(SessionState.DRIVING)
         self._log("developer_prompt", "relayed by master", prompt.text)
 
     async def _reconcile(self) -> None:
@@ -838,10 +840,10 @@ class SessionBroker:
         message is classified as if a Stop hook had delivered it, so a
         dropped hook cannot silently strand the session.
         """
-        if self.state == "escalated":
+        if self.state == SessionState.ESCALATED:
             await self._check_out_of_band_resolution()
             return
-        if self.state not in {"driving", "blocked_permission"}:
+        if self.state not in ACTIVE_STATES:
             return
         events = self._read_transcript()
         if len(events) == self._last_event_count:
@@ -932,7 +934,7 @@ class SessionBroker:
         """
         logger.error("fatal: %s: %s", error_class, detail)
         self._log("error", error_class, detail)
-        self._set_state("error")
+        self._set_state(SessionState.ERROR)
         try:
             await self._to_master(
                 T_FATAL_ERROR, {"error_class": error_class, "detail": detail}
@@ -947,7 +949,7 @@ class SessionBroker:
             self.decision_log_path, kind=kind, reasoning=reasoning, detail=detail
         )
 
-    def _set_state(self, state: str) -> None:
+    def _set_state(self, state: SessionState) -> None:
         """Assign a new state and log the transition."""
         logger.info("session %s: %s -> %s", self.cfg.name, self.state, state)
         self.state = state
