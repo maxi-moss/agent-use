@@ -459,14 +459,16 @@ class MasterRuntime:
                 proposal_id=proposal_id, prompt=prompt
             ).model_dump(),
         )
-        resp = await client.request(
-            Path(record.socket_path), env, timeout_s=REQUEST_TIMEOUT_S
-        )
-        if not resp.ok:
-            return (
+        rejected = await self._deliver(
+            record.socket_path,
+            env,
+            rejection=(
                 f"session {name} rejected approval for proposal "
                 f"{proposal_id} (stale)"
-            )
+            ),
+        )
+        if rejected is not None:
+            return rejected
         del self.proposals[proposal_id]
         record.approved_prompt = prompt  # the AUTHORITATIVE intent
         self.registry.upsert(record)
@@ -480,8 +482,9 @@ class MasterRuntime:
             decision: The developer's decision, sent verbatim.
 
         Returns:
-            An outcome line: dispatched to the named session, or a refusal
-            naming the escalation that is no longer live.
+            An outcome line: dispatched to the named session, a refusal
+            naming the escalation that is no longer live, or a rejection if
+            the session NACKed delivery.
         """
         # Liveness is checked THE INSTANT before the write, not at
         # surface time. A stale dispatch is the worst failure this system
@@ -501,9 +504,17 @@ class MasterRuntime:
                 escalation_id=escalation_id, response=decision
             ).model_dump(),
         )
-        await client.request(
-            Path(record.socket_path), env, timeout_s=REQUEST_TIMEOUT_S
+        rejected = await self._deliver(
+            record.socket_path,
+            env,
+            rejection=(
+                f"session {record.name} rejected the dispatched decision "
+                f"for escalation {escalation_id} (stale)"
+            ),
         )
+        if rejected is not None:
+            self.app_post(Notice(rejected))
+            return rejected
         self.slot.resolve(escalation_id)
         self._set_state(record.name, "driving")
         return f"decision dispatched to session {record.name}"
@@ -516,13 +527,18 @@ class MasterRuntime:
             text: Prompt text, sent verbatim.
 
         Returns:
-            A confirmation line naming the session.
+            A confirmation line naming the session, or a rejection if the
+            session NACKed delivery.
         """
         record = self.registry.get(session_id)
         env = self._env(T_SEND_PROMPT, SendPromptPayload(text=text).model_dump())
-        await client.request(
-            Path(record.socket_path), env, timeout_s=REQUEST_TIMEOUT_S
+        rejected = await self._deliver(
+            record.socket_path,
+            env,
+            rejection=f"session {session_id} rejected the prompt (stale)",
         )
+        if rejected is not None:
+            return rejected
         record.budget_count = 0  # developer prompt resets the budget
         self.registry.upsert(record)
         return f"prompt sent to session {session_id}"
@@ -559,15 +575,23 @@ class MasterRuntime:
 
         Returns:
             The log text verbatim, or the empty string when the session sent
-            no text or sent something that was not text.
+            no text or sent something that was not text — a malformed reply
+            is logged rather than silently treated as an empty log.
         """
         record = self.registry.get(session_id)
         env = self._env(T_GET_DECISION_LOG, {})
         resp = await client.request(
             Path(record.socket_path), env, timeout_s=REQUEST_TIMEOUT_S
         )
-        text = resp.payload.get("text", "")
-        return text if isinstance(text, str) else ""
+        text = resp.payload.get("text")
+        if not isinstance(text, str):
+            logger.warning(
+                "session %s sent a malformed decision-log reply: %r",
+                session_id,
+                resp.payload,
+            )
+            return ""
+        return text
 
     async def stop_session(self, session_id: str) -> str:
         """Shut a session broker down and mark it stopped.
@@ -656,6 +680,27 @@ class MasterRuntime:
         except Exception as exc:
             # A dead notifier must not lose the escalation it announces.
             self.app_post(Notice(f"notification failed: {exc}"))
+
+    async def _deliver(
+        self, socket_path: str, env: Envelope, *, rejection: str
+    ) -> str | None:
+        """Send ``env`` to a session socket, reporting a NACK.
+
+        Args:
+            socket_path: Session socket to write to.
+            env: Envelope to send.
+            rejection: Message logged and returned when the session NACKs.
+
+        Returns:
+            ``None`` when the session ACKed, otherwise ``rejection``.
+        """
+        resp = await client.request(
+            Path(socket_path), env, timeout_s=REQUEST_TIMEOUT_S
+        )
+        if resp.ok:
+            return None
+        logger.warning("%s", rejection)
+        return rejection
 
     def _env(self, msg_type: str, payload: dict[str, Any]) -> Envelope:
         """Wrap a payload in an envelope with a fresh message id."""

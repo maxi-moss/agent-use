@@ -3,6 +3,7 @@ runtime server; driver.subprocess.run monkeypatched; app_post = recording list."
 
 import asyncio
 import contextlib
+import logging
 import subprocess
 import tempfile
 import uuid
@@ -63,6 +64,20 @@ class StubSession:
     async def handler(self, env: Envelope) -> Response:
         self.envelopes.append(env)
         return Response(id=env.id, ok=True)
+
+
+class NackingSession:
+    """Session-socket handler that always rejects."""
+
+    async def handler(self, env: Envelope) -> Response:
+        return Response(id=env.id, ok=False)
+
+
+class MalformedLogSession:
+    """Session-socket handler answering get_decision_log with no text field."""
+
+    async def handler(self, env: Envelope) -> Response:
+        return Response(id=env.id, ok=True, payload={"oops": "not text"})
 
 
 def escalation_dict(esc_id: str = "e1") -> dict[str, Any]:
@@ -344,3 +359,60 @@ async def test_proposal_rendered_verbatim_and_tracked(
     assert "the exact proposed prompt" in arrived[0].rendered
     assert "the exact grounding summary" in arrived[0].rendered
     assert runtime.registry.get("s1").state == "awaiting_approval"
+
+
+async def test_dispatch_reports_rejection_when_session_nacks(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, posts = rt
+    stub = NackingSession()
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
+        result = await runtime.dispatch("e1", "use option B")
+        assert "rejected" in result
+        # A NACKed dispatch must not be treated as delivered.
+        assert runtime.slot.active is not None
+        assert runtime.registry.get("s1").state != "driving"
+        notices = [m.text for m in posts if isinstance(m, Notice)]
+        assert any("rejected" in t for t in notices)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_send_prompt_reports_rejection_when_session_nacks(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, _ = rt
+    record = runtime.registry.get("s1")
+    record.budget_count = 5
+    runtime.registry.upsert(record)
+    stub = NackingSession()
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        result = await runtime.send_prompt("s1", "hello")
+        assert "rejected" in result
+        # A NACKed send must not reset the budget as if it were delivered.
+        assert runtime.registry.get("s1").budget_count == 5
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_get_decision_log_warns_and_returns_empty_on_malformed_reply(
+    rt: tuple[MasterRuntime, list[Any]],
+    home: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runtime, _ = rt
+    stub = MalformedLogSession()
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        with caplog.at_level(logging.WARNING):
+            result = await runtime.get_decision_log("s1")
+        assert result == ""
+        assert any("malformed" in r.message.lower() for r in caplog.records)
+    finally:
+        server.close()
+        await server.wait_closed()
