@@ -1,6 +1,6 @@
 """Transcript reading: read_cleaned(), render(), TranscriptParseError, ReadReport.
 
-Two-step parse per line, deliberately:
+Three-step parse per line, deliberately:
   1. json.loads         — malformed JSON is FATAL (TranscriptParseError)
   2. raw.map_line       — unrecognised record types are discarded (counted)
   3. _EVENT.validate_python — shape drift is tolerated (skipped + counted)
