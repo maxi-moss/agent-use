@@ -7,6 +7,8 @@ text-only response, and forced choice would suppress that text.
 """
 
 import json
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -94,46 +96,76 @@ class StopSessionArgs(BaseModel):
     session_id: str
 
 
-MASTER_TOOLS: list[ToolParam] = [
-    strict_tool(
+@dataclass(frozen=True, slots=True)
+class MasterTool[M: BaseModel]:
+    """A master tool's wire schema paired with the runtime call it dispatches to."""
+
+    name: str
+    description: str
+    model: type[M]
+    handler: Callable[[MasterRuntime, M], Awaitable[str]]
+
+
+async def _list_sessions(runtime: MasterRuntime, _: ListSessionsArgs) -> str:
+    """Async adapter for the one runtime accessor that is synchronous."""
+    return runtime.render_registry_summary()
+
+
+# Deliberately unannotated: a tuple[MasterTool[Any], ...] annotation would solve
+# M as Any at every entry and stop pyright checking handlers against their model.
+_REGISTRY = (
+    MasterTool(
         "spawn_session",
         "Launch a supervised session for a new task. Pass the developer's "
         "intent VERBATIM — grounding belongs to the session broker.",
         SpawnSessionArgs,
+        lambda rt, a: rt.spawn_session(a.intent, a.cwd),
     ),
-    strict_tool(
+    MasterTool(
         "approve_prompt",
         "Approve (or relay the developer's revision of) a proposed initial "
         "prompt. The final text passes through verbatim.",
         ApprovePromptArgs,
+        lambda rt, a: rt.approve_prompt(a.proposal_id, a.prompt),
     ),
-    strict_tool(
+    MasterTool(
         "dispatch_decision",
         "Relay the developer's resolution of the active escalation to the "
         "owning session broker, unchanged.",
         DispatchDecisionArgs,
+        lambda rt, a: rt.dispatch(a.escalation_id, a.decision),
     ),
-    strict_tool(
+    MasterTool(
         "list_sessions",
         "Current sessions with state, budget, and intent.",
         ListSessionsArgs,
+        _list_sessions,
     ),
-    strict_tool(
+    MasterTool(
         "send_to_session",
         "Push a new developer instruction into an existing session.",
         SendToSessionArgs,
+        lambda rt, a: rt.send_prompt(a.session_id, a.prompt),
     ),
-    strict_tool(
+    MasterTool(
         "get_decision_log",
         "Retrieve a session broker's triage reasoning.",
         GetDecisionLogArgs,
+        lambda rt, a: rt.get_decision_log(a.session_id),
     ),
-    strict_tool(
+    MasterTool(
         "stop_session",
         "Terminate a session and its broker.",
         StopSessionArgs,
+        lambda rt, a: rt.stop_session(a.session_id),
     ),
+)
+
+MASTER_TOOLS: list[ToolParam] = [
+    strict_tool(t.name, t.description, t.model) for t in _REGISTRY
 ]
+
+_BY_NAME: dict[str, MasterTool[Any]] = {t.name: t for t in _REGISTRY}
 
 AUTO_ONE: ToolChoiceParam = {
     "type": "auto",
@@ -141,16 +173,6 @@ AUTO_ONE: ToolChoiceParam = {
 }
 
 _MASTER_PROMPT = prompts.load("master")
-
-_ARG_MODELS: dict[str, type[BaseModel]] = {
-    "spawn_session": SpawnSessionArgs,
-    "approve_prompt": ApprovePromptArgs,
-    "dispatch_decision": DispatchDecisionArgs,
-    "list_sessions": ListSessionsArgs,
-    "send_to_session": SendToSessionArgs,
-    "get_decision_log": GetDecisionLogArgs,
-    "stop_session": StopSessionArgs,
-}
 
 
 class ConversationLog:
@@ -287,34 +309,16 @@ class MasterLLM:
         return [cast(MessageParam, {"role": "user", "content": blocks})]
 
     async def _execute(self, call: ToolCall) -> str:
-        model = _ARG_MODELS.get(call.name)
-        if model is None:
+        tool = _BY_NAME.get(call.name)
+        if tool is None:
             raise LLMCallError(f"unknown master tool {call.name!r}")
         try:
-            args = model.model_validate(call.input)
+            args = tool.model.model_validate(call.input)
         except ValidationError as exc:
             raise LLMCallError(
                 f"invalid input for master tool {call.name!r}: {exc}"
             ) from exc
-        if isinstance(args, SpawnSessionArgs):
-            return await self.runtime.spawn_session(args.intent, args.cwd)
-        if isinstance(args, ApprovePromptArgs):
-            return await self.runtime.approve_prompt(
-                args.proposal_id, args.prompt
-            )
-        if isinstance(args, DispatchDecisionArgs):
-            return await self.runtime.dispatch(
-                args.escalation_id, args.decision
-            )
-        if isinstance(args, ListSessionsArgs):
-            return self.runtime.render_registry_summary()
-        if isinstance(args, SendToSessionArgs):
-            return await self.runtime.send_prompt(args.session_id, args.prompt)
-        if isinstance(args, GetDecisionLogArgs):
-            return await self.runtime.get_decision_log(args.session_id)
-        if isinstance(args, StopSessionArgs):
-            return await self.runtime.stop_session(args.session_id)
-        raise LLMCallError(f"unhandled master tool {call.name!r}")
+        return await tool.handler(self.runtime, args)
 
 
 def bind_call_turn(client: AsyncAnthropic) -> LLMTurnCaller:
