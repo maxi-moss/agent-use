@@ -1,5 +1,5 @@
 #!/bin/sh
-# Field-name containment gate (plan §3): raw JSONL key literals may appear ONLY
+# Field-name containment gate: raw JSONL key literals may appear ONLY
 # in src/broker/transcript/raw.py. import-linter reasons about imports, not
 # string literals — this gate covers the other half.
 #

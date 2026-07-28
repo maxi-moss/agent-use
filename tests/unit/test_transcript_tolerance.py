@@ -1,4 +1,4 @@
-"""Tolerance vs fail-loud split (PRP Level 2 binding names)."""
+"""Tolerance vs fail-loud split."""
 
 from pathlib import Path
 from typing import Any

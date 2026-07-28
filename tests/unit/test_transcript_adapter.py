@@ -1,4 +1,4 @@
-"""Adapter determinism + real-fixture behaviour (PRP Level 2 binding names)."""
+"""Adapter determinism + real-fixture behaviour."""
 
 from pathlib import Path
 
@@ -115,7 +115,7 @@ def test_exit_plan_mode_inputs_and_rejected_results() -> None:
 
 
 def test_approved_exit_plan_synthetic_fixture() -> None:
-    """SYNTHETIC shape — replaced by the Task 10 developer capture."""
+    """SYNTHETIC shape — replaced by the real developer capture."""
     events = read_cleaned(APPROVED_PLAN_SYNTHETIC)
     results = [e for e in events if isinstance(e, ExitPlanResult)]
     assert len(results) == 1

@@ -1,4 +1,4 @@
-"""ALL JSONL field-name knowledge lives here (plan §3, §6 mitigation 1).
+"""ALL JSONL field-name knowledge lives here.
 
 Importable only by broker.transcript.adapter (import-linter contract) and the
 only module allowed to contain raw JSONL key literals (scripts/check_jsonl_literals.sh).
@@ -10,7 +10,7 @@ is the adapter's job — this module never holds cross-record state.
 
 from typing import Any, cast
 
-# Keep-known rule (plan §3.2): only these top-level record types are recognised.
+# Keep-known rule: only these top-level record types are recognised.
 # Everything else — including future types — is discarded, counted, never fatal.
 KNOWN_RECORD_TYPES = frozenset({"assistant", "user"})
 
@@ -18,7 +18,7 @@ KNOWN_RECORD_TYPES = frozenset({"assistant", "user"})
 # pairs it to a previously seen AskUserQuestion / ExitPlanMode id or strips it.
 KIND_TOOL_RESULT = "tool_result"
 
-# The AskUserQuestion answer arrives as this prose (spike-verified, 2.1.220):
+# The AskUserQuestion answer arrives as this prose (verified against 2.1.220):
 #   Your questions have been answered: "<q>"="<label>"[, ...]. You can now
 #   continue with these answers in mind.
 # It is exposed verbatim as `raw`; consumers never string-match it. The only
@@ -28,11 +28,13 @@ _REJECTED_DENIAL_KIND = "user-rejected"
 
 
 def record_type(obj: dict[str, Any]) -> str | None:
+    """Return the record's top-level type, or ``None`` when absent or non-string."""
     t = obj.get("type")
     return t if isinstance(t, str) else None
 
 
 def record_version(obj: dict[str, Any]) -> str | None:
+    """Return the Claude Code version stamped on the record, if it carries one."""
     v = obj.get("version")
     return v if isinstance(v, str) else None
 
@@ -40,9 +42,11 @@ def record_version(obj: dict[str, Any]) -> str | None:
 def map_line(obj: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     """Map one parsed JSONL record to (kind, mapped dict) pairs.
 
-    Returns [] for every record the adapter should discard. A list, not a
-    single tuple, because assistant records can carry multiple content blocks
-    (2/13964 in the 2026-07-27 corpus — rare, handled defensively).
+    Args:
+        obj: One parsed JSONL record.
+
+    Returns:
+        Zero or more (kind, mapped dict) pairs; ``[]`` for records to discard.
     """
     rtype = record_type(obj)
     if rtype == "assistant":
@@ -53,18 +57,21 @@ def map_line(obj: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
 
 
 def _as_dict(value: Any) -> dict[str, Any] | None:
+    """Return ``value`` as a dict, or ``None`` when it is not one."""
     if isinstance(value, dict):
         return cast(dict[str, Any], value)
     return None
 
 
 def _as_list(value: Any) -> list[Any] | None:
+    """Return ``value`` as a list, or ``None`` when it is not one."""
     if isinstance(value, list):
         return cast(list[Any], value)
     return None
 
 
 def _message_content(obj: dict[str, Any]) -> Any:
+    """Return the record's message content, or ``None`` when it has no message."""
     message = _as_dict(obj.get("message"))
     if message is None:
         return None
@@ -72,6 +79,14 @@ def _message_content(obj: dict[str, Any]) -> Any:
 
 
 def _map_assistant(obj: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Map an assistant record's content blocks to (kind, mapped dict) pairs.
+
+    Args:
+        obj: One parsed assistant record.
+
+    Returns:
+        One pair per block that survived the filter; ``[]`` if none did.
+    """
     content = _as_list(_message_content(obj))
     if content is None:
         return []
@@ -95,6 +110,14 @@ def _map_assistant(obj: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
 
 
 def _map_tool_use(block: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """Map one assistant tool_use block to a public event, if it is one we keep.
+
+    Args:
+        block: One ``tool_use`` content block from an assistant record.
+
+    Returns:
+        The (kind, mapped dict) pair, or ``None`` if not kept, or malformed.
+    """
     name = block.get("name")
     block_id = block.get("id")
     tool_input = _as_dict(block.get("input"))
@@ -129,6 +152,14 @@ def _map_tool_use(block: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
 
 
 def _map_user(obj: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Map a user record to a prompt event or to internal tool_result pairs.
+
+    Args:
+        obj: One parsed user record.
+
+    Returns:
+        Zero or more (kind, mapped dict) pairs; ``[]`` if neither.
+    """
     content = _message_content(obj)
     if isinstance(content, str):
         # Typed developer prompts carry origin.kind == "human" (and a

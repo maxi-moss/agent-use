@@ -1,6 +1,6 @@
 """Transcript reading: read_cleaned(), render(), TranscriptParseError, ReadReport.
 
-Two-step parse per line, deliberately (plan §3.2, gotcha 1):
+Two-step parse per line, deliberately:
   1. json.loads         — malformed JSON is FATAL (TranscriptParseError)
   2. raw.map_line       — unrecognised record types are discarded (counted)
   3. _EVENT.validate_python — shape drift is tolerated (skipped + counted)
@@ -40,6 +40,7 @@ class ReadReport:
 
 
 def read_cleaned(path: Path) -> list[TranscriptEvent]:
+    """Read a transcript file and return its cleaned events, dropping the report."""
     events, _ = read_cleaned_with_report(path)
     return events
 
@@ -47,6 +48,18 @@ def read_cleaned(path: Path) -> list[TranscriptEvent]:
 def read_cleaned_with_report(
     path: Path,
 ) -> tuple[list[TranscriptEvent], ReadReport]:
+    """Read a transcript file into cleaned events, with a report of what was lost.
+
+    Args:
+        path: The session's JSONL transcript, read as UTF-8.
+
+    Returns:
+        The cleaned events in file order, plus a report of what was lost.
+
+    Raises:
+        TranscriptParseError: A line is not valid JSON, or a non-empty file
+            yielded no events at all.
+    """
     text = path.read_text(encoding="utf-8")
     report = ReadReport()
     events: list[TranscriptEvent] = []
@@ -116,6 +129,15 @@ def read_cleaned_with_report(
 def _resolve_tool_result(
     data: dict[str, Any], pending: dict[str, str]
 ) -> dict[str, Any] | None:
+    """Re-kind an internal tool result into the public event it answers.
+
+    Args:
+        data: One internal tool-result mapping from ``raw.map_line``.
+        pending: Tool_use id -> public result kind, mutated by the pop.
+
+    Returns:
+        The public event dict, or ``None`` when no pending call claims this id.
+    """
     tool_use_id = data["tool_use_id"]
     result_kind = pending.pop(tool_use_id, None)
     if result_kind is None:
@@ -129,7 +151,14 @@ def _resolve_tool_result(
 
 
 def render(events: list[TranscriptEvent]) -> str:
-    """Pure, deterministic rendering. No wall-clock, no locale, insertion order."""
+    """Render cleaned events as a Markdown-ish transcript.
+
+    Args:
+        events: Cleaned events, in the order the adapter produced them.
+
+    Returns:
+        The rendered transcript, one titled section per event.
+    """
     parts: list[str] = []
     for event in events:
         if event.kind == "user_prompt":
