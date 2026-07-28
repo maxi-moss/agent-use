@@ -1,4 +1,8 @@
-"""Public transcript event models. No JSONL field names here — raw.py owns those."""
+"""Public transcript event models. No JSONL field names here — raw.py owns those.
+
+These rely on pydantic's default extra="ignore" — never set extra="forbid": an
+unknown key is a newer Claude Code writing the transcript, not a typo.
+"""
 
 from typing import Annotated, Literal
 

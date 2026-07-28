@@ -19,6 +19,8 @@ from typing import Any, cast
 
 import pytest
 
+from broker.protocol.constants import HOOK_SETTINGS_TIMEOUT, HOOK_WAIT_SECONDS
+
 EXPECTED_ALLOW = {
     "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
@@ -202,3 +204,10 @@ def test_non_pretooluse_event_is_fire_and_forget(sock_dir: Path) -> None:
         assert env["type"] == "hook_event"
         assert env["payload"]["hook_event_name"] == "Stop"
         assert env["payload"]["raw"] == STOP_PAYLOAD
+
+
+def test_hook_deadline_fires_before_claude_codes() -> None:
+    # The hook must hit its own deadline and exit 0 on its own terms. If Claude
+    # Code's settings.json timeout fired first it would kill the process
+    # mid-wait and the degraded outcome would stop being predictable.
+    assert HOOK_WAIT_SECONDS < HOOK_SETTINGS_TIMEOUT

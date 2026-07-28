@@ -1,4 +1,8 @@
-"""Pydantic models for herdr CLI JSON results (verified against herdr 0.7.5)."""
+"""Pydantic models for herdr CLI JSON results (verified against herdr 0.7.5).
+
+Every model here is extra="ignore", never extra="forbid": a new key in herdr's
+JSON output is a herdr upgrade, not a typo, and must not fail the parse.
+"""
 
 from typing import Any, cast
 

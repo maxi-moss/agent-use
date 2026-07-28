@@ -31,5 +31,8 @@ T_BUDGET_UPDATE = "budget_update"  # broker -> master
 DECISION_ALLOW = "allow"
 DECISION_ESCALATED = "escalated"
 
+# The hook's own deadline must always expire first, so it exits 0 on its own
+# terms and degrades the session predictably. If Claude Code's settings.json
+# timeout fired first it would kill the process mid-wait instead.
 HOOK_WAIT_SECONDS = 30      # hook-internal hard timeout
 HOOK_SETTINGS_TIMEOUT = 60  # settings.json "timeout" — deliberately 2x the above

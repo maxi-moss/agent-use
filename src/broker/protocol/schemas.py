@@ -1,4 +1,8 @@
-"""Socket-protocol pydantic models. Brokers only — the hook must never import this."""
+"""Socket-protocol pydantic models. Brokers only — the hook must never import this.
+
+Every model here is extra="ignore", never extra="forbid": an unknown wire field
+means a newer peer, not a typo. Config models are the strict half of that pair.
+"""
 
 from typing import Any, Literal
 
