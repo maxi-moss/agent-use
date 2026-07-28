@@ -225,6 +225,7 @@ def agent_start(
     kind: str,
     pane_id: str,
     timeout_ms: int,
+    agent_args: list[str] | None = None,
 ) -> AgentStartResult:
     """Start an agent in an existing pane.
 
@@ -233,6 +234,7 @@ def agent_start(
         kind: Agent kind, passed through to ``--kind``.
         pane_id: Pane the agent takes over.
         timeout_ms: herdr's own start timeout, in milliseconds.
+        agent_args: Arguments forwarded to the agent binary after ``--``.
 
     Returns:
         The parsed start result, unwrapped from any ``result`` envelope.
@@ -250,6 +252,8 @@ def agent_start(
         "--pane", pane_id,
         "--timeout", str(timeout_ms),
     ]
+    if agent_args:
+        argv += ["--", *agent_args]
     stdout = _run(argv, timeout_s=timeout_ms / 1000 + 10.0)
     return AgentStartResult.model_validate(_unwrap_result(_parse_json(stdout)))
 

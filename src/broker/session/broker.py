@@ -82,6 +82,11 @@ SUBMIT_TIMEOUT_S = 15.0
 MASTER_TIMEOUT_S = 10.0
 SESSION_BIND_TIMEOUT_S = 60.0
 
+# Forwarded to the claude binary at spawn. "auto" classifies each tool call and
+# still prompts on the risky ones, so the hook's escalation path survives;
+# "bypassPermissions" would silently approve every escalation.
+CLAUDE_AGENT_ARGS = ["--model", "opus", "--permission-mode", "auto"]
+
 Job = Callable[[], Awaitable[None]]
 
 
@@ -222,6 +227,7 @@ class SessionBroker:
             kind="claude",
             pane_id=self.pane_id,
             timeout_ms=30000,
+            agent_args=CLAUDE_AGENT_ARGS,
         )
         session = start.agent_session
         # Optimistic fill-in only: the SessionStart hook may already have

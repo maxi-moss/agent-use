@@ -94,6 +94,25 @@ def test_agent_start_with_session(fake: Any) -> None:
     assert result.agent_session.value == "7dfd77f8-a848-4a35-9122-d5343e019082"
 
 
+def test_agent_start_forwards_agent_args(fake: Any) -> None:
+    """Args land after `--`; dropping them would launch claude in default mode."""
+    run = fake(stdout=(FIXTURES / "agent_start_with_session.json").read_text())
+    driver.agent_start(
+        "sess-a1",
+        kind="claude",
+        pane_id="w3:p2",
+        timeout_ms=30000,
+        agent_args=["--model", "opus", "--permission-mode", "auto"],
+    )
+    assert run.calls == [[
+        "herdr", "agent", "start", "sess-a1",
+        "--kind", "claude",
+        "--pane", "w3:p2",
+        "--timeout", "30000",
+        "--", "--model", "opus", "--permission-mode", "auto",
+    ]]
+
+
 def test_agent_start_without_session(fake: Any) -> None:
     """agent_session absent when the trust dialog blocked init — must parse."""
     fake(stdout=(FIXTURES / "agent_start_no_session.json").read_text())
