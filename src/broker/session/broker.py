@@ -83,6 +83,7 @@ from broker.transcript.adapter import read_cleaned
 from broker.transcript.schemas import (
     AskUserAnswer,
     AssistantText,
+    Question,
     TranscriptEvent,
     UserPrompt,
 )
@@ -1022,15 +1023,15 @@ def _count_user_prompts(events: list[TranscriptEvent]) -> int:
 
 def _render_ask_user(
     tool_input: dict[str, Any],
-) -> tuple[str, list[dict[str, str]], str]:
+) -> tuple[str, list[Alternative], str]:
     """Render ``AskUserQuestion`` tool input into escalation fields.
 
-    Question and option text pass through untouched. Malformed entries are
-    skipped rather than guessed at.
+    Question and option text pass through untouched. Entries that do not
+    validate are skipped rather than guessed at, so a malformed payload still
+    yields a usable "answer in the pane" escalation.
 
     Args:
-        tool_input: Raw tool input; ``questions``, and the ``options`` within
-            each, are used only when they are lists of dicts.
+        tool_input: Raw ``AskUserQuestion`` tool input.
 
     Returns:
         The rendered question text, the alternatives list (falling back to a
@@ -1038,41 +1039,35 @@ def _render_ask_user(
         option's label when it is marked ``(Recommended)``.
     """
     lines: list[str] = []
-    alternatives: list[dict[str, str]] = []
+    alternatives: list[Alternative] = []
     recommendation = "answer in the pane"
     raw_questions = tool_input.get("questions")
     questions = (
         cast(list[Any], raw_questions) if isinstance(raw_questions, list) else []
     )
     for raw_question in questions:
-        if not isinstance(raw_question, dict):
+        try:
+            question = Question.model_validate(raw_question)
+        except ValidationError:
+            logger.warning("skipping malformed AskUserQuestion entry")
             continue
-        question = cast(dict[str, Any], raw_question)
-        header = str(question.get("header", ""))
-        lines.append(f"{question.get('question', '')} [{header}]")
-        raw_options = question.get("options")
-        options = (
-            cast(list[Any], raw_options) if isinstance(raw_options, list) else []
-        )
-        for i, raw_option in enumerate(options):
-            if not isinstance(raw_option, dict):
-                continue
-            option = cast(dict[str, Any], raw_option)
-            label = str(option.get("label", ""))
-            description = str(option.get("description", ""))
-            lines.append(f"- {label}: {description}")
+        lines.append(f"{question.question} [{question.header}]")
+        for i, option in enumerate(question.options):
+            lines.append(f"- {option.label}: {option.description}")
             alternatives.append(
-                {"option": label, "pros": description, "cons": ""}
+                Alternative(
+                    option=option.label, pros=option.description, cons=""
+                )
             )
-            if i == 0 and "(Recommended)" in label:
-                recommendation = label
+            if i == 0 and "(Recommended)" in option.label:
+                recommendation = option.label
     if not alternatives:
         alternatives = [
-            {
-                "option": "answer in the pane",
-                "pros": "the native menu is authoritative",
-                "cons": "",
-            }
+            Alternative(
+                option="answer in the pane",
+                pros="the native menu is authoritative",
+                cons="",
+            )
         ]
     rendered = "\n".join(lines) or "(question content unavailable)"
     return rendered, alternatives, recommendation
