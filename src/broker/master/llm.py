@@ -97,6 +97,20 @@ class StopSessionArgs(BaseModel):
     session_id: str
 
 
+class ReactivateSessionArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    intent: str
+
+
+class ReassignSessionArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    intent: str
+
+
 @dataclass(frozen=True, slots=True)
 class MasterTool[M: BaseModel]:
     """A master tool's wire schema paired with the runtime call it dispatches to."""
@@ -159,6 +173,22 @@ _REGISTRY = (
         "Terminate a session and its broker.",
         StopSessionArgs,
         lambda rt, a: rt.stop_session(a.session_id),
+    ),
+    MasterTool(
+        "reactivate_session",
+        "Give a completed session a new task, keeping its broker and its "
+        "chat. Pass the developer's intent VERBATIM — the session broker "
+        "grounds it. Refused unless the session is completed.",
+        ReactivateSessionArgs,
+        lambda rt, a: rt.reactivate_session(a.session_id, a.intent),
+    ),
+    MasterTool(
+        "reassign_session",
+        "Replace a session's broker with a fresh one and give it a new task, "
+        "keeping the session's pane and chat. Use when the broker is stuck or "
+        "errored. Pass the developer's intent VERBATIM.",
+        ReassignSessionArgs,
+        lambda rt, a: rt.reassign_session(a.session_id, a.intent),
     ),
 )
 

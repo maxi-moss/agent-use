@@ -5,6 +5,21 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict
 
 
+class AdoptedSession(BaseModel):
+    """A live Claude session a replacement broker takes over instead of starting.
+
+    Every field is required: a broker that only partly knows the session it is
+    adopting would drive a pane it cannot read, or read a transcript it cannot
+    drive.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    pane_id: str
+    claude_session_id: str
+    transcript_path: str
+
+
 class SessionBrokerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
@@ -20,3 +35,4 @@ class SessionBrokerConfig(BaseModel):
     max_tokens: int
     watchdog_seconds: float
     budget_max: int
+    adopt: AdoptedSession | None = None  # set only when reassigned

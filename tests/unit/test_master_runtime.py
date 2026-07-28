@@ -3,13 +3,14 @@ runtime server; driver.subprocess.run monkeypatched; app_post = recording list."
 
 import asyncio
 import contextlib
+import json
 import logging
 import subprocess
 import tempfile
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -31,6 +32,7 @@ from broker.protocol.constants import (
     T_ESCALATION,
     T_FATAL_ERROR,
     T_PROMPT_PROPOSAL,
+    T_REACTIVATE,
     T_RETRACT,
 )
 from broker.protocol.schemas import Envelope, EscalationPayload, Response
@@ -73,6 +75,48 @@ class NackingSession:
         return Response(id=env.id, ok=False)
 
 
+class ReasoningNackSession:
+    """Session-socket handler that rejects and says why."""
+
+    reason = "session is 'driving', not 'completed'"
+
+    async def handler(self, env: Envelope) -> Response:
+        return Response(id=env.id, ok=False, payload={"error": self.reason})
+
+
+class FakeProcess:
+    """Stand-in for the session-broker subprocess."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.returncode: int | None = None
+
+    async def wait(self) -> int:
+        self.returncode = 0
+        return 0
+
+    def terminate(self) -> None:
+        self.returncode = -15
+
+
+class RecordingSpawn:
+    """Stand-in for asyncio.create_subprocess_exec that records each argv."""
+
+    def __init__(self) -> None:
+        self.argvs: list[tuple[str, ...]] = []
+
+    async def __call__(self, *argv: str) -> FakeProcess:
+        self.argvs.append(argv)
+        return FakeProcess(4242 + len(self.argvs))
+
+    def config(self) -> dict[str, Any]:
+        """Decode --config-json from the most recent spawn."""
+        argv = self.argvs[-1]
+        return cast(
+            dict[str, Any], json.loads(argv[argv.index("--config-json") + 1])
+        )
+
+
 class MalformedLogSession:
     """Session-socket handler answering get_decision_log with no text field."""
 
@@ -102,6 +146,13 @@ def escalation_dict(esc_id: str = "e1") -> dict[str, Any]:
 def recording_run(monkeypatch: pytest.MonkeyPatch) -> RecordingRun:
     rec = RecordingRun()
     monkeypatch.setattr(driver.subprocess, "run", rec)
+    return rec
+
+
+@pytest.fixture
+def spawn(monkeypatch: pytest.MonkeyPatch) -> RecordingSpawn:
+    rec = RecordingSpawn()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", rec)
     return rec
 
 
@@ -413,6 +464,140 @@ async def test_get_decision_log_warns_and_returns_empty_on_malformed_reply(
             result = await runtime.get_decision_log("s1")
         assert result == ""
         assert any("malformed" in r.message.lower() for r in caplog.records)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+def _bind_session(runtime: MasterRuntime) -> SessionRecord:
+    """Give s1 the identifiers a reassignment has to carry over."""
+    record = runtime.registry.get("s1")
+    record.pane_id = "w3:p2"
+    record.claude_session_id = "cc-1"
+    record.transcript_path = "/private/tmp/t.jsonl"
+    record.approved_prompt = "the first task"
+    record.budget_count = 6
+    runtime.registry.upsert(record)
+    return record
+
+
+async def test_reassign_spawns_a_broker_that_adopts_the_live_session(
+    rt: tuple[MasterRuntime, list[Any]], home: Path, spawn: RecordingSpawn
+) -> None:
+    runtime, _ = rt
+    record = _bind_session(runtime)
+    result = await runtime.reassign_session("s1", "take it from here")
+    assert "reassigned" in result
+    config = spawn.config()
+    assert config["name"] == "s1"
+    # The SAME socket path: BROKER_SOCKET was baked into the pane's
+    # environment at split time, so a replacement broker bound anywhere else
+    # would never see another hook event from this session.
+    assert config["socket_path"] == record.socket_path
+    assert config["intent"] == "take it from here"
+    assert config["budget_count"] == 0
+    assert config["adopt"] == {
+        "pane_id": "w3:p2",
+        "claude_session_id": "cc-1",
+        "transcript_path": "/private/tmp/t.jsonl",
+    }
+    reloaded = Registry.load(home / "registry.json").get("s1")
+    assert reloaded.intent == "take it from here"
+    assert reloaded.approved_prompt is None  # superseded until re-approved
+    assert reloaded.budget_count == 0
+    assert reloaded.state == "spawning"
+    assert reloaded.pid is not None  # the new broker, not the dead one
+
+
+async def test_reassign_refuses_a_session_it_only_partly_knows(
+    rt: tuple[MasterRuntime, list[Any]], spawn: RecordingSpawn
+) -> None:
+    runtime, _ = rt
+    record = runtime.registry.get("s1")
+    record.pane_id = "w3:p2"  # no claude session id, no transcript path
+    runtime.registry.upsert(record)
+    with pytest.raises(ValueError) as exc:
+        await runtime.reassign_session("s1", "take it from here")
+    assert "claude_session_id" in str(exc.value)
+    assert "transcript_path" in str(exc.value)
+    # Refusing AFTER the teardown would leave the session with no broker at
+    # all — the check has to come first.
+    assert spawn.argvs == []
+    assert runtime.registry.get("s1").state == "driving"
+
+
+async def test_reassign_refuses_while_a_broker_still_answers(
+    rt: tuple[MasterRuntime, list[Any]],
+    home: Path,
+    spawn: RecordingSpawn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("broker.master.runtime.STOP_WAIT_S", 0.3)
+    runtime, _ = rt
+    _bind_session(runtime)
+    stub = StubSession()
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        with pytest.raises(RuntimeError) as exc:
+            await runtime.reassign_session("s1", "take it from here")
+        assert "refusing to reassign" in str(exc.value)
+        # A unix rebind over a live listener succeeds silently; two brokers
+        # would then split this pane's hook traffic between them.
+        assert spawn.argvs == []
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_reactivate_relays_the_intent_and_supersedes_the_old_one(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, _ = rt
+    record = runtime.registry.get("s1")
+    record.state = "completed"
+    record.approved_prompt = "the first task"
+    record.budget_count = 4
+    runtime.registry.upsert(record)
+    stub = StubSession()
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        result = await runtime.reactivate_session("s1", "now write the docs")
+        assert "reactivated" in result
+        assert len(stub.envelopes) == 1
+        assert stub.envelopes[0].type == T_REACTIVATE
+        assert stub.envelopes[0].payload == {"intent": "now write the docs"}
+        reloaded = Registry.load(home / "registry.json").get("s1")
+        assert reloaded.intent == "now write the docs"
+        assert reloaded.approved_prompt is None  # superseded until re-approved
+        assert reloaded.budget_count == 0
+        assert reloaded.state == "grounding"
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_reactivate_rejection_surfaces_the_reason_and_changes_nothing(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, posts = rt
+    record = runtime.registry.get("s1")
+    record.approved_prompt = "the first task"
+    record.budget_count = 4
+    runtime.registry.upsert(record)
+    stub = ReasoningNackSession()
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        result = await runtime.reactivate_session("s1", "displace it")
+        # The broker's own reason reaches the developer; "refused" alone would
+        # not say which task is still running.
+        assert stub.reason in result
+        assert any(stub.reason in m.text for m in posts if isinstance(m, Notice))
+        # A refused reactivation must not read as if the new task took.
+        reloaded = runtime.registry.get("s1")
+        assert reloaded.intent != "displace it"
+        assert reloaded.approved_prompt == "the first task"
+        assert reloaded.budget_count == 4
+        assert reloaded.state == "driving"
     finally:
         server.close()
         await server.wait_closed()

@@ -285,6 +285,8 @@ def test_master_tools_are_strict_and_complete() -> None:
         "send_to_session",
         "get_decision_log",
         "stop_session",
+        "reactivate_session",
+        "reassign_session",
     ]
     for tool in MASTER_TOOLS:
         assert tool.get("strict") is True

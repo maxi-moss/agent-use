@@ -38,6 +38,7 @@ from broker.protocol.constants import (
     T_HOOK_EVENT,
     T_PERMISSION_REQUEST,
     T_PROMPT_PROPOSAL,
+    T_REACTIVATE,
     T_RETRACT,
     T_SEND_PROMPT,
     T_SHUTDOWN,
@@ -52,12 +53,13 @@ from broker.protocol.schemas import (
     HookEventPayload,
     PermissionDecisionPayload,
     PermissionRequestPayload,
+    ReactivatePayload,
     Response,
     SendPromptPayload,
     StatusPayload,
 )
 from broker.session import decision_log
-from broker.session.config import SessionBrokerConfig
+from broker.session.config import AdoptedSession, SessionBrokerConfig
 from broker.session.triage import (
     AnswerCall,
     CompleteCall,
@@ -159,6 +161,7 @@ class SessionBroker:
         self.claude_session_id: str | None = None
         self.transcript_path: Path | None = None
         self.budget_count = cfg.budget_count
+        self.intent = cfg.intent  # replaced outright on reactivation
         self.approved_prompt: str | None = None
 
         self.session_bound = asyncio.Event()
@@ -200,10 +203,39 @@ class SessionBroker:
             await server.wait_closed()
 
     async def _launch(self) -> None:
-        """Split a pane, bind the session, then ground and submit the prompt.
+        """Take over or start a Claude session, then ground and submit the task.
 
-        Approval is synchronous and blocking, with no timeout — the broker
-        never decides the opening prompt for the developer.
+        Raises:
+            FatalSessionError: A fresh start saw no SessionStart hook event
+                within ``SESSION_BIND_TIMEOUT_S``.
+        """
+        if self.cfg.adopt is not None:
+            self._adopt(self.cfg.adopt)
+        else:
+            await self._start_session()
+        await self._ground_and_submit(self.cfg.intent)
+
+    def _adopt(self, adopt: AdoptedSession) -> None:
+        """Take over a Claude session a previous broker was driving.
+
+        The pane, chat and transcript already exist and SessionStart fired for
+        the outgoing broker, so nothing is started and nothing is waited for.
+
+        Args:
+            adopt: Pane, Claude session id and transcript path to take over.
+        """
+        self.pane_id = adopt.pane_id
+        self.claude_session_id = adopt.claude_session_id
+        self.transcript_path = Path(adopt.transcript_path)
+        self.session_bound.set()
+        self._log(
+            "adopted",
+            "reassigned to a session that was already running",
+            f"pane={adopt.pane_id} claude_session={adopt.claude_session_id}",
+        )
+
+    async def _start_session(self) -> None:
+        """Split a pane, start Claude in it, and wait for the session to bind.
 
         Raises:
             FatalSessionError: No SessionStart hook event arrived within
@@ -249,13 +281,25 @@ class SessionBroker:
                 f"no SessionStart hook event within {SESSION_BIND_TIMEOUT_S:.0f} s",
             ) from None
 
+    async def _ground_and_submit(self, intent: str) -> None:
+        """Ground an intent into a prompt, await approval, and submit it.
+
+        Approval is synchronous and blocking, with no timeout — the broker
+        never decides the opening prompt of a task for the developer.
+
+        Args:
+            intent: Raw task intent, superseding whatever this broker was
+                driving before.
+        """
+        self.intent = intent
+        self.approved_prompt = None  # superseded until the developer approves
         self._set_state("grounding")
         assert self._llm_call is not None
         proposal = await ground_intent(
             self._llm_call,
             self.broker_cfg,
-            intent=cfg.intent,
-            cwd=Path(cfg.cwd),
+            intent=intent,
+            cwd=Path(self.cfg.cwd),
         )
         self._proposal_id = uuid.uuid4().hex
         loop = asyncio.get_running_loop()
@@ -352,6 +396,26 @@ class SessionBroker:
         if env.type == T_DISPATCH_DECISION:
             decision = DispatchDecisionPayload.model_validate(env.payload)
             self.queue.put_nowait(lambda: self._deliver_decision(decision))
+            return Response(id=env.id, ok=True)
+
+        if env.type == T_REACTIVATE:
+            reactivate = ReactivatePayload.model_validate(env.payload)
+            if self.state != "completed":
+                return Response(
+                    id=env.id,
+                    ok=False,
+                    payload={
+                        "error": (
+                            f"session is {self.state!r}, not 'completed' — "
+                            "reassign a new broker instead of displacing the "
+                            "task this one is still driving"
+                        )
+                    },
+                )
+            # Closes the gate here, not in the job: a second reactivate
+            # arriving before the queue drains must not pass it too.
+            self._set_state("grounding")
+            self.queue.put_nowait(lambda: self._reactivate(reactivate))
             return Response(id=env.id, ok=True)
 
         if env.type == T_SEND_PROMPT:
@@ -729,6 +793,22 @@ class SessionBroker:
         self._set_state("driving")
         self._log("dispatched", "developer decision delivered", decision.response)
 
+    async def _reactivate(self, payload: ReactivatePayload) -> None:
+        """Drive a new task through the session that just completed one.
+
+        The pane, chat and transcript carry over untouched — only the task
+        changes. Direct developer contact resets the autonomous answer budget.
+
+        Args:
+            payload: The new task intent, grounded before anything is typed.
+        """
+        self._log("reactivated", "new task in the same session", payload.intent)
+        self._active_escalation = None
+        self._pending_ask_id = None
+        self.budget_count = 0
+        await self._to_master(T_BUDGET_UPDATE, {"count": 0})
+        await self._ground_and_submit(payload.intent)
+
     async def _send_developer_prompt(self, prompt: SendPromptPayload) -> None:
         """Relay a developer-authored prompt into the pane verbatim.
 
@@ -783,7 +863,7 @@ class SessionBroker:
 
     def _intent(self) -> str:
         """Return the authoritative intent: the approved prompt if any."""
-        return self.approved_prompt or self.cfg.intent
+        return self.approved_prompt or self.intent
 
     def _read_transcript(self) -> list[TranscriptEvent]:
         """Read the session transcript as cleaned events.

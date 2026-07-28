@@ -159,6 +159,14 @@ class ApprovePromptPayload(BaseModel):
     prompt: str
 
 
+class ReactivatePayload(BaseModel):
+    """master -> broker: a new task for a session that already completed one."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    intent: str
+
+
 class BudgetUpdatePayload(BaseModel):
     """broker -> master: autonomous-answer counter for registry persistence."""
 

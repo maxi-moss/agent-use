@@ -47,6 +47,7 @@ from broker.protocol.constants import (
     T_FATAL_ERROR,
     T_GET_DECISION_LOG,
     T_PROMPT_PROPOSAL,
+    T_REACTIVATE,
     T_RETRACT,
     T_SEND_PROMPT,
     T_SHUTDOWN,
@@ -61,6 +62,7 @@ from broker.protocol.schemas import (
     EscalationPayload,
     FatalErrorPayload,
     PromptProposalPayload,
+    ReactivatePayload,
     Response,
     RetractPayload,
     SendPromptPayload,
@@ -76,6 +78,58 @@ AppPost = Callable[[Message], object]
 
 REQUEST_TIMEOUT_S = 10.0
 STOP_WAIT_S = 10.0
+SOCKET_POLL_S = 0.1
+SOCKET_PROBE_TIMEOUT_S = 2.0
+
+
+async def _broker_is_listening(path: Path) -> bool:
+    """Report whether anything still accepts connections on a session socket.
+
+    Args:
+        path: Session socket to probe.
+
+    Returns:
+        ``True`` when the connection is accepted, and also when the probe
+        itself is inconclusive — an ambiguous result must never read as free.
+    """
+    try:
+        async with asyncio.timeout(SOCKET_PROBE_TIMEOUT_S):
+            _, writer = await asyncio.open_unix_connection(str(path))
+    except TimeoutError:
+        return True  # BEFORE OSError, which TimeoutError subclasses
+    except OSError:
+        return False  # nothing bound, or a stale file refusing connections
+    writer.close()
+    with contextlib.suppress(OSError, ConnectionError):
+        await writer.wait_closed()
+    return True
+
+
+def _adoption_fields(record: SessionRecord) -> dict[str, str]:
+    """Build the block a replacement broker needs to adopt a live session.
+
+    Args:
+        record: Registry record of the session being reassigned.
+
+    Returns:
+        The pane id, Claude session id and transcript path, all present.
+
+    Raises:
+        ValueError: Any of them is unknown. A broker must never adopt a
+            session it only partly knows.
+    """
+    known = {
+        "pane_id": record.pane_id,
+        "claude_session_id": record.claude_session_id,
+        "transcript_path": record.transcript_path,
+    }
+    missing = sorted(field for field, value in known.items() if not value)
+    if missing:
+        raise ValueError(
+            f"session {record.name} cannot be reassigned: the registry has no "
+            + ", ".join(missing)
+        )
+    return {field: value for field, value in known.items() if value}
 
 
 class ProtocolViolation(Exception):
@@ -401,41 +455,88 @@ class MasterRuntime:
         if not cwd_path.is_dir():
             raise ValueError(f"cwd does not exist: {cwd}")
         name = self.registry.allocate_name()
-        socket_path = self.paths.session_socket(name)
         record = SessionRecord(
             name=name,
-            socket_path=str(socket_path),
+            socket_path=str(self.paths.session_socket(name)),
             cwd=str(cwd_path),
             anchor_pane=self.anchor_pane,
             intent=intent,
         )
         seed_trust(cwd_path)  # BEFORE spawn — the dialog eats input
-        config_json = json.dumps(
-            {
-                "name": name,
-                "socket_path": str(socket_path),
-                "master_socket_path": str(self.master_socket_path),
-                "broker_home": str(self.paths.home),
-                "cwd": str(cwd_path),
-                "anchor_pane": self.anchor_pane,
-                "intent": intent,
-                "budget_count": record.budget_count,
-                "model_id": self.cfg.model_id,
-                "max_tokens": self.cfg.max_tokens,
-                "watchdog_seconds": self.cfg.watchdog_seconds,
-                "budget_max": self.cfg.budget_max,
-            }
-        )
-        # By module string, never by import — keeps the module boundary
-        # structural.
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "broker.session", "--config-json", config_json
-        )
+        proc = await self._spawn_broker(record, adopt=None)
         record.pid = proc.pid
         self._procs[name] = proc
         self.registry.upsert(record)
         self.app_post(SessionStatusChanged(name, record.state))
         return f"spawned session {name} (pid {proc.pid}) in {cwd_path}"
+
+    async def reassign_session(self, session_id: str, intent: str) -> str:
+        """Hand a live session to a freshly spawned broker with a new task.
+
+        The Claude session, its pane and its transcript survive; only the
+        broker driving them is replaced. The new broker reuses the session's
+        socket path, because ``BROKER_SOCKET`` was baked into the pane's
+        environment when it was split and cannot be changed afterwards.
+
+        Args:
+            session_id: Registry name of the session to hand over.
+            intent: Raw developer intent for the new task.
+
+        Returns:
+            A confirmation line naming the session and the new broker's pid.
+
+        Raises:
+            ValueError: The registry does not know the session's pane, Claude
+                session id or transcript path.
+            RuntimeError: A broker is still answering on the session socket.
+        """
+        record = self.registry.get(session_id)
+        # BEFORE anything is torn down: an unreassignable session must not be
+        # left with its old broker killed and no replacement.
+        adopt = _adoption_fields(record)
+        await self.stop_session(session_id)
+        await self._require_socket_free(record)
+        record.intent = intent
+        record.approved_prompt = None  # superseded; set again on approval
+        record.budget_count = 0
+        proc = await self._spawn_broker(record, adopt=adopt)
+        record.pid = proc.pid
+        self._procs[session_id] = proc
+        self.registry.upsert(record)
+        self._set_state(session_id, "spawning")
+        return (
+            f"session {session_id} reassigned to a new broker (pid {proc.pid})"
+        )
+
+    async def reactivate_session(self, session_id: str, intent: str) -> str:
+        """Give a completed session a new task without replacing its broker.
+
+        Args:
+            session_id: Registry name of the completed session.
+            intent: Raw developer intent for the new task.
+
+        Returns:
+            A confirmation line, or a rejection when the session is not
+            completed and so has a task it is still driving.
+        """
+        record = self.registry.get(session_id)
+        env = self._env(
+            T_REACTIVATE, ReactivatePayload(intent=intent).model_dump()
+        )
+        rejected = await self._deliver(
+            record.socket_path,
+            env,
+            rejection=f"session {session_id} refused reactivation",
+        )
+        if rejected is not None:
+            self.app_post(Notice(rejected))
+            return rejected
+        record.intent = intent
+        record.approved_prompt = None  # superseded; set again on approval
+        record.budget_count = 0
+        self.registry.upsert(record)
+        self._set_state(session_id, "grounding")
+        return f"session {session_id} reactivated — grounding the new task"
 
     async def approve_prompt(self, proposal_id: str, prompt: str) -> str:
         """Approve a pending prompt proposal and send it to its session.
@@ -645,6 +746,70 @@ class MasterRuntime:
 
     # ── internals ────────────────────────────────────────────────────────────
 
+    async def _spawn_broker(
+        self, record: SessionRecord, *, adopt: dict[str, str] | None
+    ) -> asyncio.subprocess.Process:
+        """Start a session-broker subprocess for ``record``.
+
+        Args:
+            record: Supplies the identity, socket, cwd, intent and budget the
+                broker starts from.
+            adopt: Pane, Claude session and transcript of a running session the
+                broker takes over; ``None`` starts a fresh one.
+
+        Returns:
+            The spawned process.
+        """
+        config: dict[str, Any] = {
+            "name": record.name,
+            "socket_path": record.socket_path,
+            "master_socket_path": str(self.master_socket_path),
+            "broker_home": str(self.paths.home),
+            "cwd": record.cwd,
+            "anchor_pane": record.anchor_pane,
+            "intent": record.intent,
+            "budget_count": record.budget_count,
+            "model_id": self.cfg.model_id,
+            "max_tokens": self.cfg.max_tokens,
+            "watchdog_seconds": self.cfg.watchdog_seconds,
+            "budget_max": self.cfg.budget_max,
+        }
+        if adopt is not None:
+            config["adopt"] = adopt
+        # By module string, never by import — keeps the module boundary
+        # structural.
+        return await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "broker.session",
+            "--config-json",
+            json.dumps(config),
+        )
+
+    async def _require_socket_free(self, record: SessionRecord) -> None:
+        """Block until nothing answers on a session's socket.
+
+        The replacement broker binds the same path, and a unix socket rebind
+        over a live listener succeeds silently — two brokers would then split
+        the pane's hook traffic between them.
+
+        Args:
+            record: Registry record of the session being reassigned.
+
+        Raises:
+            RuntimeError: A broker was still accepting connections after
+                ``STOP_WAIT_S``.
+        """
+        path = Path(record.socket_path)
+        deadline = asyncio.get_running_loop().time() + STOP_WAIT_S
+        while await _broker_is_listening(path):
+            if asyncio.get_running_loop().time() >= deadline:
+                raise RuntimeError(
+                    f"session {record.name}: a broker is still serving "
+                    f"{path} after {STOP_WAIT_S:.0f} s — refusing to reassign"
+                )
+            await asyncio.sleep(SOCKET_POLL_S)
+
     def _set_state(self, name: str, state: str) -> None:
         """Record a session's new state and tell the TUI.
 
@@ -692,13 +857,17 @@ class MasterRuntime:
             rejection: Message logged and returned when the session NACKs.
 
         Returns:
-            ``None`` when the session ACKed, otherwise ``rejection``.
+            ``None`` when the session ACKed, otherwise ``rejection``, with the
+            broker's own reason appended when it sent one.
         """
         resp = await client.request(
             Path(socket_path), env, timeout_s=REQUEST_TIMEOUT_S
         )
         if resp.ok:
             return None
+        reason = resp.payload.get("error")
+        if isinstance(reason, str) and reason:
+            rejection = f"{rejection}: {reason}"
         logger.warning("%s", rejection)
         return rejection
 

@@ -17,6 +17,7 @@ T_GET_DECISION_LOG = "get_decision_log"
 T_SHUTDOWN = "shutdown"
 T_RESPONSE = "response"
 T_APPROVE_PROMPT = "approve_prompt"  # master -> broker
+T_REACTIVATE = "reactivate"  # master -> broker
 
 # Master-socket message types
 T_ESCALATION = "escalation"

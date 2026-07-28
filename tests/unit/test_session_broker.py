@@ -7,7 +7,8 @@ import subprocess
 import tempfile
 import time
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -20,19 +21,21 @@ from broker.protocol import client
 from broker.protocol.constants import (
     T_APPROVE_PROMPT,
     T_BUDGET_UPDATE,
+    T_COMPLETION,
     T_DISPATCH_DECISION,
     T_ESCALATION,
     T_FATAL_ERROR,
     T_HOOK_EVENT,
     T_PERMISSION_REQUEST,
     T_PROMPT_PROPOSAL,
+    T_REACTIVATE,
     T_RETRACT,
     T_STATUS,
 )
 from broker.protocol.schemas import Envelope, Response
 from broker.protocol.server import serve_unix
 from broker.session.broker import SessionBroker
-from broker.session.config import SessionBrokerConfig
+from broker.session.config import AdoptedSession, SessionBrokerConfig
 
 FIXTURES = Path(__file__).parent.parent / "fixtures"
 HERDR_FIXTURES = FIXTURES / "herdr"
@@ -41,6 +44,11 @@ TRANSCRIPT_FIXTURE = (
     FIXTURES / "transcripts" / "d4032982-9753-4cce-ac1a-589ee8fe7e19.jsonl"
 )
 ANSWERED_ASK_ID = "toolu_01JkpyNV1bx66fUu8xkoanws"
+# Identifiers a reassigned broker adopts — deliberately unlike the ones the
+# pane_split/agent_start fixtures return, so an adopted broker that fell back
+# to starting its own session would show it.
+ADOPTED_PANE = "w9:p9"
+ADOPTED_SESSION = "cc-adopted"
 
 ANSWER_RESULT = ToolCall(
     name="answer", input={"reasoning": "grounded", "answer": "use oauth"}
@@ -185,10 +193,10 @@ def home(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
         yield Path(d)
 
 
-@pytest.fixture
-async def harness(
-    home: Path, monkeypatch: pytest.MonkeyPatch
-) -> AsyncIterator[Harness]:
+@asynccontextmanager
+async def _harness(
+    home: Path, monkeypatch: pytest.MonkeyPatch, *, adopt: bool
+) -> AsyncGenerator[Harness]:
     transcript = home / "t.jsonl"
     shutil.copy(TRANSCRIPT_FIXTURE, transcript)
     cwd = home / "work"
@@ -211,6 +219,15 @@ async def harness(
         max_tokens=1024,
         watchdog_seconds=300.0,
         budget_max=8,
+        adopt=(
+            AdoptedSession(
+                pane_id=ADOPTED_PANE,
+                claude_session_id=ADOPTED_SESSION,
+                transcript_path=str(transcript),
+            )
+            if adopt
+            else None
+        ),
     )
     broker = SessionBroker(cfg, llm_call=llm)
     run_task = asyncio.create_task(broker.run())
@@ -238,22 +255,38 @@ async def harness(
     await master_server.wait_closed()
 
 
-async def launch(h: Harness) -> None:
-    """Walk the launch sequence to the driving state."""
-    await client.notify(
-        h.sock,
-        hook_env(
-            "SessionStart",
-            {"session_id": "cc-1", "transcript_path": str(h.transcript)},
-        ),
-    )
+@pytest.fixture
+async def harness(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[Harness]:
+    async with _harness(home, monkeypatch, adopt=False) as h:
+        yield h
+
+
+@pytest.fixture
+async def adopted(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[Harness]:
+    async with _harness(home, monkeypatch, adopt=True) as h:
+        yield h
+
+
+async def ground_and_approve(h: Harness, *, count: int, prompt: str) -> None:
+    """Answer the grounding call, then approve the proposal it produces.
+
+    Args:
+        h: The running harness.
+        count: Which proposal to approve, 1-based — reactivation raises a
+            second one.
+        prompt: The text the developer approves.
+    """
     await h.llm.results.put(
         ToolCall(
             name="propose_prompt",
             input={"reasoning": "grounded in cwd", "prompt": "GROUNDED PROMPT"},
         )
     )
-    proposal = await h.master.wait_for(T_PROMPT_PROPOSAL)
+    proposal = await h.master.wait_for(T_PROMPT_PROPOSAL, count=count)
     assert h.broker.state == "awaiting_approval"
     resp = await client.request(
         h.sock,
@@ -263,13 +296,54 @@ async def launch(h: Harness) -> None:
             session_id="s1",
             payload={
                 "proposal_id": proposal.payload["proposal_id"],
-                "prompt": "APPROVED PROMPT",
+                "prompt": prompt,
             },
         ),
         timeout_s=5.0,
     )
     assert resp.ok is True
     await wait_state(h.broker, "driving")
+
+
+async def launch(h: Harness) -> None:
+    """Walk the launch sequence to the driving state."""
+    await client.notify(
+        h.sock,
+        hook_env(
+            "SessionStart",
+            {"session_id": "cc-1", "transcript_path": str(h.transcript)},
+        ),
+    )
+    await ground_and_approve(h, count=1, prompt="APPROVED PROMPT")
+
+
+async def complete(h: Harness) -> None:
+    """Drive one turn boundary to the completed state."""
+    await client.notify(
+        h.sock, hook_env("Stop", {"last_assistant_message": "all done"})
+    )
+    await h.llm.results.put(
+        ToolCall(
+            name="complete",
+            input={"reasoning": "task finished", "summary": "shipped it"},
+        )
+    )
+    await h.master.wait_for(T_COMPLETION)
+    await wait_state(h.broker, "completed")
+
+
+async def reactivate(h: Harness, intent: str) -> Response:
+    """Ask the broker to take on a new task in the same session."""
+    return await client.request(
+        h.sock,
+        Envelope(
+            id=uuid.uuid4().hex,
+            type=T_REACTIVATE,
+            session_id="s1",
+            payload={"intent": intent},
+        ),
+        timeout_s=5.0,
+    )
 
 
 async def test_permission_request_immediate_escalated_reply(
@@ -477,6 +551,73 @@ async def test_transcript_parse_error_sends_fatal_error(
     fatal = await harness.master.wait_for(T_FATAL_ERROR)
     assert fatal.payload["error_class"] == "TranscriptParseError"
     await wait_state(harness.broker, "error")
+
+
+async def test_adopted_broker_takes_over_without_touching_the_pane(
+    adopted: Harness,
+) -> None:
+    # No SessionStart is sent: the hook fired for the outgoing broker and will
+    # not fire again. An adopting broker that waited for it would hang, and one
+    # that split a pane would strand the developer's live chat.
+    await ground_and_approve(adopted, count=1, prompt="THE HANDOVER TASK")
+    assert [c for c in adopted.run.calls if c[1:3] == ["pane", "split"]] == []
+    assert [c for c in adopted.run.calls if c[1:3] == ["agent", "start"]] == []
+    assert adopted.run.drive_calls() == [
+        ["herdr", "agent", "prompt", "s1", "THE HANDOVER TASK"],
+        ["herdr", "pane", "send-keys", ADOPTED_PANE, "enter"],
+    ]
+    resp = await client.request(
+        adopted.sock,
+        Envelope(id=uuid.uuid4().hex, type=T_STATUS, session_id="s1"),
+        timeout_s=5.0,
+    )
+    assert resp.payload["pane_id"] == ADOPTED_PANE
+    assert resp.payload["claude_session_id"] == ADOPTED_SESSION
+    assert resp.payload["transcript_path"] == str(adopted.transcript)
+
+
+async def test_reactivate_grounds_new_task_and_supersedes_the_old_intent(
+    harness: Harness,
+) -> None:
+    await launch(harness)
+    await complete(harness)
+    harness.broker.budget_count = 5
+    harness.run.calls.clear()
+    assert (await reactivate(harness, "now write the docs")).ok is True
+    await ground_and_approve(harness, count=2, prompt="THE SECOND TASK")
+    assert harness.run.drive_calls() == [
+        ["herdr", "agent", "prompt", "s1", "THE SECOND TASK"],
+        ["herdr", "pane", "send-keys", "w3:p2", "enter"],
+    ]
+    # Developer contact resets the autonomous answer budget.
+    assert harness.broker.budget_count == 0
+    assert harness.master.of_type(T_BUDGET_UPDATE)[-1].payload == {"count": 0}
+    # The new approved prompt is the authoritative intent from here on;
+    # triaging the second task against the first one's would misclassify it.
+    await client.notify(
+        harness.sock, hook_env("Stop", {"last_assistant_message": "which format?"})
+    )
+    await harness.llm.results.put(ANSWER_RESULT)
+    await harness.master.wait_for(T_BUDGET_UPDATE, count=2)
+    content = cast(
+        list[dict[str, Any]], harness.llm.calls[-1]["messages"][0]["content"]
+    )
+    assert "THE SECOND TASK" in content[0]["text"]
+    assert "APPROVED PROMPT" not in content[0]["text"]
+
+
+async def test_reactivate_refused_while_a_task_is_still_running(
+    harness: Harness,
+) -> None:
+    await launch(harness)  # driving, not completed
+    harness.run.calls.clear()
+    resp = await reactivate(harness, "do something else instead")
+    assert resp.ok is False
+    assert "driving" in resp.payload["error"]
+    await asyncio.sleep(0.1)
+    # A refused reactivation must not displace the running task.
+    assert harness.run.drive_calls() == []
+    assert harness.broker.state == "driving"
 
 
 async def test_status_answers_with_bound_identifiers(harness: Harness) -> None:
