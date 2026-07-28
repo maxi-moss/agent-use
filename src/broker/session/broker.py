@@ -352,6 +352,29 @@ class SessionBroker:
             logger.error("invalid %s payload: %s", env.type, exc)
             return Response(id=env.id, ok=False, payload={"error": str(exc)})
 
+    def _on_permission_request(self, env: Envelope) -> Response:
+        """Answer a permission request on the hot path, then enqueue the rest.
+
+        The reply is built with zero LLM work: this is the synchronous hook
+        path, and every millisecond here is a millisecond the supervised tool
+        call is blocked.
+
+        Args:
+            env: Envelope carrying a ``PermissionRequestPayload``.
+
+        Returns:
+            The decision reply for the hook.
+        """
+        payload = PermissionRequestPayload.model_validate(env.payload)
+        self.queue.put_nowait(lambda: self._permission_passthrough(payload))
+        return Response(
+            id=env.id,
+            ok=True,
+            payload=PermissionDecisionPayload(
+                decision=DECISION_ESCALATED
+            ).model_dump(),
+        )
+
     async def _handle(self, env: Envelope) -> Response | None:
         """Reply to one message type, enqueuing anything slow onto the queue.
 
@@ -364,17 +387,7 @@ class SessionBroker:
             types get an ``ok=False`` reply.
         """
         if env.type == T_PERMISSION_REQUEST:
-            payload = PermissionRequestPayload.model_validate(env.payload)
-            # Reply IMMEDIATELY with zero LLM work — then enqueue the
-            # bookkeeping.
-            self.queue.put_nowait(lambda: self._permission_passthrough(payload))
-            return Response(
-                id=env.id,
-                ok=True,
-                payload=PermissionDecisionPayload(
-                    decision=DECISION_ESCALATED
-                ).model_dump(),
-            )
+            return self._on_permission_request(env)
 
         if env.type == T_HOOK_EVENT:
             self.watchdog.reset()
