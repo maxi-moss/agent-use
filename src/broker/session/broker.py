@@ -222,7 +222,14 @@ class SessionBroker:
             timeout_ms=30000,
         )
         session = start.agent_session
-        if session is not None and session.kind == "id":
+        # Optimistic fill-in only: the SessionStart hook may already have
+        # bound the authoritative id by the time this returns, and must
+        # never be clobbered by agent_start's guess.
+        if (
+            session is not None
+            and session.kind == "id"
+            and self.claude_session_id is None
+        ):
             self.claude_session_id = session.value
         try:
             async with asyncio.timeout(SESSION_BIND_TIMEOUT_S):

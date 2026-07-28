@@ -12,6 +12,7 @@ Rules encoded here, verified against herdr 0.7.5:
 import json
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -23,6 +24,13 @@ HERDR = "herdr"
 AGENT_NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 
 _DIRECTIONS = frozenset({"right", "down"})
+
+# A pane freshly returned by `pane split` has not necessarily finished
+# initializing its shell yet. `agent start`'s own --timeout claims to "wait
+# for interactive readiness" but does not: called immediately after a split,
+# it fails instantly with agent_pane_busy roughly half the time (verified
+# live, repeatedly, against herdr 0.7.5). This fixed delay is the workaround.
+_PANE_READY_DELAY_S = 1.0
 
 
 class HerdrError(Exception):
@@ -235,6 +243,7 @@ def agent_start(
     _check_agent_name(name)
     _check_identifier(pane_id, "pane id")
     _check_identifier(kind, "agent kind")
+    time.sleep(_PANE_READY_DELAY_S)
     argv = [
         HERDR, "agent", "start", name,
         "--kind", kind,
