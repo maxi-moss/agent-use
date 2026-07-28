@@ -1,0 +1,1 @@
+{"id": "cli:agent:start", "result": {"type": "agent_started", "agent": {"pane_id": "w3:p2", "name": "s1", "interactive_ready": true, "agent_status": "working", "agent_session": {"agent": "claude", "kind": "id", "source": "herdr:claude", "value": "7dfd77f8-a848-4a35-9122-d5343e019082"}}, "argv": ["claude"]}}

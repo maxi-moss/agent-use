@@ -104,6 +104,40 @@ def test_agent_start_without_session(fake: Any) -> None:
     assert result.agent_session is None
 
 
+def test_agent_start_nested_agent_shape(fake: Any) -> None:
+    """The installed 0.7.5 API schema nests fields under result.agent
+    ({"type": "agent_started", "agent": AgentInfo}) — must parse identically."""
+    fake(stdout=(FIXTURES / "agent_start_nested.json").read_text())
+    result = driver.agent_start(
+        "sess-a1", kind="claude", pane_id="w3:p2", timeout_ms=30000
+    )
+    assert result.interactive_ready is True
+    assert result.agent_session is not None
+    assert result.agent_session.value == "7dfd77f8-a848-4a35-9122-d5343e019082"
+
+
+def test_agent_get_argv_and_fixture_parse(fake: Any) -> None:
+    """No --json flag on `agent get` (verified via herdr completion zsh);
+    JSON is the default output."""
+    run = fake(stdout=(FIXTURES / "agent_get.json").read_text())
+    info = driver.agent_get("sess-a1", timeout_s=10.0)
+    assert run.calls == [["herdr", "agent", "get", "sess-a1"]]
+    assert driver.agent_status(info) == "idle"
+
+
+def test_agent_get_rejects_current(fake: Any) -> None:
+    run = fake(stdout="{}")
+    with pytest.raises(ValueError):
+        driver.agent_get("--current", timeout_s=1.0)
+    assert run.calls == []
+
+
+def test_agent_status_degrades_to_unknown() -> None:
+    assert driver.agent_status({}) == "unknown"
+    assert driver.agent_status({"agent": {"agent_status": "blocked"}}) == "blocked"
+    assert driver.agent_status({"agent": {"agent_status": 3}}) == "unknown"
+
+
 def test_submit_prompt_is_the_two_step(fake: Any) -> None:
     """agent prompt types only; submit is prompt + pane send-keys enter."""
     run = fake(stdout="{}")
@@ -148,7 +182,7 @@ def test_exit_2_is_our_bug(fake: Any) -> None:
 
 
 def test_no_public_api_emits_current(fake: Any) -> None:
-    """constraint 14: --current must be rejected everywhere a target goes."""
+    """--current must be rejected everywhere a target goes."""
     run = fake(stdout="{}")
     for call in (
         lambda: driver.agent_prompt("--current", "x", timeout_s=1.0),
