@@ -33,6 +33,7 @@ class BrokerConfig(BaseModel):
     budget_max: int = 8
     recent_turns_window: int = 20
     broker_home: Path = Field(default_factory=default_broker_home)
+    chat_log_dir: Path | None = None  # None -> broker_home/master-log.ndjson
 
 
 class ConfigError(Exception):

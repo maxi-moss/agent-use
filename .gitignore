@@ -4,3 +4,6 @@
 **/*.pyc
 pycache
 .venv/
+chat_logs/
+__pycache__
+.DS_STORE
