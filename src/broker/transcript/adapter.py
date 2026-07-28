@@ -13,7 +13,7 @@ import json
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, assert_never, cast
 
 from pydantic import ValidationError
 
@@ -178,6 +178,8 @@ def render(events: list[TranscriptEvent]) -> str:
             parts.append(f"## plan (id={event.id})\n{event.plan}\n\n")
         elif event.kind == "exit_plan_result":
             parts.append(f"## plan-result (id={event.id})\n{event.raw}\n\n")
-        else:  # CompactionBoundary — the only remaining union member
+        elif event.kind == "compaction_boundary":
             parts.append("## [compaction boundary]\n\n")
+        else:
+            assert_never(event)
     return "".join(parts)
