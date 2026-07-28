@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from broker import prompts
 from broker.config import BrokerConfig
+from broker.layout import Layout
 from broker.llm import (
     LLMCallError,
     ToolCall,
@@ -31,7 +32,7 @@ from broker.llm import (
     call_turn,
     strict_tool,
 )
-from broker.master.runtime import MasterRuntime, render_escalation
+from broker.master.runtime import MasterRuntime, render_escalation, render_proposal
 
 MAX_TOOL_ROUNDS = 6
 
@@ -176,7 +177,7 @@ _MASTER_PROMPT = prompts.load("master")
 
 
 class ConversationLog:
-    """broker_home/master-log.ndjson — append-only; only a bounded window is
+    """The master conversation log — append-only; only a bounded window is
     ever loaded into context. Timestamps stay in the file, never in
     the rendered context (cache determinism)."""
 
@@ -223,7 +224,7 @@ class MasterLLM:
         self.llm_call = llm_call
         self.runtime = runtime
         self.cfg = cfg
-        self.log = ConversationLog(cfg.broker_home / "master-log.ndjson")
+        self.log = ConversationLog(Layout(cfg.broker_home).master_conversation)
 
     async def handle_developer_message(self, text: str) -> str:
         messages = self._assemble(text)
@@ -279,8 +280,9 @@ class MasterLLM:
 
     def _assemble(self, developer_message: str) -> list[MessageParam]:
         """Fresh per turn: registry summary, the single active
-        escalation (verbatim block), a bounded window of recent turns, then
-        the developer's message."""
+        escalation (verbatim block), any pending prompt proposals (verbatim
+        blocks), a bounded window of recent turns, then the developer's
+        message."""
         blocks: list[TextBlockParam] = [
             {
                 "type": "text",
@@ -294,6 +296,17 @@ class MasterLLM:
             # Byte-identical to the runtime rendering — its own block, so
             # nothing is prepended to or reflowed around the broker's words.
             blocks.append({"type": "text", "text": render_escalation(active)})
+        for pending in self.runtime.pending_proposals():
+            blocks.append(
+                {
+                    "type": "text",
+                    "text": "# Prompt proposal awaiting approval — session "
+                    + pending.session_name,
+                }
+            )
+            blocks.append(
+                {"type": "text", "text": render_proposal(pending.payload)}
+            )
         window = self.log.tail(self.cfg.recent_turns_window)
         if window:
             rendered = "\n".join(f"{role}: {text}" for role, text in window)

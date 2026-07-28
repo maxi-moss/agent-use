@@ -19,8 +19,13 @@ from broker.config import BrokerConfig
 from broker.llm import ToolCall, TurnResult
 from broker.master.llm import MAX_TOOL_ROUNDS, MASTER_TOOLS, MasterLLM
 from broker.master.registry import Registry, SessionRecord
-from broker.master.runtime import MasterRuntime, render_escalation
-from broker.protocol.schemas import EscalationPayload
+from broker.master.runtime import (
+    MasterRuntime,
+    PendingProposal,
+    render_escalation,
+    render_proposal,
+)
+from broker.protocol.schemas import EscalationPayload, PromptProposalPayload
 
 
 class RecordingRuntime(MasterRuntime):
@@ -88,6 +93,14 @@ ESCALATION = EscalationPayload.model_validate(
         "recommendation": "rec",
         "uncertainty": "unc",
         "what_would_change_my_mind": "change",
+    }
+)
+
+PROPOSAL = PromptProposalPayload.model_validate(
+    {
+        "proposal_id": "p1",
+        "proposed_prompt": "prompt text",
+        "grounding_summary": "grounding",
     }
 )
 
@@ -189,6 +202,18 @@ async def test_escalation_block_is_byte_identical(
     # The rendered escalation is its OWN context block, byte-identical to the
     # runtime renderer's output (structural thin-master rule).
     assert render_escalation(ESCALATION) in texts
+
+
+async def test_pending_proposal_reaches_llm_context(
+    runtime: RecordingRuntime,
+) -> None:
+    runtime.proposals["p1"] = PendingProposal("s1", PROPOSAL)
+    fake = FakeLLM([TurnResult(text="ok")])
+    master = make_master(runtime, fake)
+    await master.handle_developer_message("approve it")
+    texts = _block_texts(fake.calls[0])
+    assert any("p1" in t for t in texts)  # the id the tool needs
+    assert render_proposal(PROPOSAL) in texts  # verbatim, its own block
 
 
 async def test_tool_loop_terminates_at_cap(
