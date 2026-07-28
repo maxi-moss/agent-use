@@ -203,6 +203,7 @@ async def harness(
         name="s1",
         socket_path=str(home / "s" / "s1.sock"),
         master_socket_path=str(master_sock),
+        broker_home=home,
         cwd=str(cwd),
         anchor_pane="w3:p1",
         intent="the raw intent",

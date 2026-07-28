@@ -21,7 +21,8 @@ from typing import Any, cast
 from pydantic import ValidationError
 
 from broker import llm as llm_module
-from broker.config import BrokerConfig, default_broker_home
+from broker.config import BrokerConfig
+from broker.layout import Layout
 from broker.herdr import driver
 from broker.claude.paths import transcript_dir_for_cwd
 from broker.protocol import client
@@ -145,6 +146,7 @@ class SessionBroker:
             max_tokens=cfg.max_tokens,
             watchdog_seconds=cfg.watchdog_seconds,
             budget_max=cfg.budget_max,
+            broker_home=cfg.broker_home,
         )
         self._llm_call = llm_call
         self.state = "spawning"
@@ -166,8 +168,8 @@ class SessionBroker:
         self._user_prompt_baseline = 0
         self._last_event_count = -1
 
-        self.decision_log_path = (
-            default_broker_home() / "sessions" / cfg.name / "decisions.ndjson"
+        self.decision_log_path = Layout(cfg.broker_home).session_decisions(
+            cfg.name
         )
         self.watchdog = Watchdog(
             cfg.watchdog_seconds, self._herdr_state, self._reconcile
@@ -241,7 +243,7 @@ class SessionBroker:
                 f"no SessionStart hook event within {SESSION_BIND_TIMEOUT_S:.0f} s",
             ) from None
 
-        self.state = "grounding"
+        self._set_state("grounding")
         assert self._llm_call is not None
         proposal = await ground_intent(
             self._llm_call,
@@ -252,7 +254,7 @@ class SessionBroker:
         self._proposal_id = uuid.uuid4().hex
         loop = asyncio.get_running_loop()
         self._approval = loop.create_future()
-        self.state = "awaiting_approval"
+        self._set_state("awaiting_approval")
         await self._to_master(
             T_PROMPT_PROPOSAL,
             {
@@ -265,7 +267,7 @@ class SessionBroker:
         approved = await self._approval
         self.approved_prompt = approved.prompt
         await self._submit(approved.prompt)
-        self.state = "driving"
+        self._set_state("driving")
 
     async def _event_loop(self) -> None:
         """Run queued jobs one at a time until shutdown or the sentinel."""
@@ -416,9 +418,9 @@ class SessionBroker:
             self._log("notification", "", str(raw.get("message", "")))
             if raw.get("notification_type") == "permission_prompt":
                 if self.state == "driving":
-                    self.state = "blocked_permission"
+                    self._set_state("blocked_permission")
         elif name == "SessionEnd":
-            self.state = "stopped"
+            self._set_state("stopped")
             self._log("session_end", "", "SessionEnd hook received")
         elif name in {"PreCompact", "PostCompact"}:
             self._log("compaction", "", name)  # continue normally
@@ -475,7 +477,7 @@ class SessionBroker:
             await self._ask_user_question(p.tool_input, p.tool_use_id)
         else:
             if self.state == "driving":
-                self.state = "blocked_permission"
+                self._set_state("blocked_permission")
 
     async def _classify(self, last_assistant_message: str) -> None:
         """Triage one turn boundary into an answer, escalation or completion.
@@ -497,7 +499,7 @@ class SessionBroker:
                 "",
             )
             return
-        self.state = "driving"
+        self._set_state("driving")
         events = self._read_transcript()  # context ONLY; input is the message
         self._last_event_count = len(events)
         assert self._llm_call is not None
@@ -532,7 +534,7 @@ class SessionBroker:
         elif isinstance(result, CompleteCall):
             self._log("completed", result.reasoning, result.summary)
             await self._to_master(T_COMPLETION, {"summary": result.summary})
-            self.state = "completed"  # stop driving; keep serving
+            self._set_state("completed")  # stop driving; keep serving
         elif isinstance(result, NoActionCall):  # pyright: ignore[reportUnnecessaryIsInstance]
             self._log("no_action", result.reasoning, "")
 
@@ -659,7 +661,7 @@ class SessionBroker:
         self._user_prompt_baseline = (
             _count_user_prompts(events) if events is not None else -1
         )
-        self.state = "escalated"  # QUIESCENT until dispatch or retract
+        self._set_state("escalated")  # QUIESCENT until dispatch or retract
         await self._to_master(T_ESCALATION, payload.model_dump())
 
     async def _check_out_of_band_resolution(self) -> None:
@@ -686,7 +688,7 @@ class SessionBroker:
         self._log("retracted", "resolved in pane", escalation_id)
         self._active_escalation = None
         self._pending_ask_id = None
-        self.state = "driving"
+        self._set_state("driving")
         await self._to_master(
             T_RETRACT,
             {"escalation_id": escalation_id, "reason": "resolved in pane"},
@@ -718,7 +720,7 @@ class SessionBroker:
         self._pending_ask_id = None
         self.budget_count = 0
         await self._to_master(T_BUDGET_UPDATE, {"count": 0})
-        self.state = "driving"
+        self._set_state("driving")
         self._log("dispatched", "developer decision delivered", decision.response)
 
     async def _send_developer_prompt(self, prompt: SendPromptPayload) -> None:
@@ -735,7 +737,7 @@ class SessionBroker:
         await self._to_master(T_BUDGET_UPDATE, {"count": 0})
         self._active_escalation = None
         self._pending_ask_id = None
-        self.state = "driving"
+        self._set_state("driving")
         self._log("developer_prompt", "relayed by master", prompt.text)
 
     async def _reconcile(self) -> None:
@@ -844,7 +846,7 @@ class SessionBroker:
         """
         logger.error("fatal: %s: %s", error_class, detail)
         self._log("error", error_class, detail)
-        self.state = "error"
+        self._set_state("error")
         try:
             await self._to_master(
                 T_FATAL_ERROR, {"error_class": error_class, "detail": detail}
@@ -858,6 +860,11 @@ class SessionBroker:
         decision_log.append(
             self.decision_log_path, kind=kind, reasoning=reasoning, detail=detail
         )
+
+    def _set_state(self, state: str) -> None:
+        """Assign a new state and log the transition."""
+        logger.info("session %s: %s -> %s", self.cfg.name, self.state, state)
+        self.state = state
 
     def _herdr_state(self) -> str:
         """Report the agent's state as Herdr sees it, for the watchdog gate.

@@ -1,5 +1,7 @@
 """Session broker process configuration, passed as --config-json at spawn."""
 
+from pathlib import Path
+
 from pydantic import BaseModel, ConfigDict
 
 
@@ -9,6 +11,7 @@ class SessionBrokerConfig(BaseModel):
     name: str
     socket_path: str
     master_socket_path: str
+    broker_home: Path  # sent by the master; never re-derived from the env
     cwd: str
     anchor_pane: str
     intent: str

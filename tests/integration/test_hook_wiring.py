@@ -178,6 +178,7 @@ def make_cfg(home: Path, *, budget_max: int = 8) -> SessionBrokerConfig:
         name="s1",
         socket_path=str(home / "s" / "s1.sock"),
         master_socket_path=str(home / "m.sock"),
+        broker_home=home,
         cwd=str(cwd),
         anchor_pane="w3:p1",
         intent="the raw intent",

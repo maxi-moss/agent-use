@@ -14,9 +14,11 @@ answers.
 import asyncio
 import contextlib
 import json
+import logging
 import sys
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,7 @@ from textual.message import Message
 
 from broker.claude.trust import seed_trust
 from broker.config import BrokerConfig
+from broker.layout import Layout
 from broker.master import notifier
 from broker.master.messages import (
     CompletionArrived,
@@ -64,6 +67,8 @@ from broker.protocol.schemas import (
     StatusPayload,
 )
 from broker.protocol.server import serve_unix
+
+logger = logging.getLogger(__name__)
 
 # object, not None: App.post_message returns bool, and the bound method is
 # passed here directly.
@@ -215,6 +220,14 @@ def render_proposal(p: PromptProposalPayload) -> str:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class PendingProposal:
+    """A prompt proposal awaiting the developer's approval."""
+
+    session_name: str
+    payload: PromptProposalPayload
+
+
 class MasterRuntime:
     def __init__(
         self,
@@ -237,8 +250,9 @@ class MasterRuntime:
         self.cfg = cfg
         self.anchor_pane = anchor_pane
         self.slot = EscalationSlot()
-        self.master_socket_path = cfg.broker_home / "master.sock"
-        self._proposals: dict[str, str] = {}  # proposal_id -> session name
+        self.layout = Layout(cfg.broker_home)
+        self.master_socket_path = self.layout.master_socket
+        self.proposals: dict[str, PendingProposal] = {}
         self._procs: dict[str, asyncio.subprocess.Process] = {}
 
     # ── socket server ────────────────────────────────────────────────────────
@@ -312,7 +326,7 @@ class MasterRuntime:
             return self._ack(env, ok=True)
         if env.type == T_PROMPT_PROPOSAL:
             p = PromptProposalPayload.model_validate(env.payload)
-            self._proposals[p.proposal_id] = name
+            self.proposals[p.proposal_id] = PendingProposal(name, p)
             self._set_state(name, "awaiting_approval")
             self.app_post(
                 ProposalArrived(name, p.proposal_id, render_proposal(p))
@@ -387,7 +401,7 @@ class MasterRuntime:
         if not cwd_path.is_dir():
             raise ValueError(f"cwd does not exist: {cwd}")
         name = self.registry.allocate_name()
-        socket_path = self.cfg.broker_home / "s" / f"{name}.sock"
+        socket_path = self.layout.session_socket(name)
         record = SessionRecord(
             name=name,
             socket_path=str(socket_path),
@@ -401,6 +415,7 @@ class MasterRuntime:
                 "name": name,
                 "socket_path": str(socket_path),
                 "master_socket_path": str(self.master_socket_path),
+                "broker_home": str(self.layout.home),
                 "cwd": str(cwd_path),
                 "anchor_pane": self.anchor_pane,
                 "intent": intent,
@@ -433,9 +448,10 @@ class MasterRuntime:
         Returns:
             An outcome line: approved, unknown proposal, or rejected as stale.
         """
-        name = self._proposals.get(proposal_id)
-        if name is None:
+        pending = self.proposals.get(proposal_id)
+        if pending is None:
             return f"unknown proposal {proposal_id!r} — nothing approved"
+        name = pending.session_name
         record = self.registry.get(name)
         env = self._env(
             T_APPROVE_PROMPT,
@@ -451,7 +467,7 @@ class MasterRuntime:
                 f"session {name} rejected approval for proposal "
                 f"{proposal_id} (stale)"
             )
-        del self._proposals[proposal_id]
+        del self.proposals[proposal_id]
         record.approved_prompt = prompt  # the AUTHORITATIVE intent
         self.registry.upsert(record)
         return f"prompt approved for session {name}"
@@ -580,6 +596,10 @@ class MasterRuntime:
         self._set_state(session_id, "stopped")
         return f"session {session_id} stopped"
 
+    def pending_proposals(self) -> list[PendingProposal]:
+        """Return every proposal awaiting approval, oldest first."""
+        return list(self.proposals.values())
+
     def render_registry_summary(self) -> str:
         """Render the registry summary for the LLM context and list_sessions.
 
@@ -613,6 +633,7 @@ class MasterRuntime:
         except KeyError:
             self.app_post(Notice(f"message from unknown session {name!r}"))
             return
+        logger.info("session %s: %s -> %s", name, record.state, state)
         record.state = state
         self.registry.upsert(record)
         self.app_post(SessionStatusChanged(name, state))
