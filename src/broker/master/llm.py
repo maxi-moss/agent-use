@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, cast
 
 from anthropic import AsyncAnthropic
 from anthropic.types import (
@@ -26,6 +26,7 @@ from broker import prompts
 from broker.config import BrokerConfig
 from broker.paths import BrokerPaths
 from broker.llm import (
+    LLMCaller,
     LLMCallError,
     ToolCall,
     TurnResult,
@@ -35,22 +36,6 @@ from broker.llm import (
 from broker.master.runtime import MasterRuntime, render_escalation, render_proposal
 
 MAX_TOOL_ROUNDS = 6
-
-
-class LLMTurnCaller(Protocol):
-    """Injected seam: tests pass a fake; production binds llm.call_turn."""
-
-    async def __call__(
-        self,
-        *,
-        model: str,
-        max_tokens: int,
-        system: list[TextBlockParam],
-        messages: list[MessageParam],
-        tools: list[ToolParam],
-        tool_choice: ToolChoiceParam,
-    ) -> TurnResult:
-        ...
 
 
 class SpawnSessionArgs(BaseModel):
@@ -247,7 +232,7 @@ class ConversationLog:
 class MasterLLM:
     def __init__(
         self,
-        llm_call: LLMTurnCaller,
+        llm_call: LLMCaller[TurnResult],
         runtime: MasterRuntime,
         cfg: BrokerConfig,
     ) -> None:
@@ -364,7 +349,7 @@ class MasterLLM:
         return await tool.handler(self.runtime, args)
 
 
-def bind_call_turn(client: AsyncAnthropic) -> LLMTurnCaller:
+def bind_call_turn(client: AsyncAnthropic) -> LLMCaller[TurnResult]:
     """Production binding of the injected seam (tests pass a fake)."""
 
     async def call(

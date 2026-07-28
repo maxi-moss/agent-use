@@ -18,9 +18,17 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, cast
 
+from anthropic import AsyncAnthropic
+from anthropic.types import (
+    MessageParam,
+    TextBlockParam,
+    ToolChoiceParam,
+    ToolParam,
+)
 from pydantic import ValidationError
 
 from broker import llm as llm_module
+from broker.llm import LLMCaller, ToolCall
 from broker.config import AdoptedSession, BrokerConfig, SessionBrokerConfig
 from broker.paths import BrokerPaths
 from broker.herdr import driver
@@ -66,7 +74,6 @@ from broker.session.triage import (
     AnswerCall,
     CompleteCall,
     EscalateCall,
-    LLMToolCaller,
     NoActionCall,
     ground_intent,
     triage,
@@ -102,11 +109,11 @@ class FatalSessionError(Exception):
         self.detail = detail
 
 
-def _bind_llm(client_obj: Any) -> LLMToolCaller:
-    """Adapt an Anthropic client into the keyword-only ``LLMToolCaller`` shape.
+def _bind_llm(client: AsyncAnthropic) -> LLMCaller[ToolCall]:
+    """Adapt an Anthropic client into the keyword-only ``LLMCaller`` shape.
 
     Args:
-        client_obj: Anthropic client passed through to ``llm.call_tool``.
+        client: Anthropic client passed through to ``llm.call_tool``.
 
     Returns:
         A callable that forwards every triage call to that one client.
@@ -116,14 +123,14 @@ def _bind_llm(client_obj: Any) -> LLMToolCaller:
         *,
         model: str,
         max_tokens: int,
-        system: Any,
-        messages: Any,
-        tools: Any,
-        tool_choice: Any,
-    ) -> llm_module.ToolCall:
+        system: list[TextBlockParam],
+        messages: list[MessageParam],
+        tools: list[ToolParam],
+        tool_choice: ToolChoiceParam,
+    ) -> ToolCall:
         """Invoke the bound client and return its single tool call."""
         return await llm_module.call_tool(
-            client_obj,
+            client,
             model=model,
             max_tokens=max_tokens,
             system=system,
@@ -140,7 +147,7 @@ class SessionBroker:
         self,
         cfg: SessionBrokerConfig,
         *,
-        llm_call: LLMToolCaller | None = None,
+        llm_call: LLMCaller[ToolCall] | None = None,
     ) -> None:
         """Build the broker's state without touching the socket or the pane.
 

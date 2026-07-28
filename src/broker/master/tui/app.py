@@ -21,7 +21,8 @@ from textual.widgets import Input, RichLog, Static
 from textual.worker import Worker, WorkerState
 
 from broker.config import BrokerConfig
-from broker.master.llm import LLMTurnCaller, MasterLLM
+from broker.llm import LLMCaller, TurnResult
+from broker.master.llm import MasterLLM
 from broker.master.messages import (
     CompletionArrived,
     EscalationArrived,
@@ -44,7 +45,7 @@ class BrokerMasterApp(App[None]):
         self,
         cfg: BrokerConfig,
         registry: Registry,
-        llm_call: LLMTurnCaller,
+        llm_call: LLMCaller[TurnResult],
         *,
         anchor_pane: str,
         startup_warnings: list[str] | None = None,

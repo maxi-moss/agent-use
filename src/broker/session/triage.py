@@ -9,7 +9,6 @@ the tool schema cannot drift apart.
 import asyncio
 import subprocess
 from pathlib import Path
-from typing import Protocol
 
 from anthropic.types import (
     MessageParam,
@@ -21,27 +20,11 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from broker import prompts
 from broker.config import BrokerConfig
-from broker.llm import LLMCallError, ToolCall, strict_tool
+from broker.llm import LLMCaller, LLMCallError, ToolCall, strict_tool
 from broker.protocol.schemas import Alternative
 from broker.transcript.adapter import render
 from broker.transcript.schemas import TranscriptEvent
 
-
-class LLMToolCaller(Protocol):
-    """The one injected seam: tests pass a fake; production binds llm.call_tool."""
-
-    async def __call__(
-        self,
-        *,
-        model: str,
-        max_tokens: int,
-        system: list[TextBlockParam],
-        messages: list[MessageParam],
-        tools: list[ToolParam],
-        tool_choice: ToolChoiceParam,
-    ) -> ToolCall:
-        """Make one tool call against the model and return the tool it chose."""
-        ...
 _TRACKED_FILES_TIMEOUT_S = 10.0
 _MAX_TRACKED_FILES = 200
 
@@ -185,7 +168,7 @@ def assemble_context(
 
 
 async def triage(
-    llm_call: LLMToolCaller,
+    llm_call: LLMCaller[ToolCall],
     cfg: BrokerConfig,
     *,
     intent: str,
@@ -239,7 +222,7 @@ async def triage(
 
 
 def _git_ls_files(cwd: Path) -> str:
-    """List the repository's tracked files, truncated to the first 200.
+    """List the repository's tracked files, truncated to a fixed maximum.
 
     Args:
         cwd: Directory to run ``git ls-files`` in.

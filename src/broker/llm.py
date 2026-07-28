@@ -11,7 +11,7 @@ Rules encoded here:
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import anthropic
 from anthropic import AsyncAnthropic
@@ -44,6 +44,27 @@ class TurnResult:
 
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list[ToolCall])
+
+
+class LLMCaller[R](Protocol):
+    """The one injected seam: tests pass a fake, production binds a client.
+
+    ``R`` is the call's result type — ``ToolCall`` for triage's forced-tool
+    calls, ``TurnResult`` for the master's ``tool_choice`` auto turns.
+    """
+
+    async def __call__(
+        self,
+        *,
+        model: str,
+        max_tokens: int,
+        system: list[TextBlockParam],
+        messages: list[MessageParam],
+        tools: list[ToolParam],
+        tool_choice: ToolChoiceParam,
+    ) -> R:
+        """Make one call against the model and return its result."""
+        ...
 
 
 def strictify(schema: dict[str, Any]) -> dict[str, Any]:
