@@ -176,9 +176,9 @@ _MASTER_PROMPT = prompts.load("master")
 
 
 class ConversationLog:
-    """master-log.ndjson, under chat_log_dir or broker_home — append-only;
-    only a bounded window is ever loaded into context. Timestamps stay in
-    the file, never in the rendered context (cache determinism)."""
+    """broker_home/master-log.ndjson — append-only; only a bounded window is
+    ever loaded into context. Timestamps stay in the file, never in
+    the rendered context (cache determinism)."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -223,8 +223,7 @@ class MasterLLM:
         self.llm_call = llm_call
         self.runtime = runtime
         self.cfg = cfg
-        log_dir = cfg.chat_log_dir if cfg.chat_log_dir is not None else cfg.broker_home
-        self.log = ConversationLog(log_dir / "master-log.ndjson")
+        self.log = ConversationLog(cfg.broker_home / "master-log.ndjson")
 
     async def handle_developer_message(self, text: str) -> str:
         messages = self._assemble(text)
