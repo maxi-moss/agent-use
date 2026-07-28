@@ -58,6 +58,7 @@ from broker.protocol.server import serve_unix
 from broker.protocol.schemas import (
     Alternative,
     ApprovePromptPayload,
+    DecisionLogPayload,
     DispatchDecisionPayload,
     Envelope,
     EscalationPayload,
@@ -464,7 +465,9 @@ class SessionBroker:
             return Response(
                 id=env.id,
                 ok=True,
-                payload={"text": decision_log.render_log(self.decision_log_path)},
+                payload=DecisionLogPayload(
+                    text=decision_log.render_log(self.decision_log_path)
+                ).model_dump(),
             )
 
         if env.type == T_SHUTDOWN:

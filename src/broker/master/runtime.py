@@ -57,6 +57,7 @@ from broker.protocol.schemas import (
     ApprovePromptPayload,
     BudgetUpdatePayload,
     CompletionPayload,
+    DecisionLogPayload,
     DispatchDecisionPayload,
     Envelope,
     EscalationPayload,
@@ -689,24 +690,17 @@ class MasterRuntime:
             session_id: Registry name of the session to query.
 
         Returns:
-            The log text verbatim, or the empty string when the session sent
-            no text or sent something that was not text — a malformed reply
-            is logged rather than silently treated as an empty log.
+            The log text verbatim.
+
+        Raises:
+            ValidationError: The session's reply was not a decision log.
         """
         record = self.registry.get(session_id)
         env = self._env(T_GET_DECISION_LOG, {})
         resp = await client.request(
             Path(record.socket_path), env, timeout_s=REQUEST_TIMEOUT_S
         )
-        text = resp.payload.get("text")
-        if not isinstance(text, str):
-            logger.warning(
-                "session %s sent a malformed decision-log reply: %r",
-                session_id,
-                resp.payload,
-            )
-            return ""
-        return text
+        return DecisionLogPayload.model_validate(resp.payload).text
 
     async def stop_session(self, session_id: str) -> str:
         """Shut a session broker down and mark it stopped.

@@ -4,7 +4,6 @@ runtime server; driver.subprocess.run monkeypatched; app_post = recording list."
 import asyncio
 import contextlib
 import json
-import logging
 import subprocess
 import tempfile
 import uuid
@@ -13,6 +12,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from pydantic import ValidationError
 
 from broker.config import BrokerConfig
 from broker.herdr import driver
@@ -452,19 +452,17 @@ async def test_send_prompt_reports_rejection_when_session_nacks(
         await server.wait_closed()
 
 
-async def test_get_decision_log_warns_and_returns_empty_on_malformed_reply(
+async def test_get_decision_log_raises_on_malformed_reply(
     rt: tuple[MasterRuntime, list[Any]],
     home: Path,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """A malformed log reply must fail loud, never read as an empty log."""
     runtime, _ = rt
     stub = MalformedLogSession()
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
-        with caplog.at_level(logging.WARNING):
-            result = await runtime.get_decision_log("s1")
-        assert result == ""
-        assert any("malformed" in r.message.lower() for r in caplog.records)
+        with pytest.raises(ValidationError):
+            await runtime.get_decision_log("s1")
     finally:
         server.close()
         await server.wait_closed()

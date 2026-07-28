@@ -78,6 +78,14 @@ class SendPromptPayload(BaseModel):
     text: str
 
 
+class DecisionLogPayload(BaseModel):
+    """broker -> master reply payload carrying a rendered decision log."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    text: str
+
+
 class StatusPayload(BaseModel):
     """broker -> master reply payload for the attach/liveness probe."""
 
