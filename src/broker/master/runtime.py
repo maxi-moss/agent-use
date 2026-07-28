@@ -27,7 +27,7 @@ from textual.message import Message
 
 from broker.claude.trust import seed_trust
 from broker.config import BrokerConfig
-from broker.layout import Layout
+from broker.paths import BrokerPaths
 from broker.master import notifier
 from broker.master.messages import (
     CompletionArrived,
@@ -250,8 +250,8 @@ class MasterRuntime:
         self.cfg = cfg
         self.anchor_pane = anchor_pane
         self.slot = EscalationSlot()
-        self.layout = Layout(cfg.broker_home)
-        self.master_socket_path = self.layout.master_socket
+        self.paths = BrokerPaths(cfg.broker_home)
+        self.master_socket_path = self.paths.master_socket
         self.proposals: dict[str, PendingProposal] = {}
         self._procs: dict[str, asyncio.subprocess.Process] = {}
 
@@ -401,7 +401,7 @@ class MasterRuntime:
         if not cwd_path.is_dir():
             raise ValueError(f"cwd does not exist: {cwd}")
         name = self.registry.allocate_name()
-        socket_path = self.layout.session_socket(name)
+        socket_path = self.paths.session_socket(name)
         record = SessionRecord(
             name=name,
             socket_path=str(socket_path),
@@ -415,7 +415,7 @@ class MasterRuntime:
                 "name": name,
                 "socket_path": str(socket_path),
                 "master_socket_path": str(self.master_socket_path),
-                "broker_home": str(self.layout.home),
+                "broker_home": str(self.paths.home),
                 "cwd": str(cwd_path),
                 "anchor_pane": self.anchor_pane,
                 "intent": intent,

@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from broker import prompts
 from broker.config import BrokerConfig
-from broker.layout import Layout
+from broker.paths import BrokerPaths
 from broker.llm import (
     LLMCallError,
     ToolCall,
@@ -224,7 +224,7 @@ class MasterLLM:
         self.llm_call = llm_call
         self.runtime = runtime
         self.cfg = cfg
-        self.log = ConversationLog(Layout(cfg.broker_home).master_conversation)
+        self.log = ConversationLog(BrokerPaths(cfg.broker_home).master_conversation)
 
     async def handle_developer_message(self, text: str) -> str:
         messages = self._assemble(text)

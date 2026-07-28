@@ -49,13 +49,13 @@ uv run python -m broker.master
 
 Session brokers are never launched by hand — the master spawns them.
 
-Configuration is optional. Defaults live in `BrokerConfig` (`src/broker/config.py`) and are overlaid with `$BROKER_HOME/config.json` if present; `$BROKER_HOME` defaults to `~/.broker` and is where sockets, the session registry, and logs are kept. `src/broker/layout.py` defines that layout and is the only place that builds a path inside it.
+Configuration is optional. Defaults live in `BrokerConfig` (`src/broker/config.py`) and are overlaid with `$BROKER_HOME/config.json` if present; `$BROKER_HOME` defaults to `~/.broker` and is where sockets, the session registry, and logs are kept. `src/broker/paths.py` defines where each of those lives and is the only place that builds a path inside it.
 
 Diagnostic logs are written to files, never to the terminal — the master's TUI owns that display. Follow a run with `tail -f "$BROKER_HOME"/logs/master.log`.
 
-## Layout
+## Source tree
 
-```
+```bash
 src/broker/
   config.py      Shared configuration
   llm.py         Anthropic SDK wrapper

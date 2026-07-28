@@ -19,7 +19,7 @@ from broker import config as broker_config
 from broker import logging_setup
 from broker.claude.settings import register_hooks, verify_and_repair
 from broker.herdr import driver
-from broker.layout import Layout
+from broker.paths import BrokerPaths
 from broker.llm import build_client
 from broker.master.llm import bind_call_turn
 from broker.master.registry import Registry
@@ -77,9 +77,9 @@ def main() -> None:
         _fail("HERDR_PANE_ID is not set and --anchor was not given")
 
     cfg = broker_config.load()
-    layout = Layout(cfg.broker_home)
-    logging_setup.configure(layout.master_log)
-    registry = Registry.load(layout.registry)
+    paths = BrokerPaths(cfg.broker_home)
+    logging_setup.configure(paths.master_log)
+    registry = Registry.load(paths.registry)
 
     # 2. Hook registration at USER level (never project-level),
     #    then verify-and-repair with candidate shadow paths.

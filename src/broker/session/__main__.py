@@ -4,7 +4,7 @@ import argparse
 import asyncio
 
 from broker import logging_setup
-from broker.layout import Layout
+from broker.paths import BrokerPaths
 from broker.session.broker import SessionBroker
 from broker.session.config import SessionBrokerConfig
 
@@ -15,7 +15,7 @@ def main() -> None:
     parser.add_argument("--config-json", required=True)
     args = parser.parse_args()
     cfg = SessionBrokerConfig.model_validate_json(args.config_json)
-    logging_setup.configure(Layout(cfg.broker_home).session_log(cfg.name))
+    logging_setup.configure(BrokerPaths(cfg.broker_home).session_log(cfg.name))
     asyncio.run(SessionBroker(cfg).run())
 
 

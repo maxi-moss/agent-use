@@ -1,7 +1,7 @@
 """Every path under ``broker_home``, in one place.
 
-No other module joins a path inside the broker home: changing the on-disk
-layout means changing this file and nothing else.
+No other module joins a path inside the broker home: moving a file or socket
+on disk means changing this file and nothing else.
 """
 
 from dataclasses import dataclass
@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 @dataclass(frozen=True)
-class Layout:
+class BrokerPaths:
     """On-disk locations for one broker home."""
 
     home: Path

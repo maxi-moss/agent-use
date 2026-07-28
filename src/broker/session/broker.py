@@ -22,7 +22,7 @@ from pydantic import ValidationError
 
 from broker import llm as llm_module
 from broker.config import BrokerConfig
-from broker.layout import Layout
+from broker.paths import BrokerPaths
 from broker.herdr import driver
 from broker.claude.paths import transcript_dir_for_cwd
 from broker.protocol import client
@@ -168,7 +168,7 @@ class SessionBroker:
         self._user_prompt_baseline = 0
         self._last_event_count = -1
 
-        self.decision_log_path = Layout(cfg.broker_home).session_decisions(
+        self.decision_log_path = BrokerPaths(cfg.broker_home).session_decisions(
             cfg.name
         )
         self.watchdog = Watchdog(

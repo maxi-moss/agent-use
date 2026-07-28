@@ -1,10 +1,10 @@
-"""Layout roots every broker-home path at the value it is given."""
+"""BrokerPaths roots every broker-home path at the value it is given."""
 
 from pathlib import Path
 
 import pytest
 
-from broker.layout import Layout
+from broker.paths import BrokerPaths
 from broker.session.config import SessionBrokerConfig
 
 
@@ -27,6 +27,6 @@ def test_session_paths_follow_the_configured_home_not_the_env(
         watchdog_seconds=300.0,
         budget_max=8,
     )
-    decisions = Layout(cfg.broker_home).session_decisions(cfg.name)
+    decisions = BrokerPaths(cfg.broker_home).session_decisions(cfg.name)
     assert decisions.is_relative_to(configured)
     assert not decisions.is_relative_to(tmp_path / "env")
