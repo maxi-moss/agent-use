@@ -551,7 +551,9 @@ class MasterRuntime:
         """
         pending = self.proposals.get(proposal_id)
         if pending is None:
-            return f"unknown proposal {proposal_id!r} — nothing approved"
+            msg = f"unknown proposal {proposal_id!r} — nothing approved"
+            self.app_post(Notice(msg))
+            return msg
         name = pending.session_name
         record = self.registry.get(name)
         env = self._env(
@@ -569,6 +571,7 @@ class MasterRuntime:
             ),
         )
         if rejected is not None:
+            self.app_post(Notice(rejected))
             return rejected
         del self.proposals[proposal_id]
         record.approved_prompt = prompt  # the AUTHORITATIVE intent
@@ -639,6 +642,7 @@ class MasterRuntime:
             rejection=f"session {session_id} rejected the prompt (stale)",
         )
         if rejected is not None:
+            self.app_post(Notice(rejected))
             return rejected
         record.budget_count = 0  # developer prompt resets the budget
         self.registry.upsert(record)
