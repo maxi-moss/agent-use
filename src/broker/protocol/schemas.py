@@ -58,7 +58,7 @@ class HookEventPayload(BaseModel):
 
 
 class DispatchDecisionPayload(BaseModel):
-    """master -> broker: developer's resolution of an escalation (spec §9.7 step 6)."""
+    """master -> broker: developer's resolution of an escalation."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -67,7 +67,7 @@ class DispatchDecisionPayload(BaseModel):
 
 
 class SendPromptPayload(BaseModel):
-    """master -> broker: relay a developer prompt into the session (spec §8.4)."""
+    """master -> broker: relay a developer prompt into the session."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -75,11 +75,14 @@ class SendPromptPayload(BaseModel):
 
 
 class StatusPayload(BaseModel):
-    """broker -> master reply payload for the attach/liveness probe (spec §9.11)."""
+    """broker -> master reply payload for the attach/liveness probe."""
 
     model_config = ConfigDict(extra="ignore")
 
     state: str
+    pane_id: str | None = None
+    claude_session_id: str | None = None
+    transcript_path: str | None = None
 
 
 class Alternative(BaseModel):
@@ -91,7 +94,7 @@ class Alternative(BaseModel):
 
 
 class EscalationPayload(BaseModel):
-    """broker -> master structured escalation object (spec §9.7)."""
+    """broker -> master structured escalation object."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -108,7 +111,7 @@ class EscalationPayload(BaseModel):
 
 
 class CompletionPayload(BaseModel):
-    """broker -> master completion notice with summary (spec §9.8)."""
+    """broker -> master completion notice with summary."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -116,7 +119,7 @@ class CompletionPayload(BaseModel):
 
 
 class FatalErrorPayload(BaseModel):
-    """broker -> master fatal error (spec §9.10)."""
+    """broker -> master fatal error."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -125,9 +128,36 @@ class FatalErrorPayload(BaseModel):
 
 
 class RetractPayload(BaseModel):
-    """broker -> master: escalation resolved out of band (spec §8.6)."""
+    """broker -> master: escalation resolved out of band."""
 
     model_config = ConfigDict(extra="ignore")
 
     escalation_id: str
     reason: str
+
+
+class PromptProposalPayload(BaseModel):
+    """broker -> master: grounded prompt awaiting developer approval."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    proposal_id: str
+    proposed_prompt: str
+    grounding_summary: str
+
+
+class ApprovePromptPayload(BaseModel):
+    """master -> broker: the developer-approved (possibly revised) prompt."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    proposal_id: str
+    prompt: str
+
+
+class BudgetUpdatePayload(BaseModel):
+    """broker -> master: autonomous-answer counter for registry persistence."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    count: int

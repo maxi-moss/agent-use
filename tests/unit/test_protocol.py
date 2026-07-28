@@ -6,9 +6,13 @@ import typing
 
 from broker.protocol import constants
 from broker.protocol.schemas import (
+    ApprovePromptPayload,
+    BudgetUpdatePayload,
     Envelope,
     PermissionDecisionPayload,
+    PromptProposalPayload,
     Response,
+    StatusPayload,
 )
 
 
@@ -53,6 +57,48 @@ def test_decision_literals_match_constants() -> None:
         constants.DECISION_ALLOW,
         constants.DECISION_ESCALATED,
     }
+
+
+def test_phase1_payloads_round_trip() -> None:
+    proposal = PromptProposalPayload(
+        proposal_id="p1",
+        proposed_prompt="Do the thing.",
+        grounding_summary="from CLAUDE.md",
+    )
+    assert (
+        PromptProposalPayload.model_validate_json(proposal.model_dump_json())
+        == proposal
+    )
+    approve = ApprovePromptPayload(proposal_id="p1", prompt="Do the thing, revised.")
+    assert (
+        ApprovePromptPayload.model_validate_json(approve.model_dump_json())
+        == approve
+    )
+    budget = BudgetUpdatePayload(count=3)
+    assert (
+        BudgetUpdatePayload.model_validate_json(budget.model_dump_json()) == budget
+    )
+
+
+def test_status_payload_extension_is_additive() -> None:
+    """Old-style state-only payloads must still validate."""
+    old = StatusPayload.model_validate({"state": "driving"})
+    assert old.pane_id is None
+    assert old.claude_session_id is None
+    assert old.transcript_path is None
+    new = StatusPayload(
+        state="driving",
+        pane_id="w3:p2",
+        claude_session_id="sess-1",
+        transcript_path="/private/tmp/t.jsonl",
+    )
+    assert StatusPayload.model_validate_json(new.model_dump_json()) == new
+
+
+def test_phase1_type_constants() -> None:
+    assert constants.T_PROMPT_PROPOSAL == "prompt_proposal"
+    assert constants.T_APPROVE_PROMPT == "approve_prompt"
+    assert constants.T_BUDGET_UPDATE == "budget_update"
 
 
 def test_oversized_line_guard_value() -> None:
