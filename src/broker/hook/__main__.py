@@ -1,10 +1,10 @@
 """Claude Code hook client. `python -m broker.hook`.
 
-Import closure: stdlib + broker.protocol.constants ONLY (plan §1.3). This
-process starts on the synchronous permission path of every tool call in every
-supervised session — pydantic here would tax every single tool call.
+Import closure: stdlib + broker.protocol.constants ONLY. This process starts
+on the synchronous permission path of every tool call in every supervised
+session — pydantic here would tax every single tool call.
 
-Invariants (spec constraints 11-12, §9.5 — binding):
+Invariants (binding):
 - stdout carries the PreToolUse allow-decision JSON or NOTHING. Never "deny",
   never allow-by-default.
 - exit 0 on every path, including every exception. A dead broker degrades the
@@ -38,6 +38,7 @@ _ALLOW_OUTPUT = {
 
 
 def _timeout_seconds() -> float:
+    """Return the wait in seconds, overridable via ``BROKER_HOOK_TIMEOUT``."""
     try:
         return float(os.environ["BROKER_HOOK_TIMEOUT"])
     except (KeyError, ValueError):
@@ -45,7 +46,15 @@ def _timeout_seconds() -> float:
 
 
 def _read_line(sock: socket.socket, timeout: float) -> bytes | None:
-    """Read one \\n-terminated reply line, capped at MAX_LINE_BYTES."""
+    """Read one \\n-terminated reply line, capped at MAX_LINE_BYTES.
+
+    Args:
+        sock: Connected socket to read from.
+        timeout: Per-recv socket timeout in seconds.
+
+    Returns:
+        The line without its terminator, or ``None`` if closed early or capped.
+    """
     sock.settimeout(timeout)
     buf = b""
     while b"\n" not in buf:
@@ -59,13 +68,14 @@ def _read_line(sock: socket.socket, timeout: float) -> bytes | None:
 
 
 def main() -> None:
+    """Relay one hook event to the broker and print its allow-decision, if any."""
     raw_payload: Any = json.load(sys.stdin)
     if not isinstance(raw_payload, dict):
         return
     payload = cast(dict[str, Any], raw_payload)
     sock_path = os.environ.get("BROKER_SOCKET")
     if not sock_path:
-        return  # isolation gate (spec §4.1 step 6)
+        return  # isolation gate
 
     event = payload.get("hook_event_name")
     timeout = _timeout_seconds()

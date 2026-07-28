@@ -1,7 +1,7 @@
-"""Hook client proven against a stub broker socket (PRP Level 2 binding names).
+"""Hook client proven against a stub broker socket.
 
 Real subprocess (`sys.executable -m broker.hook`) against an in-test
-socketserver stub. Sockets live under /private/tmp — never /tmp (gotcha 11).
+socketserver stub. Sockets live under /private/tmp — never /tmp.
 """
 
 import contextlib

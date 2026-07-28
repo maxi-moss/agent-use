@@ -1,4 +1,4 @@
-"""The hook's import closure is asserted, not left to discipline (plan §1.3)."""
+"""The hook's import closure is asserted, not left to discipline."""
 
 import subprocess
 import sys
