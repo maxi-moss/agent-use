@@ -120,7 +120,7 @@ async def test_forced_single_tool_choice() -> None:
         "type": "any",
         "disable_parallel_tool_use": True,
     }
-    assert fake.calls[0]["model"] == "claude-opus-5"
+    assert fake.calls[0]["model"] == "claude-sonnet-5"
 
 
 def test_context_order_intent_transcript_working() -> None:

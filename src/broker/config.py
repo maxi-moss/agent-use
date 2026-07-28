@@ -27,7 +27,7 @@ class BrokerConfig(BaseModel):
     # that must fail loud, never be silently ignored.
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
-    model_id: str = "claude-opus-5"  # PINNED — nowhere else in the tree
+    model_id: str = "claude-sonnet-5"  # PINNED — nowhere else in the tree
     max_tokens: int = 8192
     watchdog_seconds: float = 300.0
     budget_max: int = 8

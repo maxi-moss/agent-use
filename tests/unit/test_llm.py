@@ -54,7 +54,7 @@ def as_client(fake: FakeClient) -> AsyncAnthropic:
 
 
 CALL_KWARGS: dict[str, Any] = {
-    "model": "claude-opus-5",
+    "model": "claude-sonnet-5",
     "max_tokens": 1024,
     "system": [],
     "messages": [],
