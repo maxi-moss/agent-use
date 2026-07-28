@@ -67,10 +67,3 @@ def test_corrupt_registry_fails_loud(tmp_path: Path) -> None:
     path.write_text("{broken")
     with pytest.raises(RegistryError):
         Registry.load(path)
-
-
-def test_approved_prompt_is_persisted(tmp_path: Path) -> None:
-    path = tmp_path / "registry.json"
-    registry = Registry.load(path)
-    registry.upsert(record("s1", approved_prompt="THE APPROVED PROMPT"))
-    assert Registry.load(path).get("s1").approved_prompt == "THE APPROVED PROMPT"

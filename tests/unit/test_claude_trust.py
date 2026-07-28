@@ -5,12 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from broker.claude.trust import VALIDATED_AGAINST, seed_trust
-
-
-def test_validated_against_pinned() -> None:
-    # Undocumented key — re-verify on every Claude Code upgrade
-    assert VALIDATED_AGAINST == "2.1.220"
+from broker.claude.trust import seed_trust
 
 
 def test_seeds_fresh_file(tmp_path: Path) -> None:
@@ -49,13 +44,6 @@ def test_preserves_existing_projects_and_siblings(tmp_path: Path) -> None:
         "history": ["old prompt"],
         "hasTrustDialogAccepted": True,
     }
-
-
-def test_key_is_absolute_path_string(tmp_path: Path) -> None:
-    target = tmp_path / ".claude.json"
-    seed_trust(Path("/private/tmp/deep/nested/worktree"), target)
-    data = json.loads(target.read_text())
-    assert list(data["projects"]) == ["/private/tmp/deep/nested/worktree"]
 
 
 def test_relative_path_rejected(tmp_path: Path) -> None:

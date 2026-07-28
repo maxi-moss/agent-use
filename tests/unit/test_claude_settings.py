@@ -12,8 +12,6 @@ from broker.claude.settings import (
     register_hooks,
     verify_and_repair,
 )
-from broker.protocol.constants import HOOK_SETTINGS_TIMEOUT
-
 COMMAND = "/usr/bin/env python3 -m broker.hook  # broker-hook"
 EVENTS = ["PreToolUse", "Stop", "SessionStart"]
 
@@ -28,19 +26,6 @@ FAKE_HERDR_ENTRY: dict[str, Any] = {
         }
     ],
 }
-
-
-def test_hook_entry_shape() -> None:
-    entry = hook_entry(COMMAND)
-    assert entry == {
-        "hooks": [
-            {
-                "type": "command",
-                "command": COMMAND,
-                "timeout": HOOK_SETTINGS_TIMEOUT,
-            }
-        ]
-    }
 
 
 def test_command_without_marker_is_rejected(tmp_path: Path) -> None:

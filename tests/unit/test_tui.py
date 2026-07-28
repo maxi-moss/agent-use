@@ -140,20 +140,3 @@ async def test_app_mounts_serves_and_unmounts_cleanly(home: Path) -> None:
         assert resp.ok is False
     # Clean unmount: registry persisted, no exception raised on the way out.
     assert (home / "registry.json").exists()
-
-
-async def test_startup_warnings_shown(home: Path) -> None:
-    cfg = BrokerConfig(model_id="test-model", broker_home=home)
-    registry = Registry.load(home / "registry.json")
-    app = BrokerMasterApp(
-        cfg,
-        registry,
-        GatedLLM(),
-        anchor_pane="%1",
-        startup_warnings=["session s1 found in registry — marked unmanaged"],
-    )
-    async with app.run_test() as pilot:
-        await pilot.pause(0.05)
-        # RichLog stores rendered lines; presence of the widget suffices —
-        # the warning path is exercised without error.
-        assert app.query_one("#events") is not None

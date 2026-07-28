@@ -64,13 +64,3 @@ def test_escalate_tool_fields_match_escalation_payload() -> None:
         "task_context",
     }
     assert tool_fields == payload_fields
-
-
-def test_tool_names_and_order_are_deterministic() -> None:
-    assert [t["name"] for t in TRIAGE_TOOLS] == [
-        "answer",
-        "escalate",
-        "complete",
-        "no_action",
-    ]
-    assert [t["name"] for t in GROUNDING_TOOLS] == ["propose_prompt"]

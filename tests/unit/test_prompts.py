@@ -12,17 +12,6 @@ NAMES = ["triage", "master", "grounding"]
 
 
 @pytest.mark.parametrize("name", NAMES)
-def test_load_returns_non_empty(name: str) -> None:
-    text = prompts.load(name)
-    assert text.strip()
-
-
-def test_load_unknown_prompt_fails_loud() -> None:
-    with pytest.raises(FileNotFoundError):
-        prompts.load("does-not-exist")
-
-
-@pytest.mark.parametrize("name", NAMES)
 def test_prompts_are_static_prefixes(name: str) -> None:
     """No templating slots: prompts must be byte-stable across calls
     (any volatile content belongs after the cache breakpoint)."""

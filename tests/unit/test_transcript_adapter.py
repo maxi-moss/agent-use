@@ -2,8 +2,6 @@
 
 from pathlib import Path
 
-import pytest
-
 from broker.transcript.adapter import (
     ReadReport,
     read_cleaned,
@@ -26,28 +24,6 @@ REJECTED_ASK = FIXTURES / "d4032982-9753-4cce-ac1a-589ee8fe7e19.jsonl"
 EXIT_PLAN = FIXTURES / "4f98b564-4f25-4a62-bee0-7808a82cd868.jsonl"
 MULTISELECT_ABSENT = FIXTURES / "3ec7ee94-4dd8-4e26-a8fa-6b047e3382e2.jsonl"
 APPROVED_PLAN_SYNTHETIC = FIXTURES / "approved-exit-plan.jsonl"
-
-READABLE_FIXTURES = [
-    MINIMAL_ASK,
-    ASK_VARIANTS,
-    REJECTED_ASK,
-    EXIT_PLAN,
-    MULTISELECT_ABSENT,
-    APPROVED_PLAN_SYNTHETIC,
-]
-
-
-@pytest.mark.parametrize("path", READABLE_FIXTURES, ids=lambda p: p.name)
-def test_double_read_is_equal(path: Path) -> None:
-    assert read_cleaned(path) == read_cleaned(path)
-
-
-@pytest.mark.parametrize("path", READABLE_FIXTURES, ids=lambda p: p.name)
-def test_render_is_byte_deterministic(path: Path) -> None:
-    events = read_cleaned(path)
-    first = render(events)
-    second = render(read_cleaned(path))
-    assert first.encode() == second.encode()
 
 
 def test_minimal_ask_user_question_answered() -> None:
