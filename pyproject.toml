@@ -3,7 +3,11 @@ name = "broker"
 version = "0.1.0"
 description = "Routes decisions between one developer and N headless Claude Code sessions driven through Herdr."
 requires-python = ">=3.14"
-dependencies = ["pydantic>=2.13"]
+dependencies = [
+    "anthropic>=0.120.0",
+    "pydantic>=2.13",
+    "textual>=8.2.8",
+]
 
 [build-system]
 requires = ["uv_build>=0.10,<0.11"]
@@ -15,6 +19,7 @@ dev = [
     "pyright",
     "flake8>=7.3.0",
     "import-linter",
+    "pytest-asyncio>=1.4.0",
 ]
 
 [tool.pyright]
@@ -28,6 +33,7 @@ venv = ".venv"
 minversion = "8.0"
 testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
+asyncio_mode = "auto"
 markers = [
     "unit: fast, no I/O",
     "integration: exercises real subprocess/IO boundaries",
@@ -52,5 +58,26 @@ forbidden_modules = [
     "broker.transcript",
     "broker.herdr",
     "broker.claude",
+    "broker.master",
+    "broker.session",
+    "broker.prompts",
+    "broker.llm",
+    "broker.config",
 ]
 ignore_imports = ["broker.hook.** -> broker.protocol.constants"]
+
+[[tool.importlinter.contracts]]
+name = "session brokers never import the master or Claude Code config writers"
+type = "forbidden"
+source_modules = ["broker.session"]
+forbidden_modules = [
+    "broker.master",
+    "broker.claude.settings",
+    "broker.claude.trust",
+]
+
+[[tool.importlinter.contracts]]
+name = "master never imports session broker internals (spawn is by subprocess)"
+type = "forbidden"
+source_modules = ["broker.master"]
+forbidden_modules = ["broker.session"]
