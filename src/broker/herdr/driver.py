@@ -32,6 +32,10 @@ _DIRECTIONS = frozenset({"right", "down"})
 # live, repeatedly, against herdr 0.7.5). This fixed delay is the workaround.
 _PANE_READY_DELAY_S = 1.0
 
+# Slack over herdr's own --timeout, so herdr hits its deadline first and
+# reports a structured error instead of being killed mid-run by ours.
+_HERDR_WAIT_GRACE_S = 10.0
+
 
 class HerdrError(Exception):
     """herdr reported a server/timeout error (exit 1, JSON on stderr)."""
@@ -254,7 +258,7 @@ def agent_start(
     ]
     if agent_args:
         argv += ["--", *agent_args]
-    stdout = _run(argv, timeout_s=timeout_ms / 1000 + 10.0)
+    stdout = _run(argv, timeout_s=timeout_ms / 1000 + _HERDR_WAIT_GRACE_S)
     return AgentStartResult.model_validate(_unwrap_result(_parse_json(stdout)))
 
 
@@ -374,7 +378,7 @@ def agent_wait(
         _check_identifier(state, "wait state")
         argv += ["--until", state]
     argv += ["--timeout", str(timeout_ms)]
-    stdout = _run(argv, timeout_s=timeout_ms / 1000 + 10.0)
+    stdout = _run(argv, timeout_s=timeout_ms / 1000 + _HERDR_WAIT_GRACE_S)
     parsed: Any = _parse_json(stdout) if stdout.strip() else {}
     if isinstance(parsed, dict):
         return cast(dict[str, Any], parsed)
