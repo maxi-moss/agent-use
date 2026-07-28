@@ -48,6 +48,7 @@ from broker.protocol.constants import (
 )
 from broker.protocol.server import serve_unix
 from broker.protocol.schemas import (
+    Alternative,
     ApprovePromptPayload,
     DispatchDecisionPayload,
     Envelope,
@@ -594,21 +595,60 @@ class SessionBroker:
                     T_BUDGET_UPDATE, {"count": self.budget_count}
                 )
         elif isinstance(result, EscalateCall):
-            payload = EscalationPayload.model_validate(
-                {
-                    "escalation_id": uuid.uuid4().hex,
-                    "session_id": self.cfg.name,
-                    "task_context": self._intent(),
-                    **result.model_dump(exclude={"reasoning"}),
-                }
-            )  # model_validate, never model_construct
+            payload = self._new_escalation(
+                situation=result.situation,
+                what_was_asked=result.what_was_asked,
+                what_is_at_stake=result.what_is_at_stake,
+                alternatives=result.alternatives,
+                recommendation=result.recommendation,
+                uncertainty=result.uncertainty,
+                what_would_change_my_mind=result.what_would_change_my_mind,
+            )
             await self._raise_escalation(payload, result.reasoning, events)
         elif isinstance(result, CompleteCall):
             self._log("completed", result.reasoning, result.summary)
             await self._to_master(T_COMPLETION, {"summary": result.summary})
-            self._set_state("completed")  # stop driving; keep serving
+            self._set_state(SessionState.COMPLETED)  # stop driving; keep serving
         elif isinstance(result, NoActionCall):  # pyright: ignore[reportUnnecessaryIsInstance]
             self._log("no_action", result.reasoning, "")
+
+    def _new_escalation(
+        self,
+        *,
+        situation: str,
+        what_was_asked: str,
+        what_is_at_stake: str,
+        alternatives: list[Alternative],
+        recommendation: str,
+        uncertainty: str,
+        what_would_change_my_mind: str,
+    ) -> EscalationPayload:
+        """Build an escalation carrying this session's identifying preamble.
+
+        Args:
+            situation: What is happening that needs a decision.
+            what_was_asked: The question, verbatim.
+            what_is_at_stake: Consequences of getting it wrong.
+            alternatives: The options open to the developer.
+            recommendation: The broker's suggested option.
+            uncertainty: What the broker is unsure about.
+            what_would_change_my_mind: What would flip the recommendation.
+
+        Returns:
+            The escalation, ready to raise.
+        """
+        return EscalationPayload(
+            escalation_id=uuid.uuid4().hex,
+            session_id=self.cfg.name,
+            task_context=self._intent(),
+            situation=situation,
+            what_was_asked=what_was_asked,
+            what_is_at_stake=what_is_at_stake,
+            alternatives=alternatives,
+            recommendation=recommendation,
+            uncertainty=uncertainty,
+            what_would_change_my_mind=what_would_change_my_mind,
+        )
 
     async def _escalate_handover(
         self,
@@ -627,43 +667,38 @@ class SessionBroker:
             last_assistant_message: The question that answer was replying to.
             events: Transcript events used to baseline out-of-band resolution.
         """
-        payload = EscalationPayload.model_validate(
-            {
-                "escalation_id": uuid.uuid4().hex,
-                "session_id": self.cfg.name,
-                "task_context": self._intent(),
-                "situation": (
-                    f"Autonomous answer budget exhausted: {self.budget_count} "
-                    "consecutive autonomous answers without developer contact. "
-                    "This broker is handing over."
+        payload = self._new_escalation(
+            situation=(
+                f"Autonomous answer budget exhausted: {self.budget_count} "
+                "consecutive autonomous answers without developer contact. "
+                "This broker is handing over."
+            ),
+            what_was_asked=last_assistant_message,
+            what_is_at_stake=(
+                "Continuing unsupervised would exceed the drift bound the "
+                "budget exists to enforce."
+            ),
+            alternatives=[
+                Alternative(
+                    option="Send the broker's prepared answer (below)",
+                    pros="The session continues immediately",
+                    cons="It has not been reviewed by you",
                 ),
-                "what_was_asked": last_assistant_message,
-                "what_is_at_stake": (
-                    "Continuing unsupervised would exceed the drift bound the "
-                    "budget exists to enforce."
+                Alternative(
+                    option="Answer differently in your own words",
+                    pros="Full control after a long autonomous stretch",
+                    cons="Requires reading the question",
                 ),
-                "alternatives": [
-                    {
-                        "option": "Send the broker's prepared answer (below)",
-                        "pros": "The session continues immediately",
-                        "cons": "It has not been reviewed by you",
-                    },
-                    {
-                        "option": "Answer differently in your own words",
-                        "pros": "Full control after a long autonomous stretch",
-                        "cons": "Requires reading the question",
-                    },
-                ],
-                "recommendation": result.answer,
-                "uncertainty": (
-                    "The budget cap, not doubt about the answer, forced this "
-                    f"escalation. Broker reasoning: {result.reasoning}"
-                ),
-                "what_would_change_my_mind": (
-                    "Any developer response resets the budget and resumes "
-                    "autonomous operation."
-                ),
-            }
+            ],
+            recommendation=result.answer,
+            uncertainty=(
+                "The budget cap, not doubt about the answer, forced this "
+                f"escalation. Broker reasoning: {result.reasoning}"
+            ),
+            what_would_change_my_mind=(
+                "Any developer response resets the budget and resumes "
+                "autonomous operation."
+            ),
         )
         await self._raise_escalation(payload, result.reasoning, events)
 
@@ -681,30 +716,23 @@ class SessionBroker:
                 ``_check_out_of_band_resolution`` can match the answer.
         """
         rendered, alternatives, recommendation = _render_ask_user(tool_input)
-        payload = EscalationPayload.model_validate(
-            {
-                "escalation_id": uuid.uuid4().hex,
-                "session_id": self.cfg.name,
-                "task_context": self._intent(),
-                "situation": (
-                    "AskUserQuestion pending — manual input required in pane "
-                    f"{self.pane_id or '?'}. The native menu is on screen; "
-                    "answer it directly in that pane."
-                ),
-                "what_was_asked": rendered,
-                "what_is_at_stake": (
-                    "The session is blocked on this menu until it is answered."
-                ),
-                "alternatives": alternatives,
-                "recommendation": recommendation,
-                "uncertainty": (
-                    "This broker cannot drive menus."
-                ),
-                "what_would_change_my_mind": (
-                    "Answering in the pane retracts this escalation "
-                    "automatically."
-                ),
-            }
+        payload = self._new_escalation(
+            situation=(
+                "AskUserQuestion pending — manual input required in pane "
+                f"{self.pane_id or '?'}. The native menu is on screen; "
+                "answer it directly in that pane."
+            ),
+            what_was_asked=rendered,
+            what_is_at_stake=(
+                "The session is blocked on this menu until it is answered."
+            ),
+            alternatives=alternatives,
+            recommendation=recommendation,
+            uncertainty="This broker cannot drive menus.",
+            what_would_change_my_mind=(
+                "Answering in the pane retracts this escalation "
+                "automatically."
+            ),
         )
         self._pending_ask_id = tool_use_id
         await self._raise_escalation(payload, "AskUserQuestion (mechanical)", None)
