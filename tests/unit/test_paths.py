@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from broker.paths import BrokerPaths
-from broker.session.config import SessionBrokerConfig
+from broker.config import SessionBrokerConfig
 
 
 def test_session_paths_follow_the_configured_home_not_the_env(

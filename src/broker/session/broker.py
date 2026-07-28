@@ -21,7 +21,7 @@ from typing import Any, cast
 from pydantic import ValidationError
 
 from broker import llm as llm_module
-from broker.config import BrokerConfig
+from broker.config import AdoptedSession, BrokerConfig, SessionBrokerConfig
 from broker.paths import BrokerPaths
 from broker.herdr import driver
 from broker.claude.paths import transcript_dir_for_cwd
@@ -62,7 +62,6 @@ from broker.protocol.schemas import (
     StatusPayload,
 )
 from broker.session import decision_log
-from broker.session.config import AdoptedSession, SessionBrokerConfig
 from broker.session.triage import (
     AnswerCall,
     CompleteCall,

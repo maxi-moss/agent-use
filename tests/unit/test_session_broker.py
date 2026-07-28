@@ -35,7 +35,7 @@ from broker.protocol.constants import (
 from broker.protocol.schemas import Envelope, Response
 from broker.protocol.server import serve_unix
 from broker.session.broker import SessionBroker
-from broker.session.config import AdoptedSession, SessionBrokerConfig
+from broker.config import AdoptedSession, SessionBrokerConfig
 
 FIXTURES = Path(__file__).parent.parent / "fixtures"
 HERDR_FIXTURES = FIXTURES / "herdr"

@@ -13,7 +13,6 @@ answers.
 
 import asyncio
 import contextlib
-import json
 import logging
 import sys
 import uuid
@@ -26,7 +25,7 @@ from pydantic import ValidationError
 from textual.message import Message
 
 from broker.claude.trust import seed_trust
-from broker.config import BrokerConfig
+from broker.config import AdoptedSession, BrokerConfig, SessionBrokerConfig
 from broker.paths import BrokerPaths
 from broker.master import notifier
 from broker.master.messages import (
@@ -106,7 +105,7 @@ async def _broker_is_listening(path: Path) -> bool:
     return True
 
 
-def _adoption_fields(record: SessionRecord) -> dict[str, str]:
+def _adoption_fields(record: SessionRecord) -> AdoptedSession:
     """Build the block a replacement broker needs to adopt a live session.
 
     Args:
@@ -119,18 +118,28 @@ def _adoption_fields(record: SessionRecord) -> dict[str, str]:
         ValueError: Any of them is unknown. A broker must never adopt a
             session it only partly knows.
     """
-    known = {
-        "pane_id": record.pane_id,
-        "claude_session_id": record.claude_session_id,
-        "transcript_path": record.transcript_path,
-    }
-    missing = sorted(field for field, value in known.items() if not value)
-    if missing:
+    pane_id = record.pane_id
+    claude_session_id = record.claude_session_id
+    transcript_path = record.transcript_path
+    if not (pane_id and claude_session_id and transcript_path):
+        missing = sorted(
+            field
+            for field, value in (
+                ("pane_id", pane_id),
+                ("claude_session_id", claude_session_id),
+                ("transcript_path", transcript_path),
+            )
+            if not value
+        )
         raise ValueError(
             f"session {record.name} cannot be reassigned: the registry has no "
             + ", ".join(missing)
         )
-    return {field: value for field, value in known.items() if value}
+    return AdoptedSession(
+        pane_id=pane_id,
+        claude_session_id=claude_session_id,
+        transcript_path=transcript_path,
+    )
 
 
 class ProtocolViolation(Exception):
@@ -752,7 +761,7 @@ class MasterRuntime:
     # ── internals ────────────────────────────────────────────────────────────
 
     async def _spawn_broker(
-        self, record: SessionRecord, *, adopt: dict[str, str] | None
+        self, record: SessionRecord, *, adopt: AdoptedSession | None
     ) -> asyncio.subprocess.Process:
         """Start a session-broker subprocess for ``record``.
 
@@ -765,22 +774,21 @@ class MasterRuntime:
         Returns:
             The spawned process.
         """
-        config: dict[str, Any] = {
-            "name": record.name,
-            "socket_path": record.socket_path,
-            "master_socket_path": str(self.master_socket_path),
-            "broker_home": str(self.paths.home),
-            "cwd": record.cwd,
-            "anchor_pane": record.anchor_pane,
-            "intent": record.intent,
-            "budget_count": record.budget_count,
-            "model_id": self.cfg.model_id,
-            "max_tokens": self.cfg.max_tokens,
-            "watchdog_seconds": self.cfg.watchdog_seconds,
-            "budget_max": self.cfg.budget_max,
-        }
-        if adopt is not None:
-            config["adopt"] = adopt
+        config = SessionBrokerConfig(
+            name=record.name,
+            socket_path=record.socket_path,
+            master_socket_path=str(self.master_socket_path),
+            broker_home=self.paths.home,
+            cwd=record.cwd,
+            anchor_pane=record.anchor_pane,
+            intent=record.intent,
+            budget_count=record.budget_count,
+            model_id=self.cfg.model_id,
+            max_tokens=self.cfg.max_tokens,
+            watchdog_seconds=self.cfg.watchdog_seconds,
+            budget_max=self.cfg.budget_max,
+            adopt=adopt,
+        )
         # By module string, never by import — keeps the module boundary
         # structural.
         return await asyncio.create_subprocess_exec(
@@ -788,7 +796,7 @@ class MasterRuntime:
             "-m",
             "broker.session",
             "--config-json",
-            json.dumps(config),
+            config.model_dump_json(),
         )
 
     async def _require_socket_free(self, record: SessionRecord) -> None:

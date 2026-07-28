@@ -6,7 +6,7 @@ import asyncio
 from broker import logging_setup
 from broker.paths import BrokerPaths
 from broker.session.broker import SessionBroker
-from broker.session.config import SessionBrokerConfig
+from broker.config import SessionBrokerConfig
 
 
 def main() -> None:
