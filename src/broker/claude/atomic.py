@@ -22,8 +22,20 @@ def atomic_update_json(
     mutate: Callable[[dict[str, Any]], dict[str, Any]],
     backup_suffix: str = ".broker-backup",
 ) -> dict[str, Any]:
-    """Apply `mutate` to the JSON object at `path`, atomically. Returns the
-    written object. A missing file starts as {}; an invalid one is fatal."""
+    """Apply ``mutate`` to the JSON object at ``path``, atomically.
+
+    Args:
+        path: JSON file to update.
+        mutate: Receives the current object and returns the object to write.
+        backup_suffix: Suffix for the pre-write backup file.
+
+    Returns:
+        The object that was written.
+
+    Raises:
+        AtomicWriteError: The file is not a JSON object, or ``mutate`` did not
+            return a dict.
+    """
     original_bytes: bytes | None = None
     data: dict[str, Any] = {}
     if path.exists():

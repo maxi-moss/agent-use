@@ -1,8 +1,7 @@
-"""Pre-seed folder trust in ~/.claude.json (spike-verified key, spec §9.1 gap).
+"""Pre-seed folder trust in ~/.claude.json.
 
-The trust key is UNDOCUMENTED — verified only by observation on 2.1.220
-(spikes/README.md §6). Re-verify on every Claude Code upgrade before trusting
-VALIDATED_AGAINST here.
+The trust key is UNDOCUMENTED — verified only by observation on 2.1.220.
+Re-verify on every Claude Code upgrade before trusting VALIDATED_AGAINST here.
 """
 
 from pathlib import Path
@@ -15,13 +14,23 @@ VALIDATED_AGAINST = "2.1.220"
 
 
 def seed_trust(project_path: Path, path: Path | None = None) -> None:
-    """Set projects.<abs-path>.hasTrustDialogAccepted = true, creating nodes as
-    needed and preserving every sibling key."""
+    """Pre-seed folder trust for ``project_path`` in ``~/.claude.json``.
+
+    Args:
+        project_path: Absolute path of the project to trust.
+        path: State file to update; defaults to ``~/.claude.json``.
+
+    Raises:
+        ValueError: ``project_path`` is not absolute.
+        AtomicWriteError: ``projects`` or this project's entry exists but
+            isn't a JSON object.
+    """
     if not project_path.is_absolute():
         raise ValueError(f"project path must be absolute: {project_path}")
     target = path if path is not None else claude_json_path()
 
     def mutate(data: dict[str, Any]) -> dict[str, Any]:
+        """Set the trust flag on this project's entry."""
         raw_projects = data.setdefault("projects", {})
         if not isinstance(raw_projects, dict):
             raise AtomicWriteError(

@@ -32,7 +32,7 @@ def test_claude_json_is_not_under_config_dir(
     [
         ("/private/tmp/broker-spike", "-private-tmp-broker-spike"),
         (
-            # underscore becomes dash too (gotcha 10) — verified on 2.1.220
+            # underscore becomes dash too — verified on 2.1.220
             "/Users/maxi/side_projects/agent-use",
             "-Users-maxi-side-projects-agent-use",
         ),

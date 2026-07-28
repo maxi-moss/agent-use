@@ -9,7 +9,7 @@ from broker.claude.trust import VALIDATED_AGAINST, seed_trust
 
 
 def test_validated_against_pinned() -> None:
-    # gotcha 7: undocumented key — re-verify on every Claude Code upgrade
+    # Undocumented key — re-verify on every Claude Code upgrade
     assert VALIDATED_AGAINST == "2.1.220"
 
 
