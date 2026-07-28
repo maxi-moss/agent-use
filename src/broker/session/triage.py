@@ -42,6 +42,8 @@ class LLMToolCaller(Protocol):
     ) -> ToolCall:
         """Make one tool call against the model and return the tool it chose."""
         ...
+_TRACKED_FILES_TIMEOUT_S = 10.0
+_MAX_TRACKED_FILES = 200
 
 
 class AnswerCall(BaseModel):
@@ -252,21 +254,22 @@ def _git_ls_files(cwd: Path) -> str:
             cwd=cwd,
             capture_output=True,
             text=True,
-            timeout=10.0,
+            timeout=_TRACKED_FILES_TIMEOUT_S,
         )
     except (OSError, subprocess.TimeoutExpired):
         return ""
     if proc.returncode != 0:
         return ""
     lines = proc.stdout.splitlines()
-    head = lines[:200]
-    if len(lines) > 200:
-        head.append(f"... ({len(lines) - 200} more tracked files)")
+    head = lines[:_MAX_TRACKED_FILES]
+    if len(lines) > _MAX_TRACKED_FILES:
+        extra = len(lines) - _MAX_TRACKED_FILES
+        head.append(f"... ({extra} more tracked files)")
     return "\n".join(head)
 
 
 async def ground_intent(
-    llm_call: LLMToolCaller,
+    llm_call: LLMCaller[ToolCall],
     cfg: BrokerConfig,
     *,
     intent: str,
