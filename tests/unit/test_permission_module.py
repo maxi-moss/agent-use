@@ -163,7 +163,6 @@ async def test_allow_logs_before_reply(home: Path) -> None:
     assert written[0]["decision"] == DECISION_ALLOW
     assert written[0]["reason"] == "reversible read"
     assert written[0]["model_id"] == "claude-haiku-4-5"
-    assert written[0]["cached"] is False
     assert written[0]["tool_input"] == READ_INPUT
     assert master.received == []
 
@@ -205,40 +204,6 @@ async def test_askuserquestion_gate_no_inference(home: Path) -> None:
     written = entries(log)
     assert len(written) == 1
     assert written[0]["model_id"] is None
-
-
-async def test_repeat_served_from_cache_single_inference_and_log_flags(
-    home: Path,
-) -> None:
-    llm = FakeLLM(ALLOW)
-    async with _module(home, llm) as (module, master, log):
-        decisions = [await module.decide("Read", READ_INPUT, []) for _ in range(3)]
-        await asyncio.sleep(SETTLE_S)
-    assert decisions == [DECISION_ALLOW] * 3
-    assert len(llm.calls) == 1
-    written = entries(log)
-    assert len(written) == 3
-    assert [e["cached"] for e in written] == [False, True, True]
-    for replay in written[1:]:
-        assert replay["reason"] == written[0]["reason"]
-        assert replay["model_id"] == written[0]["model_id"]
-    assert master.of_type(T_PERMISSION_ESCALATION) == []
-
-
-async def test_signal3_retracts_and_replays_without_new_escalation(
-    home: Path,
-) -> None:
-    llm = FakeLLM(ESCALATE)
-    async with _module(home, llm) as (module, master, log):
-        assert await module.decide("Bash", PUSH_INPUT, []) == DECISION_ESCALATED
-        raised = await master.wait_for(T_PERMISSION_ESCALATION)
-        assert await module.decide("Bash", PUSH_INPUT, []) == DECISION_ESCALATED
-        retract = await master.wait_for(T_RETRACT)
-        await asyncio.sleep(SETTLE_S)
-        assert len(master.of_type(T_PERMISSION_ESCALATION)) == 1
-    assert retract.payload["escalation_id"] == raised.payload["escalation_id"]
-    assert len(llm.calls) == 1
-    assert [e["cached"] for e in entries(log)] == [False, True]
 
 
 def _completed(module: PermissionModule) -> None:
@@ -285,19 +250,29 @@ async def test_unrelated_tool_completion_does_not_retract(home: Path) -> None:
         assert master.of_type(T_RETRACT) == []
 
 
-async def test_second_escalation_suppressed_while_live(home: Path) -> None:
+async def test_second_escalation_supersedes_the_first(home: Path) -> None:
+    """Reaching a second prompt means the first was answered in the pane.
+
+    The first must be retracted rather than orphaned in the master's slot, and
+    the second must still reach the developer — swallowing it would leave the
+    master silent for the rest of the session.
+    """
     llm = FakeLLM(ESCALATE, ESCALATE_2)
     async with _module(home, llm) as (module, master, log):
         assert await module.decide("Bash", PUSH_INPUT, []) == DECISION_ESCALATED
-        await master.wait_for(T_PERMISSION_ESCALATION)
+        first = await master.wait_for(T_PERMISSION_ESCALATION)
         assert await module.decide("Bash", DEPLOY_INPUT, []) == DECISION_ESCALATED
+        second = await master.wait_for(T_PERMISSION_ESCALATION, count=2)
+        retract = await master.wait_for(T_RETRACT)
         await asyncio.sleep(SETTLE_S)
-        assert len(master.of_type(T_PERMISSION_ESCALATION)) == 1
+    assert retract.payload["escalation_id"] == first.payload["escalation_id"]
+    assert second.payload["tool_input"] == DEPLOY_INPUT
+    # The slot is one-per-raiser, so the retraction has to land first or the
+    # replacement is refused for capacity by the escalation it replaces.
+    order = [e.type for e in master.received]
+    assert order.index(T_RETRACT) < order.index(T_PERMISSION_ESCALATION, 1)
     written = entries(log)
-    assert [e["decision"] for e in written] == [DECISION_ESCALATED] * 2
-    assert written[0]["reason"] == "publishes to a remote"
-    assert written[1]["reason"].startswith("deploys")
-    assert "not raised" in written[1]["reason"]
+    assert [e["reason"] for e in written] == ["publishes to a remote", "deploys"]
 
 
 async def test_slot_occupied_nack_is_routine(home: Path) -> None:
@@ -327,17 +302,17 @@ async def test_reply_arrives_with_master_unreachable(home: Path) -> None:
         await asyncio.sleep(SETTLE_S)
 
 
-async def test_set_intent_clears_cache(home: Path) -> None:
+async def test_set_intent_changes_what_calls_are_judged_against(
+    home: Path,
+) -> None:
     llm = FakeLLM(ALLOW, ALLOW)
-    async with _module(home, llm) as (module, _, log):
+    async with _module(home, llm) as (module, _, _log):
         assert await module.decide("Read", READ_INPUT, []) == DECISION_ALLOW
         module.set_intent("rewrite the billing exporter")
         assert await module.decide("Read", READ_INPUT, []) == DECISION_ALLOW
         await asyncio.sleep(SETTLE_S)
-    assert len(llm.calls) == 2
     assert "add a login page" in llm.sent_text(0)
     assert "rewrite the billing exporter" in llm.sent_text(1)
-    assert [e["cached"] for e in entries(log)] == [False, False]
 
 
 async def test_non_capacity_nack_still_frees_the_slot(home: Path) -> None:

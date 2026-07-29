@@ -20,7 +20,6 @@ def append(
     reason: str,
     model_id: str | None,
     latency_ms: int,
-    cached: bool,
 ) -> None:
     """Append one permission decision to the NDJSON log.
 
@@ -32,7 +31,6 @@ def append(
         reason: Why that outcome was reached.
         model_id: Model that judged the call, or ``None`` when none did.
         latency_ms: Wall-clock time this decision took.
-        cached: Whether the decision replayed an earlier judgement.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     entry = {
@@ -43,7 +41,6 @@ def append(
         "reason": reason,
         "model_id": model_id,
         "latency_ms": latency_ms,
-        "cached": cached,
     }
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
@@ -67,7 +64,7 @@ def render_log(path: Path) -> str:
             continue
         parsed: Any = json.loads(line)  # our own writes; malformed = fail loud
         entry = cast(dict[str, Any], parsed)
-        served = "cache" if entry.get("cached") else entry.get("model_id") or "-"
+        served = entry.get("model_id") or "-"
         parts.append(
             f"[{entry.get('ts', '?')}] {entry.get('tool_name', '?')} -> "
             f"{entry.get('decision', '?')} "

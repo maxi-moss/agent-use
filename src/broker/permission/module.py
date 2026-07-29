@@ -9,6 +9,7 @@ unasked approval.
 """
 
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -21,7 +22,6 @@ from typing import Any
 from broker.config import ClassifierConfig
 from broker.permission import llm as llm_module
 from broker.permission import permission_log
-from broker.permission.cache import CacheEntry, ReuseCache, cache_key
 from broker.permission.llm import PermissionCaller
 from broker.permission.schemas import AllowCall
 from broker.protocol import client
@@ -51,14 +51,12 @@ _ASK_REASON = (
     "the session is putting a question to the developer; that question travels"
     " its own path to them, so this prompt is neither judged nor raised here"
 )
-_SUPPRESSED_NOTE = (
-    " (not raised: the developer already has an unanswered prompt from this"
-    " session waiting in the pane)"
-)
 _RETRACT_COMPLETED = "the tool call completed, so the prompt is gone"
 _RETRACT_DEVELOPER_INPUT = "the developer typed into the session"
-_RETRACT_REPEAT = "the session repeated the request, so the prompt was answered"
 _RETRACT_SESSION_ENDED = "the session ended"
+# Reaching a new prompt means the session was unblocked, so the earlier one was
+# answered in the pane whether or not any other signal observed it.
+_RETRACT_SUPERSEDED = "the session moved on to a different permission request"
 
 
 @dataclass
@@ -99,7 +97,6 @@ class PermissionModule:
         self.log_path = log_path
         self.intent = intent
         self._llm_call = llm_call
-        self._cache = ReuseCache()
         self._live: _LiveEscalation | None = None
         self._tasks: set[asyncio.Task[None]] = set()
 
@@ -129,28 +126,11 @@ class PermissionModule:
                 _ASK_REASON,
                 None,
                 0,
-                cached=False,
             )
             return DECISION_ESCALATED
 
-        key = cache_key(tool_name, tool_input)
+        key = _call_key(tool_name, tool_input)
         started = time.monotonic()
-        entry = self._cache.get(key)
-        if entry is not None:
-            self._append(
-                tool_name,
-                tool_input,
-                entry.decision,
-                entry.reason,
-                entry.model_id,
-                _elapsed_ms(started),
-                cached=True,
-            )
-            live = self._live
-            if live is not None and live.key == key:
-                self._retract(live, _RETRACT_REPEAT)
-            return entry.decision
-
         try:
             result = await llm_module.classify(
                 self._caller(),
@@ -169,32 +149,21 @@ class PermissionModule:
                 f"{type(exc).__name__}: {exc}",
                 self.cfg.model_id,
                 _elapsed_ms(started),
-                cached=False,
             )
             return DECISION_ESCALATED
 
         decision = (
             DECISION_ALLOW if isinstance(result, AllowCall) else DECISION_ESCALATED
         )
-        suppressed = decision == DECISION_ESCALATED and self._live is not None
         self._append(
             tool_name,
             tool_input,
             decision,
-            result.reasoning + (_SUPPRESSED_NOTE if suppressed else ""),
+            result.reasoning,
             self.cfg.model_id,
             _elapsed_ms(started),
-            cached=False,
         )
-        self._cache.put(
-            key,
-            CacheEntry(
-                decision=decision,
-                reason=result.reasoning,
-                model_id=self.cfg.model_id,
-            ),
-        )
-        if decision == DECISION_ESCALATED and not suppressed:
+        if decision == DECISION_ESCALATED:
             self._raise(key, tool_name, tool_input, result.reasoning, suggestions)
         return decision
 
@@ -208,7 +177,7 @@ class PermissionModule:
             tool_input: Arguments it completed with.
         """
         live = self._live
-        if live is not None and live.key == cache_key(tool_name, tool_input):
+        if live is not None and live.key == _call_key(tool_name, tool_input):
             self._retract(live, _RETRACT_COMPLETED)
 
     def note_developer_input(self) -> None:
@@ -228,13 +197,12 @@ class PermissionModule:
             self._retract(live, _RETRACT_SESSION_ENDED)
 
     def set_intent(self, intent: str) -> None:
-        """Replace the task intent and drop every cached judgement.
+        """Replace the task intent every later call is judged against.
 
         Args:
             intent: The intent every later call is judged against.
         """
         self.intent = intent
-        self._cache.clear()
 
     # ── internals ─────────────────────────────────────────────────────────
 
@@ -254,8 +222,6 @@ class PermissionModule:
         reason: str,
         model_id: str | None,
         latency_ms: int,
-        *,
-        cached: bool,
     ) -> None:
         """Append one entry to this session's permission log."""
         permission_log.append(
@@ -266,7 +232,6 @@ class PermissionModule:
             reason=reason,
             model_id=model_id,
             latency_ms=latency_ms,
-            cached=cached,
         )
 
     def _raise(
@@ -279,8 +244,11 @@ class PermissionModule:
     ) -> None:
         """Claim the escalation slot and send the raise off the decision path.
 
+        Any escalation still held is retracted first: the session could not
+        have reached a new prompt while blocked on the old one.
+
         Args:
-            key: Reuse key this escalation belongs to.
+            key: Key this escalation's tool call is identified by.
             tool_name: Name of the tool the session is asking to run.
             tool_input: Arguments the session passed to it.
             reason: The classifier's reasoning, passed to the developer intact.
@@ -299,10 +267,35 @@ class PermissionModule:
             ),
             permission_suggestions=suggestions,
         )
+        superseded = self._live
         self._live = _LiveEscalation(
             escalation_id=payload.escalation_id, key=key
         )
-        self._spawn(self._send_escalation(payload))
+        self._spawn(self._supersede_then_send(superseded, payload))
+
+    async def _supersede_then_send(
+        self,
+        superseded: _LiveEscalation | None,
+        payload: PermissionEscalationPayload,
+    ) -> None:
+        """Retract the escalation this one replaces, then raise this one.
+
+        The two sends are sequential because the master holds one slot per
+        raiser: overlapping them would let the raise arrive first and be
+        refused for capacity by the very escalation it supersedes.
+
+        Args:
+            superseded: Escalation being replaced, or ``None`` on a first raise.
+            payload: The escalation to raise.
+        """
+        if superseded is not None:
+            await self._send_retract(
+                RetractPayload(
+                    escalation_id=superseded.escalation_id,
+                    reason=_RETRACT_SUPERSEDED,
+                )
+            )
+        await self._send_escalation(payload)
 
     def _retract(self, live: _LiveEscalation, reason: str) -> None:
         """Release the escalation slot and send the retraction off the path.
@@ -406,3 +399,8 @@ class PermissionModule:
 def _elapsed_ms(started: float) -> int:
     """Milliseconds since ``started``, rounded down."""
     return int((time.monotonic() - started) * 1000)
+
+
+def _call_key(tool_name: str, tool_input: dict[str, Any]) -> str:
+    """Identify one tool call, stable across argument orderings."""
+    return tool_name + "\x00" + json.dumps(tool_input, sort_keys=True)

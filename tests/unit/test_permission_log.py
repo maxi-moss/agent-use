@@ -16,7 +16,6 @@ def test_append_render_round_trip(tmp_path: Path) -> None:
         reason="reversible read inside the working tree",
         model_id="claude-haiku-4-5",
         latency_ms=412,
-        cached=False,
     )
     append(
         log,
@@ -26,14 +25,12 @@ def test_append_render_round_trip(tmp_path: Path) -> None:
         reason="publishes to a shared remote",
         model_id=None,
         latency_ms=0,
-        cached=True,
     )
     lines = log.read_text().splitlines()
     assert len(lines) == 2
     first = json.loads(lines[0])
     assert first["tool_name"] == "Read"
     assert first["decision"] == "allow"
-    assert first["cached"] is False
     assert first["latency_ms"] == 412
     assert first["tool_input"] == {"file_path": "/repo/a.py"}
     text = render_log(log)
@@ -58,6 +55,5 @@ def test_append_creates_parents(tmp_path: Path) -> None:
         reason="search",
         model_id="m",
         latency_ms=1,
-        cached=False,
     )
     assert log.exists()

@@ -103,7 +103,6 @@ protected_modules = [
     "broker.permission.module",
     "broker.permission.llm",
     "broker.permission.schemas",
-    "broker.permission.cache",
     "broker.permission.permission_log",
 ]
 allowed_importers = ["broker.permission"]

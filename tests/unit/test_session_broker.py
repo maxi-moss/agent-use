@@ -541,8 +541,6 @@ async def test_ground_and_reactivate_call_set_intent(harness: Harness) -> None:
     await complete(harness)
     assert (await reactivate(harness, "now write the docs")).ok is True
     await ground_and_approve(harness, count=2, prompt="THE SECOND TASK")
-    # Reactivation replaces the intent outright; a cache judged against the
-    # first task must not survive into the second.
     assert spy.intents == ["APPROVED PROMPT", "THE SECOND TASK"]
 
 
