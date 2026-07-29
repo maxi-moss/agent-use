@@ -17,6 +17,8 @@ import pytest
 
 from broker.herdr import driver
 from broker.llm import ToolCall
+from broker.permission import PermissionModule
+from broker.permission.llm import ToolCall as PermissionToolCall
 from broker.protocol import client
 from broker.protocol.constants import (
     T_APPROVE_PROMPT,
@@ -25,6 +27,7 @@ from broker.protocol.constants import (
     T_DISPATCH_DECISION,
     T_ESCALATION,
     T_FATAL_ERROR,
+    T_GET_PERMISSION_LOG,
     T_HOOK_EVENT,
     T_PERMISSION_REQUEST,
     T_PROMPT_PROPOSAL,
@@ -35,7 +38,8 @@ from broker.protocol.constants import (
 from broker.protocol.schemas import Envelope, Response
 from broker.protocol.server import serve_unix
 from broker.session.broker import SessionBroker
-from broker.config import AdoptedSession, SessionBrokerConfig
+from broker.config import AdoptedSession, ClassifierConfig, SessionBrokerConfig
+from broker.paths import BrokerPaths
 
 FIXTURES = Path(__file__).parent.parent / "fixtures"
 HERDR_FIXTURES = FIXTURES / "herdr"
@@ -118,6 +122,53 @@ class FakeLLM:
         return await self.results.get()
 
 
+class FakePermissionLLM:
+    """Scripted classifier: an empty queue models a call still in flight."""
+
+    def __init__(self) -> None:
+        self.results: asyncio.Queue[PermissionToolCall] = asyncio.Queue()
+        self.calls: list[dict[str, Any]] = []
+
+    async def __call__(self, **kwargs: Any) -> PermissionToolCall:
+        self.calls.append(kwargs)
+        return await self.results.get()
+
+    async def script(self, name: str, reasoning: str) -> None:
+        """Queue one classifier outcome."""
+        await self.results.put(
+            PermissionToolCall(name=name, input={"reasoning": reasoning})
+        )
+
+
+class SpyPermission(PermissionModule):
+    """Records every signal the broker sends the module, and acts on none."""
+
+    def __init__(self, log_path: Path, master_socket_path: str) -> None:
+        super().__init__(
+            ClassifierConfig(),
+            session_name="s1",
+            master_socket_path=master_socket_path,
+            log_path=log_path,
+            intent="the raw intent",
+        )
+        self.notes: list[str] = []
+        self.intents: list[str] = []
+
+    def note_tool_completed(
+        self, tool_name: str, tool_input: dict[str, Any]
+    ) -> None:
+        self.notes.append(f"tool_completed:{tool_name}:{tool_input}")
+
+    def note_developer_input(self) -> None:
+        self.notes.append("developer_input")
+
+    def note_session_ended(self) -> None:
+        self.notes.append("session_ended")
+
+    def set_intent(self, intent: str) -> None:
+        self.intents.append(intent)
+
+
 class StubMaster:
     def __init__(self) -> None:
         self.received: list[Envelope] = []
@@ -144,10 +195,19 @@ class Harness:
     cfg: SessionBrokerConfig
     master: StubMaster
     llm: FakeLLM
+    classifier: FakePermissionLLM
     run: ScriptedRun
     sock: Path
     transcript: Path
     run_task: "asyncio.Task[None]" = field(repr=False, kw_only=True)
+
+    def spy_permission(self) -> SpyPermission:
+        """Replace the broker's module with a recording stand-in."""
+        spy = SpyPermission(
+            self.broker.permission_log_path, self.cfg.master_socket_path
+        )
+        self.broker.permission = spy
+        return spy
 
 
 def hook_env(name: str, raw_extra: dict[str, Any]) -> Envelope:
@@ -161,9 +221,7 @@ def hook_env(name: str, raw_extra: dict[str, Any]) -> Envelope:
     )
 
 
-def permission_env(
-    tool_name: str, tool_use_id: str, tool_input: dict[str, Any]
-) -> Envelope:
+def permission_env(tool_name: str, tool_input: dict[str, Any]) -> Envelope:
     return Envelope(
         id=uuid.uuid4().hex,
         type=T_PERMISSION_REQUEST,
@@ -171,9 +229,22 @@ def permission_env(
         payload={
             "tool_name": tool_name,
             "tool_input": tool_input,
-            "tool_use_id": tool_use_id,
             "cwd": "/private/tmp/x",
             "transcript_path": "/private/tmp/x/t.jsonl",
+            "permission_mode": "auto",
+            "permission_suggestions": [],
+        },
+    )
+
+
+def ask_user_env(tool_use_id: str, tool_input: dict[str, Any]) -> Envelope:
+    """A PreToolUse hook event for AskUserQuestion, as the hook forwards it."""
+    return hook_env(
+        "PreToolUse",
+        {
+            "tool_name": "AskUserQuestion",
+            "tool_use_id": tool_use_id,
+            "tool_input": tool_input,
         },
     )
 
@@ -204,6 +275,7 @@ async def _harness(
     run = ScriptedRun()
     monkeypatch.setattr(driver.subprocess, "run", run)
     llm = FakeLLM()
+    classifier = FakePermissionLLM()
     master = StubMaster()
     master_sock = home / "m.sock"
     master_server = await serve_unix(master_sock, master)
@@ -217,8 +289,10 @@ async def _harness(
         intent="the raw intent",
         model_id="test-model",
         max_tokens=1024,
+        classifier=ClassifierConfig(model_id="test-classifier"),
         watchdog_seconds=300.0,
         budget_max=8,
+        claude_settings_path=str(home / "claude-settings.json"),
         adopt=(
             AdoptedSession(
                 pane_id=ADOPTED_PANE,
@@ -229,7 +303,18 @@ async def _harness(
             else None
         ),
     )
-    broker = SessionBroker(cfg, llm_call=llm)
+    broker = SessionBroker(
+        cfg,
+        llm_call=llm,
+        permission=PermissionModule(
+            cfg.classifier,
+            session_name=cfg.name,
+            master_socket_path=cfg.master_socket_path,
+            log_path=BrokerPaths(home).session_permissions(cfg.name),
+            intent=cfg.intent,
+            llm_call=classifier,
+        ),
+    )
     run_task = asyncio.create_task(broker.run())
     # Wait for the session socket to be bound (bind happens FIRST in run()).
     sock = Path(cfg.socket_path)
@@ -241,6 +326,7 @@ async def _harness(
         cfg=cfg,
         master=master,
         llm=llm,
+        classifier=classifier,
         run=run,
         sock=sock,
         transcript=transcript,
@@ -346,20 +432,155 @@ async def reactivate(h: Harness, intent: str) -> Response:
     )
 
 
+async def never_finishes() -> None:
+    """A queued job that never returns, stalling the serial queue for good."""
+    await asyncio.Event().wait()
+
+
 async def test_permission_request_immediate_escalated_reply(
     harness: Harness,
 ) -> None:
-    harness.llm.never_resolve = True  # any LLM work would hang forever
+    await launch(harness)
+    harness.llm.never_resolve = True  # any triage work would hang forever
+    await harness.classifier.script("escalate", "rm -rf is irreversible")
     start = time.monotonic()
     resp = await client.request(
         harness.sock,
-        permission_env("Bash", "toolu_x1", {"command": "ls"}),
+        permission_env("Bash", {"command": "rm -rf /"}),
         timeout_s=5.0,
     )
     elapsed = time.monotonic() - start
     assert resp.ok is True
     assert resp.payload["decision"] == "escalated"
     assert elapsed < 0.5  # hot path
+    await wait_state(harness.broker, "blocked_permission")
+
+
+async def test_permission_request_allow_flows_to_hook_decision(
+    harness: Harness,
+) -> None:
+    await launch(harness)
+    await harness.classifier.script("allow", "reading a file in the work tree")
+    resp = await client.request(
+        harness.sock,
+        permission_env("Read", {"file_path": "/private/tmp/x/a.py"}),
+        timeout_s=5.0,
+    )
+    assert resp.payload["decision"] == "allow"
+    # The judged call is the one that arrived, and an approval leaves the
+    # session driving — only an escalation blocks it.
+    assert harness.broker.state == "driving"
+    assert len(harness.classifier.calls) == 1
+
+
+async def test_permission_request_bypasses_serial_queue(
+    harness: Harness,
+) -> None:
+    await launch(harness)
+    harness.broker.queue.put_nowait(never_finishes)
+    await asyncio.sleep(0.05)
+    assert harness.broker.queue.qsize() == 0  # the stalling job is in flight
+    await harness.classifier.script("allow", "a read is reversible")
+    start = time.monotonic()
+    resp = await client.request(
+        harness.sock,
+        permission_env("Read", {"file_path": "/private/tmp/x/a.py"}),
+        timeout_s=5.0,
+    )
+    elapsed = time.monotonic() - start
+    # A decision routed through the serial queue could never reach the model
+    # behind a job that never finishes, so it could not answer "allow" at all.
+    assert resp.payload["decision"] == "allow"
+    assert elapsed < 0.5
+
+
+async def test_get_permission_log_round_trip(harness: Harness) -> None:
+    await launch(harness)
+    await harness.classifier.script("allow", "a listing is reversible")
+    await client.request(
+        harness.sock,
+        permission_env("Bash", {"command": "ls"}),
+        timeout_s=5.0,
+    )
+    resp = await client.request(
+        harness.sock,
+        Envelope(id=uuid.uuid4().hex, type=T_GET_PERMISSION_LOG, session_id="s1"),
+        timeout_s=5.0,
+    )
+    assert resp.ok is True
+    text = cast(str, resp.payload["text"])
+    assert "Bash -> allow" in text
+    assert "a listing is reversible" in text
+    # The permission log is its own record; triage decisions do not leak in.
+    assert "grounded in cwd" not in text
+
+
+async def test_hook_events_reach_module(harness: Harness) -> None:
+    spy = harness.spy_permission()
+    await launch(harness)
+    await client.notify(
+        harness.sock,
+        hook_env(
+            "PostToolUse",
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+        ),
+    )
+    await client.notify(harness.sock, hook_env("UserPromptSubmit", {}))
+    await client.notify(harness.sock, hook_env("SessionEnd", {}))
+    await wait_state(harness.broker, "stopped")
+    assert spy.notes == [
+        "tool_completed:Bash:{'command': 'ls'}",
+        "developer_input",
+        "session_ended",
+    ]
+
+
+async def test_ground_and_reactivate_call_set_intent(harness: Harness) -> None:
+    spy = harness.spy_permission()
+    await launch(harness)
+    await complete(harness)
+    assert (await reactivate(harness, "now write the docs")).ok is True
+    await ground_and_approve(harness, count=2, prompt="THE SECOND TASK")
+    # Reactivation replaces the intent outright; a cache judged against the
+    # first task must not survive into the second.
+    assert spy.intents == ["APPROVED PROMPT", "THE SECOND TASK"]
+
+
+async def test_permission_prompt_notification_shows_up_on_status(
+    harness: Harness,
+) -> None:
+    await launch(harness)
+    await client.notify(
+        harness.sock,
+        hook_env("Notification", {"notification_type": "permission_prompt"}),
+    )
+    await wait_state(harness.broker, "blocked_permission")
+    resp = await client.request(
+        harness.sock,
+        Envelope(id=uuid.uuid4().hex, type=T_STATUS, session_id="s1"),
+        timeout_s=5.0,
+    )
+    assert resp.payload["permission_prompt"] is True
+    await client.notify(
+        harness.sock,
+        hook_env("PostToolUse", {"tool_name": "Bash", "tool_input": {}}),
+    )
+    await asyncio.sleep(0.1)
+    resp = await client.request(
+        harness.sock,
+        Envelope(id=uuid.uuid4().hex, type=T_STATUS, session_id="s1"),
+        timeout_s=5.0,
+    )
+    assert resp.payload["permission_prompt"] is False
+
+
+async def test_agent_start_forwards_this_sessions_settings_file(
+    harness: Harness,
+) -> None:
+    await launch(harness)
+    start = next(c for c in harness.run.calls if c[1:3] == ["agent", "start"])
+    forwarded = start[start.index("--") + 1:]
+    assert forwarded[-2:] == ["--settings", harness.cfg.claude_settings_path]
 
 
 async def test_stop_triggers_triage_and_answer_submits_two_step(
@@ -397,6 +618,12 @@ async def test_escalation_sent_then_broker_is_quiescent(
     escalation = await harness.master.wait_for(T_ESCALATION)
     assert escalation.payload["situation"] == "the plan contradicts the code"
     assert escalation.payload["task_context"] == "APPROVED PROMPT"
+    # The raiser identity is what lets the master hold one slot per raiser
+    # rather than one per session.
+    assert escalation.payload["raiser"] == {
+        "component": "broker",
+        "session_id": "s1",
+    }
     await wait_state(harness.broker, "escalated")
     harness.run.calls.clear()
     # Further turn boundaries must not write to the pane (quiescence).
@@ -425,12 +652,7 @@ async def test_ask_user_question_escalates_and_retracts_on_answer(
             }
         ]
     }
-    resp = await client.request(
-        harness.sock,
-        permission_env("AskUserQuestion", ANSWERED_ASK_ID, tool_input),
-        timeout_s=5.0,
-    )
-    assert resp.payload["decision"] == "escalated"  # native menu renders
+    await client.notify(harness.sock, ask_user_env(ANSWERED_ASK_ID, tool_input))
     escalation = await harness.master.wait_for(T_ESCALATION)
     assert "manual input required in pane w3:p2" in escalation.payload["situation"]
     assert "Pick a color" in escalation.payload["what_was_asked"]
@@ -439,11 +661,7 @@ async def test_ask_user_question_escalates_and_retracts_on_answer(
     assert labels == ["Blue (Recommended)", "Red"]
     await wait_state(harness.broker, "escalated")
     # A duplicate PreToolUse for the same tool_use_id must not re-escalate.
-    await client.request(
-        harness.sock,
-        permission_env("AskUserQuestion", ANSWERED_ASK_ID, tool_input),
-        timeout_s=5.0,
-    )
+    await client.notify(harness.sock, ask_user_env(ANSWERED_ASK_ID, tool_input))
     await asyncio.sleep(0.1)
     assert len(harness.master.of_type(T_ESCALATION)) == 1
     # The transcript contains the paired answer -> next hook event retracts.

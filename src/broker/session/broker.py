@@ -2,8 +2,9 @@
 
 Structure:
 - `handle()` is the socket handler and does NO slow work: it replies, then
-  enqueues. The permission_request reply is the hot path.
-- The serial event queue is the only place LLM work and pane writes happen.
+  enqueues. The one exception is permission_request, which is answered in the
+  handler because it must never queue behind an unrelated turn triage.
+- The serial event queue is the only place pane writes happen.
 - Classification input is `last_assistant_message` from the Stop payload,
   never the transcript tail. The watchdog reconciliation is the
   one sanctioned pure-transcript read.
@@ -33,10 +34,14 @@ from broker.config import AdoptedSession, BrokerConfig, SessionBrokerConfig
 from broker.paths import BrokerPaths
 from broker.herdr import driver
 from broker.claude.paths import transcript_dir_for_cwd
+from broker.permission import PermissionModule, render_permission_log
 from broker.protocol import client
 from broker.protocol.constants import (
     ACTIVE_STATES,
+    DECISION_ALLOW,
     DECISION_ESCALATED,
+    NACK_STALE_PROPOSAL,
+    NACK_WRONG_STATE,
     SessionState,
     T_APPROVE_PROMPT,
     T_BUDGET_UPDATE,
@@ -45,6 +50,7 @@ from broker.protocol.constants import (
     T_ESCALATION,
     T_FATAL_ERROR,
     T_GET_DECISION_LOG,
+    T_GET_PERMISSION_LOG,
     T_HOOK_EVENT,
     T_PERMISSION_REQUEST,
     T_PROMPT_PROPOSAL,
@@ -64,7 +70,9 @@ from broker.protocol.schemas import (
     EscalationPayload,
     HookEventPayload,
     PermissionDecisionPayload,
+    PermissionLogPayload,
     PermissionRequestPayload,
+    RaiserIdentity,
     ReactivatePayload,
     Response,
     SendPromptPayload,
@@ -99,6 +107,8 @@ SESSION_BIND_TIMEOUT_S = 60.0
 # still prompts on the risky ones, so the hook's escalation path survives;
 # "bypassPermissions" would silently approve every escalation.
 CLAUDE_AGENT_ARGS = ["--model", "opus", "--permission-mode", "auto"]
+
+ASK_USER_QUESTION = "AskUserQuestion"
 
 Job = Callable[[], Awaitable[None]]
 
@@ -150,6 +160,7 @@ class SessionBroker:
         cfg: SessionBrokerConfig,
         *,
         llm_call: LLMCaller[ToolCall] | None = None,
+        permission: PermissionModule | None = None,
     ) -> None:
         """Build the broker's state without touching the socket or the pane.
 
@@ -157,6 +168,8 @@ class SessionBroker:
             cfg: Session identity, socket paths, cwd, intent and budget limits.
             llm_call: Injected tool-calling backend. When omitted, ``run()``
                 builds one from an Anthropic client — tests pass a fake.
+            permission: Injected permission triage module. When omitted, one is
+                built from ``cfg`` — tests pass a fake or a spy.
         """
         self.cfg = cfg
         self.broker_cfg = BrokerConfig(
@@ -184,11 +197,19 @@ class SessionBroker:
         self._active_escalation: EscalationPayload | None = None
         self._pending_ask_id: str | None = None
         self._seen_ask_ids: set[str] = set()
+        self._permission_prompt_pending = False
         self._user_prompt_baseline = 0
         self._last_event_count = -1
 
-        self.decision_log_path = BrokerPaths(cfg.broker_home).session_decisions(
-            cfg.name
+        paths = BrokerPaths(cfg.broker_home)
+        self.decision_log_path = paths.session_decisions(cfg.name)
+        self.permission_log_path = paths.session_permissions(cfg.name)
+        self.permission = permission or PermissionModule(
+            cfg.classifier,
+            session_name=cfg.name,
+            master_socket_path=cfg.master_socket_path,
+            log_path=self.permission_log_path,
+            intent=cfg.intent,
         )
         self.watchdog = Watchdog(
             cfg.watchdog_seconds, self._herdr_state, self._reconcile
@@ -270,7 +291,11 @@ class SessionBroker:
             kind="claude",
             pane_id=self.pane_id,
             timeout_ms=30000,
-            agent_args=CLAUDE_AGENT_ARGS,
+            agent_args=[
+                *CLAUDE_AGENT_ARGS,
+                "--settings",
+                cfg.claude_settings_path,
+            ],
         )
         session = start.agent_session
         # Optimistic fill-in only: the SessionStart hook may already have
@@ -327,6 +352,7 @@ class SessionBroker:
         # Approval is synchronous and blocking — no timeout.
         approved = await self._approval
         self.approved_prompt = approved.prompt
+        self.permission.set_intent(self._intent())
         await self._submit(approved.prompt)
         self._set_state(SessionState.DRIVING)
 
@@ -360,12 +386,13 @@ class SessionBroker:
             logger.error("invalid %s payload: %s", env.type, exc)
             return Response(id=env.id, ok=False, payload={"error": str(exc)})
 
-    def _on_permission_request(self, env: Envelope) -> Response:
-        """Answer a permission request on the hot path, then enqueue the rest.
+    async def _on_permission_request(self, env: Envelope) -> Response:
+        """Judge a permission request and reply with the decision.
 
-        The reply is built with zero LLM work: this is the synchronous hook
-        path, and every millisecond here is a millisecond the supervised tool
-        call is blocked.
+        The triage module is awaited right here rather than enqueued. Each
+        accepted socket connection runs in its own task, so waiting blocks only
+        the tool call being judged; putting it on the serial queue would stall
+        the whole coding session behind an unrelated turn classification.
 
         Args:
             env: Envelope carrying a ``PermissionRequestPayload``.
@@ -374,14 +401,16 @@ class SessionBroker:
             The decision reply for the hook.
         """
         payload = PermissionRequestPayload.model_validate(env.payload)
-        self.queue.put_nowait(lambda: self._permission_passthrough(payload))
-        return Response(
-            id=env.id,
-            ok=True,
-            payload=PermissionDecisionPayload(
-                decision=DECISION_ESCALATED
-            ).model_dump(),
+        decision = await self.permission.decide(
+            payload.tool_name, payload.tool_input, payload.permission_suggestions
         )
+        if decision == DECISION_ALLOW:
+            reply = PermissionDecisionPayload(decision=DECISION_ALLOW)
+        else:
+            reply = PermissionDecisionPayload(decision=DECISION_ESCALATED)
+            if self.state == SessionState.DRIVING:
+                self._set_state(SessionState.BLOCKED_PERMISSION)
+        return Response(id=env.id, ok=True, payload=reply.model_dump())
 
     async def _handle(self, env: Envelope) -> Response | None:
         """Reply to one message type, enqueuing anything slow onto the queue.
@@ -395,7 +424,7 @@ class SessionBroker:
             types get an ``ok=False`` reply.
         """
         if env.type == T_PERMISSION_REQUEST:
-            return self._on_permission_request(env)
+            return await self._on_permission_request(env)
 
         if env.type == T_HOOK_EVENT:
             self.watchdog.reset()
@@ -412,7 +441,12 @@ class SessionBroker:
             ):
                 logger.warning("stale approve_prompt ignored")
                 return Response(
-                    id=env.id, ok=False, payload={"error": "stale proposal"}
+                    id=env.id,
+                    ok=False,
+                    payload={
+                        "error": "stale proposal",
+                        "reason_code": NACK_STALE_PROPOSAL,
+                    },
                 )
             self._approval.set_result(approved)
             return Response(id=env.id, ok=True)
@@ -433,7 +467,8 @@ class SessionBroker:
                             f"session is {self.state!r}, not 'completed' — "
                             "reassign a new broker instead of displacing the "
                             "task this one is still driving"
-                        )
+                        ),
+                        "reason_code": NACK_WRONG_STATE,
                     },
                 )
             # Closes the gate here, not in the job: a second reactivate
@@ -458,6 +493,7 @@ class SessionBroker:
                     transcript_path=(
                         str(self.transcript_path) if self.transcript_path else None
                     ),
+                    permission_prompt=self._permission_prompt_pending,
                 ).model_dump(),
             )
 
@@ -467,6 +503,15 @@ class SessionBroker:
                 ok=True,
                 payload=DecisionLogPayload(
                     text=decision_log.render_log(self.decision_log_path)
+                ).model_dump(),
+            )
+
+        if env.type == T_GET_PERMISSION_LOG:
+            return Response(
+                id=env.id,
+                ok=True,
+                payload=PermissionLogPayload(
+                    text=render_permission_log(self.permission_log_path)
                 ).model_dump(),
             )
 
@@ -485,7 +530,8 @@ class SessionBroker:
         ``Stop`` carries the classification input as ``last_assistant_message``,
         never the transcript tail, and is diverted to an out-of-band resolution
         check while escalated. ``StopFailure`` is surfaced as fatal, not treated
-        as a completed turn.
+        as a completed turn. ``PreToolUse`` reaches this broker only for
+        ``AskUserQuestion``, whose native menu no broker can drive.
 
         Args:
             hook: Validated hook payload; ``raw`` is the untyped hook JSON.
@@ -495,6 +541,7 @@ class SessionBroker:
         if name == "SessionStart":
             self._bind_session(raw)
         elif name == "Stop":
+            self._permission_prompt_pending = False
             message = str(raw.get("last_assistant_message", "") or "")
             if self.state == SessionState.ESCALATED:
                 self.queue.put_nowait(self._check_out_of_band_resolution)
@@ -507,21 +554,49 @@ class SessionBroker:
             detail = str(raw.get("message") or raw)
             # Surfaced, NOT a completed turn.
             self.queue.put_nowait(lambda: self._fatal(error_class, detail))
+        elif name == "PreToolUse":
+            self._on_pre_tool_use(raw)
         elif name in {"UserPromptSubmit", "PostToolUse"}:
+            if name == "PostToolUse":
+                self._permission_prompt_pending = False
+                tool_name, tool_input = _raw_tool(raw)
+                self.permission.note_tool_completed(tool_name, tool_input)
+            else:
+                self.permission.note_developer_input()
             if self.state == SessionState.ESCALATED:
                 self.queue.put_nowait(self._check_out_of_band_resolution)
         elif name == "Notification":
             self._log("notification", "", str(raw.get("message", "")))
             if raw.get("notification_type") == "permission_prompt":
+                self._permission_prompt_pending = True
                 if self.state == SessionState.DRIVING:
                     self._set_state(SessionState.BLOCKED_PERMISSION)
         elif name == "SessionEnd":
+            self.permission.note_session_ended()
             self._set_state(SessionState.STOPPED)
             self._log("session_end", "", "SessionEnd hook received")
         elif name in {"PreCompact", "PostCompact"}:
             self._log("compaction", "", name)  # continue normally
         else:
             logger.debug("unhandled hook event %s", name)
+
+    def _on_pre_tool_use(self, raw: dict[str, Any]) -> None:
+        """Escalate a pending ``AskUserQuestion``, once per tool use.
+
+        Args:
+            raw: Raw ``PreToolUse`` hook JSON.
+        """
+        tool_name, tool_input = _raw_tool(raw)
+        if tool_name != ASK_USER_QUESTION:
+            return
+        tool_use_id = str(raw.get("tool_use_id", "") or "")
+        # PreToolUse can fire several times per logical operation.
+        if tool_use_id in self._seen_ask_ids:
+            return
+        self._seen_ask_ids.add(tool_use_id)
+        self.queue.put_nowait(
+            lambda: self._ask_user_question(tool_input, tool_use_id)
+        )
 
     def _bind_session(self, raw: dict[str, Any]) -> None:
         """Bind the Claude session id and transcript path from SessionStart.
@@ -547,33 +622,6 @@ class SessionBroker:
         self.session_bound.set()
 
     # ── queued jobs ───────────────────────────────────────────────────────
-
-    async def _permission_passthrough(self, p: PermissionRequestPayload) -> None:
-        """Record a passed-through permission request and branch on the tool.
-
-        ``AskUserQuestion`` becomes a mechanical escalation, deduped by
-        ``tool_use_id`` since PreToolUse can fire multiple times per logical
-        operation. Any other tool leaves the native prompt on screen and only
-        marks the session blocked.
-
-        Args:
-            p: The permission request that was answered ``escalated``.
-        """
-        self._log(
-            "permission_passthrough",
-            "Every permission_request is answered 'escalated' with no LLM "
-            "work; the native prompt appears",
-            f"tool={p.tool_name} id={p.tool_use_id}",
-        )
-        if p.tool_name == "AskUserQuestion":
-            # PreToolUse can fire 3x per logical op — dedupe.
-            if p.tool_use_id in self._seen_ask_ids:
-                return
-            self._seen_ask_ids.add(p.tool_use_id)
-            await self._ask_user_question(p.tool_input, p.tool_use_id)
-        else:
-            if self.state == SessionState.DRIVING:
-                self._set_state(SessionState.BLOCKED_PERMISSION)
 
     async def _classify(self, last_assistant_message: str) -> None:
         """Triage one turn boundary into an answer, escalation or completion.
@@ -671,6 +719,7 @@ class SessionBroker:
             recommendation=recommendation,
             uncertainty=uncertainty,
             what_would_change_my_mind=what_would_change_my_mind,
+            raiser=RaiserIdentity(component="broker", session_id=self.cfg.name),
         )
 
     async def _escalate_handover(
@@ -1017,6 +1066,24 @@ class SessionBroker:
             )
         except Exception:
             return "unknown"  # gates the watchdog read out; never classifies
+
+
+def _raw_tool(raw: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Read the tool name and input out of a raw hook payload.
+
+    Args:
+        raw: Raw hook JSON.
+
+    Returns:
+        The tool name and its input, each defaulting to empty when absent or
+        of an unexpected shape.
+    """
+    name = raw.get("tool_name")
+    tool_input = raw.get("tool_input")
+    return (
+        name if isinstance(name, str) else "",
+        cast(dict[str, Any], tool_input) if isinstance(tool_input, dict) else {},
+    )
 
 
 def _count_user_prompts(events: list[TranscriptEvent]) -> int:
