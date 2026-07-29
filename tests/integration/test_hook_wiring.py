@@ -25,6 +25,8 @@ import tempfile
 
 from broker.herdr import driver
 from broker.llm import ToolCall
+from broker.permission import PermissionModule
+from broker.permission.llm import ToolCall as PermissionToolCall
 from broker.protocol import client
 from broker.protocol.constants import (
     T_APPROVE_PROMPT,
@@ -36,10 +38,11 @@ from broker.protocol.constants import (
     T_HOOK_EVENT,
     T_PROMPT_PROPOSAL,
 )
-from broker.protocol.schemas import Envelope, Response
+from broker.protocol.schemas import Envelope, PermissionSuggestion, Response
 from broker.protocol.server import serve_unix
 from broker.session.broker import SessionBroker
-from broker.config import SessionBrokerConfig
+from broker.config import ClassifierConfig, SessionBrokerConfig
+from broker.paths import BrokerPaths
 
 FIXTURES = Path(__file__).parent.parent / "fixtures"
 HERDR_FIXTURES = FIXTURES / "herdr"
@@ -113,6 +116,36 @@ class FakeLLM:
         return await self.results.get()
 
 
+class FakePermissionLLM:
+    """Scripted classifier: an empty queue models a call still in flight."""
+
+    def __init__(self) -> None:
+        self.results: asyncio.Queue[PermissionToolCall] = asyncio.Queue()
+        self.calls: list[dict[str, Any]] = []
+
+    async def __call__(self, **kwargs: Any) -> PermissionToolCall:
+        self.calls.append(kwargs)
+        return await self.results.get()
+
+    async def script(self, name: str, reasoning: str) -> None:
+        """Queue one classifier outcome."""
+        await self.results.put(
+            PermissionToolCall(name=name, input={"reasoning": reasoning})
+        )
+
+
+class DeadPermission(PermissionModule):
+    """A module that can no longer judge anything: every decide raises."""
+
+    async def decide(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        suggestions: list[PermissionSuggestion],
+    ) -> str:
+        raise RuntimeError("permission module is dead")
+
+
 class StubMaster:
     def __init__(self) -> None:
         self.received: list[Envelope] = []
@@ -139,10 +172,21 @@ class Harness:
     cfg: SessionBrokerConfig
     master: StubMaster
     llm: FakeLLM
+    classifier: FakePermissionLLM
     run: ScriptedRun
     sock: Path
     transcript: Path
     run_task: "asyncio.Task[None]" = field(repr=False, kw_only=True)
+
+    def kill_permission(self) -> None:
+        """Swap in a module whose classification path is gone."""
+        self.broker.permission = DeadPermission(
+            self.cfg.classifier,
+            session_name=self.cfg.name,
+            master_socket_path=self.cfg.master_socket_path,
+            log_path=self.broker.permission_log_path,
+            intent=self.cfg.intent,
+        )
 
 
 def hook_env(name: str, raw_extra: dict[str, Any]) -> Envelope:
@@ -184,8 +228,10 @@ def make_cfg(home: Path, *, budget_max: int = 8) -> SessionBrokerConfig:
         intent="the raw intent",
         model_id="test-model",
         max_tokens=1024,
+        classifier=ClassifierConfig(model_id="test-classifier"),
         watchdog_seconds=300.0,
         budget_max=budget_max,
+        claude_settings_path=str(home / "claude-settings.json"),
     )
 
 
@@ -200,10 +246,22 @@ async def start_harness(
     run = ScriptedRun()
     monkeypatch.setattr(driver.subprocess, "run", run)
     llm = FakeLLM()
+    classifier = FakePermissionLLM()
     master = StubMaster()
     master_server = await serve_unix(home / "m.sock", master)
     cfg = make_cfg(home, budget_max=budget_max)
-    broker = SessionBroker(cfg, llm_call=llm)
+    broker = SessionBroker(
+        cfg,
+        llm_call=llm,
+        permission=PermissionModule(
+            cfg.classifier,
+            session_name=cfg.name,
+            master_socket_path=cfg.master_socket_path,
+            log_path=BrokerPaths(home).session_permissions(cfg.name),
+            intent=cfg.intent,
+            llm_call=classifier,
+        ),
+    )
     run_task = asyncio.create_task(broker.run())
     sock = Path(cfg.socket_path)
     async with asyncio.timeout(5.0):
@@ -214,6 +272,7 @@ async def start_harness(
         cfg=cfg,
         master=master,
         llm=llm,
+        classifier=classifier,
         run=run,
         sock=sock,
         transcript=transcript,
@@ -302,18 +361,21 @@ def stop_payload(transcript: Path) -> dict[str, Any]:
     }
 
 
-def pretooluse_payload(transcript: Path) -> dict[str, Any]:
+def permission_request_payload(
+    transcript: Path, command: str = "ls"
+) -> dict[str, Any]:
+    """A PermissionRequest hook payload: no tool_use_id, suggestions present."""
     return {
         "session_id": "cc-1",
         "transcript_path": str(transcript),
         "cwd": "/private/tmp/work",
-        "prompt_id": "p-1",
-        "permission_mode": "default",
-        "effort": {"level": "high"},
-        "hook_event_name": "PreToolUse",
+        "permission_mode": "auto",
+        "hook_event_name": "PermissionRequest",
         "tool_name": "Bash",
-        "tool_input": {"command": "ls", "description": "list files"},
-        "tool_use_id": "toolu_int_1",
+        "tool_input": {"command": command, "description": "a shell command"},
+        "permission_suggestions": [
+            {"type": "addDirectories", "directories": ["/private/tmp/work"]}
+        ],
     }
 
 
@@ -364,16 +426,66 @@ async def test_hook_stop_reaches_broker_and_triggers_classify(
     assert "Which auth provider should I use?" in content[-1]["text"]
 
 
-async def test_hook_pretooluse_stdout_empty_and_fast(
+async def test_hook_permission_request_escalated_stdout_empty_and_fast(
     harness: Harness,
 ) -> None:
     # BROKER_HOOK_TIMEOUT deliberately unset: the reply is immediate.
+    await harness.classifier.script("escalate", "rm -rf is irreversible")
     stdout, stderr, elapsed = await run_hook(
-        pretooluse_payload(harness.transcript), harness.sock
+        permission_request_payload(harness.transcript, command="rm -rf /"),
+        harness.sock,
     )
-    assert stdout == b""  # escalated → nothing on stdout → native flow
+    assert stdout == b""  # escalated → nothing on stdout → native prompt
     assert stderr == b""
     assert elapsed < 1.0  # no measurable turn delay
+
+
+async def test_permission_request_end_to_end(harness: Harness) -> None:
+    await launch(harness)
+    await harness.classifier.script("allow", "a listing is reversible")
+    stdout, stderr, _ = await run_hook(
+        permission_request_payload(harness.transcript), harness.sock
+    )
+    assert stderr == b""
+    printed: Any = json.loads(stdout)
+    assert printed == {
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {"behavior": "allow", "message": "broker approved"},
+        }
+    }
+    assert len(harness.classifier.calls) == 1  # the module judged it
+    assert harness.broker.state == "driving"  # an approval does not block
+    # Nothing below waits: stdout has already been observed, so a log entry
+    # found here was written before the decision crossed the socket.
+    lines = harness.broker.permission_log_path.read_text(
+        encoding="utf-8"
+    ).splitlines()
+    entries = [
+        cast(dict[str, Any], json.loads(line)) for line in lines if line.strip()
+    ]
+    assert [(e["tool_name"], e["decision"]) for e in entries] == [
+        ("Bash", "allow")
+    ]
+
+
+async def test_hook_permission_request_with_dead_module_prints_nothing(
+    harness: Harness,
+) -> None:
+    harness.kill_permission()
+    stdout, stderr, elapsed = await run_hook(
+        permission_request_payload(harness.transcript), harness.sock
+    )
+    assert stdout == b""  # no decision printed → the native prompt renders
+    assert stderr == b""
+    assert elapsed < 1.0  # returned, rather than waiting out the hook timeout
+    # The broker survived the dead module and still serves its socket.
+    status = await client.request(
+        harness.sock,
+        Envelope(id=uuid.uuid4().hex, type="status", payload={}),
+        timeout_s=5.0,
+    )
+    assert status.ok is True
 
 
 async def test_full_loop_criteria_3_to_8(
