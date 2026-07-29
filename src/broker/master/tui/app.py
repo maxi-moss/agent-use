@@ -28,6 +28,7 @@ from broker.master.messages import (
     EscalationArrived,
     LLMReply,
     Notice,
+    PermissionEscalationArrived,
     ProposalArrived,
     SessionStatusChanged,
 )
@@ -127,6 +128,15 @@ class BrokerMasterApp(App[None]):
         self._chat_block(message.rendered)
         self._event_line(
             f"escalation {message.escalation_id} from {message.session_id}"
+        )
+
+    def on_permission_escalation_arrived(
+        self, message: PermissionEscalationArrived
+    ) -> None:
+        self._chat_block(message.rendered)
+        self._event_line(
+            f"permission escalation {message.escalation_id} from "
+            f"{message.session_id}"
         )
 
     def on_proposal_arrived(self, message: ProposalArrived) -> None:

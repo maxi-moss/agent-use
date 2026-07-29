@@ -20,7 +20,7 @@ from textual.widgets import Input, Static
 
 from broker.config import BrokerConfig
 from broker.llm import TurnResult
-from broker.master.messages import EscalationArrived
+from broker.master.messages import EscalationArrived, PermissionEscalationArrived
 from broker.master.registry import Registry
 from broker.master.tui.app import BrokerMasterApp
 from broker.protocol import client
@@ -103,6 +103,20 @@ async def test_escalation_arrived_renders_exact_string(home: Path) -> None:
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
         app.post_message(EscalationArrived("s1", "e1", rendered))
+        await pilot.pause()
+        assert rendered in chat_texts(app)  # the exact string, unreflowed
+
+
+async def test_permission_escalation_arrived_renders_exact_string(
+    home: Path,
+) -> None:
+    rendered = (
+        "Permission escalation p1 — session s1\n\nanswer it in pane [w3:p2]"
+    )
+    app = make_app(home, GatedLLM())
+    async with app.run_test() as pilot:
+        await pilot.pause(0.05)
+        app.post_message(PermissionEscalationArrived("s1", "p1", rendered))
         await pilot.pause()
         assert rendered in chat_texts(app)  # the exact string, unreflowed
 

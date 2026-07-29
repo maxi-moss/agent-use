@@ -24,9 +24,14 @@ from broker.master.runtime import (
     MasterRuntime,
     PendingProposal,
     render_escalation,
+    render_permission_escalation,
     render_proposal,
 )
-from broker.protocol.schemas import EscalationPayload, PromptProposalPayload
+from broker.protocol.schemas import (
+    EscalationPayload,
+    PermissionEscalationPayload,
+    PromptProposalPayload,
+)
 
 
 class RecordingRuntime(MasterRuntime):
@@ -86,6 +91,7 @@ ESCALATION = EscalationPayload.model_validate(
     {
         "escalation_id": "e1",
         "session_id": "s1",
+        "raiser": {"component": "broker", "session_id": "s1"},
         "task_context": "ctx",
         "situation": "sit",
         "what_was_asked": "asked",
@@ -94,6 +100,19 @@ ESCALATION = EscalationPayload.model_validate(
         "recommendation": "rec",
         "uncertainty": "unc",
         "what_would_change_my_mind": "change",
+    }
+)
+
+PERMISSION_ESCALATION = PermissionEscalationPayload.model_validate(
+    {
+        "escalation_id": "p1",
+        "session_id": "s1",
+        "raiser": {"component": "permission", "session_id": "s1"},
+        "tool_name": "Bash",
+        "tool_input": {"command": "git push"},
+        "task_intent": "intent",
+        "reason": "publishes work outside the machine",
+        "raised_at": "2026-07-29T12:00:00+00:00",
     }
 )
 
@@ -205,6 +224,24 @@ async def test_escalation_block_is_byte_identical(
     assert render_escalation(ESCALATION) in texts
 
 
+async def test_active_permission_escalation_reaches_llm_context(
+    runtime: RecordingRuntime,
+) -> None:
+    runtime.slot.accept(PERMISSION_ESCALATION)
+    fake = FakeLLM([TurnResult(text="ok")])
+    master = make_master(runtime, fake)
+    await master.handle_developer_message("what is s1 waiting on?")
+    texts = _block_texts(fake.calls[0])
+    # Without it the master would answer "nothing is blocked" while a session
+    # sits on a native prompt.
+    assert (
+        render_permission_escalation(
+            PERMISSION_ESCALATION, runtime.pane_of("s1")
+        )
+        in texts
+    )
+
+
 async def test_pending_proposal_reaches_llm_context(
     runtime: RecordingRuntime,
 ) -> None:
@@ -285,6 +322,7 @@ def test_master_tools_are_strict_and_complete() -> None:
         "list_sessions",
         "send_to_session",
         "get_decision_log",
+        "get_permission_log",
         "stop_session",
         "reactivate_session",
         "reassign_session",

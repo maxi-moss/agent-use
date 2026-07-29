@@ -18,6 +18,17 @@ class EscalationArrived(Message):
         self.rendered = rendered  # runtime-rendered, verbatim — display as-is
 
 
+class PermissionEscalationArrived(Message):
+    def __init__(
+        self, session_id: str, escalation_id: str, rendered: str
+    ) -> None:
+        """Carry one runtime-rendered permission escalation to the TUI."""
+        super().__init__()
+        self.session_id = session_id
+        self.escalation_id = escalation_id
+        self.rendered = rendered  # runtime-rendered, verbatim — display as-is
+
+
 class ProposalArrived(Message):
     def __init__(self, session_id: str, proposal_id: str, rendered: str) -> None:
         """Carry one runtime-rendered prompt proposal to the TUI."""

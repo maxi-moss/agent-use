@@ -33,7 +33,13 @@ from broker.llm import (
     call_turn,
     strict_tool,
 )
-from broker.master.runtime import MasterRuntime, render_escalation, render_proposal
+from broker.master.runtime import (
+    MasterRuntime,
+    render_escalation,
+    render_permission_escalation,
+    render_proposal,
+)
+from broker.protocol.schemas import PermissionEscalationPayload
 
 MAX_TOOL_ROUNDS = 6
 
@@ -76,6 +82,12 @@ class GetDecisionLogArgs(BaseModel):
     session_id: str
 
 
+class GetPermissionLogArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+
+
 class StopSessionArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -106,11 +118,6 @@ class MasterTool[M: BaseModel]:
     handler: Callable[[MasterRuntime, M], Awaitable[str]]
 
 
-async def _list_sessions(runtime: MasterRuntime, _: ListSessionsArgs) -> str:
-    """Async adapter for the one runtime accessor that is synchronous."""
-    return runtime.render_registry_summary()
-
-
 # Deliberately unannotated: a tuple[MasterTool[Any], ...] annotation would solve
 # M as Any at every entry and stop pyright checking handlers against their model.
 _REGISTRY = (
@@ -137,9 +144,10 @@ _REGISTRY = (
     ),
     MasterTool(
         "list_sessions",
-        "Current sessions with state, budget, and intent.",
+        "Current sessions with state, budget, and intent, plus which of them "
+        "are sitting on a native permission prompt right now.",
         ListSessionsArgs,
-        _list_sessions,
+        lambda rt, _a: rt.render_sessions_with_permission_prompts(),
     ),
     MasterTool(
         "send_to_session",
@@ -152,6 +160,14 @@ _REGISTRY = (
         "Retrieve a session broker's triage reasoning.",
         GetDecisionLogArgs,
         lambda rt, a: rt.get_decision_log(a.session_id),
+    ),
+    MasterTool(
+        "get_permission_log",
+        "Retrieve every tool permission decision made for a session, "
+        "approvals included, with the reason for each. Not a variant of the "
+        "decision log: that one carries triage reasoning about questions.",
+        GetPermissionLogArgs,
+        lambda rt, a: rt.get_permission_log(a.session_id),
     ),
     MasterTool(
         "stop_session",
@@ -306,7 +322,19 @@ class MasterLLM:
             }
         ]
         active = self.runtime.slot.active
-        if active is not None:
+        if isinstance(active, PermissionEscalationPayload):
+            blocks.append(
+                {"type": "text", "text": "# Active permission escalation"}
+            )
+            blocks.append(
+                {
+                    "type": "text",
+                    "text": render_permission_escalation(
+                        active, self.runtime.pane_of(active.session_id)
+                    ),
+                }
+            )
+        elif active is not None:
             blocks.append({"type": "text", "text": "# Active escalation"})
             # Byte-identical to the runtime rendering — its own block, so
             # nothing is prepended to or reflowed around the broker's words.

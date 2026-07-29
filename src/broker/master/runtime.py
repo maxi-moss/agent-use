@@ -13,6 +13,7 @@ answers.
 
 import asyncio
 import contextlib
+import json
 import logging
 import sys
 import uuid
@@ -24,6 +25,7 @@ from typing import Any
 from pydantic import ValidationError
 from textual.message import Message
 
+from broker.claude.settings import write_session_permissions
 from broker.claude.trust import seed_trust
 from broker.config import AdoptedSession, BrokerConfig, SessionBrokerConfig
 from broker.paths import BrokerPaths
@@ -32,12 +34,17 @@ from broker.master.messages import (
     CompletionArrived,
     EscalationArrived,
     Notice,
+    PermissionEscalationArrived,
     ProposalArrived,
     SessionStatusChanged,
 )
 from broker.master.registry import Registry, SessionRecord
 from broker.protocol import client
 from broker.protocol.constants import (
+    NACK_MALFORMED,
+    NACK_PROTOCOL_VIOLATION,
+    NACK_SLOT_OCCUPIED,
+    NACK_UNKNOWN_SESSION,
     SessionState,
     T_APPROVE_PROMPT,
     T_BUDGET_UPDATE,
@@ -46,6 +53,8 @@ from broker.protocol.constants import (
     T_ESCALATION,
     T_FATAL_ERROR,
     T_GET_DECISION_LOG,
+    T_GET_PERMISSION_LOG,
+    T_PERMISSION_ESCALATION,
     T_PROMPT_PROPOSAL,
     T_REACTIVATE,
     T_RETRACT,
@@ -62,7 +71,11 @@ from broker.protocol.schemas import (
     Envelope,
     EscalationPayload,
     FatalErrorPayload,
+    PermissionEscalationPayload,
+    PermissionLogPayload,
+    PermissionSuggestion,
     PromptProposalPayload,
+    RaiserIdentity,
     ReactivatePayload,
     Response,
     RetractPayload,
@@ -81,6 +94,18 @@ REQUEST_TIMEOUT_S = 10.0
 STOP_WAIT_S = 10.0
 SOCKET_POLL_S = 0.1
 SOCKET_PROBE_TIMEOUT_S = 2.0
+
+# Stands in for a pane the registry cannot name. A permission escalation is
+# still worth surfacing without it: the developer knows the session.
+PANE_UNKNOWN = "(pane unknown)"
+
+# Whatever a session broker or its permission module escalated. Both carry the
+# identity the slot rules read: escalation_id, session_id and raiser.
+SlotPayload = EscalationPayload | PermissionEscalationPayload
+
+# Failures the on-demand status probe absorbs into a warning line: a session
+# that cannot be reached must not fail the whole listing.
+PROBE_FAILURES = (OSError, ConnectionError, TimeoutError, ValidationError)
 
 
 async def _broker_is_listening(path: Path) -> bool:
@@ -144,7 +169,11 @@ def _adoption_fields(record: SessionRecord) -> AdoptedSession:
 
 
 class ProtocolViolation(Exception):
-    """A broker broke the one-outstanding-escalation invariant."""
+    """A raiser broke the one-outstanding-escalation invariant."""
+
+
+class CapacityRefusal(Exception):
+    """The slot is full, and a different raiser wanted it."""
 
 
 class EscalationSlot:
@@ -152,30 +181,37 @@ class EscalationSlot:
 
     def __init__(self) -> None:
         """Start with no escalation active."""
-        self._active: EscalationPayload | None = None
+        self._active: SlotPayload | None = None
 
     @property
-    def active(self) -> EscalationPayload | None:
+    def active(self) -> SlotPayload | None:
         """Return the escalation awaiting the developer, or ``None``."""
         return self._active
 
-    def accept(self, payload: EscalationPayload) -> None:
+    def accept(self, payload: SlotPayload) -> None:
         """Make ``payload`` the active escalation.
 
         Args:
             payload: The escalation to surface to the developer.
 
         Raises:
-            ProtocolViolation: An escalation is already active.
+            ProtocolViolation: The raiser that holds the slot raised again —
+                it is expected to wait for its own escalation to resolve.
+            CapacityRefusal: Another raiser holds the slot. That is legitimate
+                behaviour on the raiser's part, so it is refused rather than
+                blamed.
         """
         if self._active is not None:
-            raise ProtocolViolation(
+            held = (
                 f"escalation {payload.escalation_id} arrived while "
                 f"{self._active.escalation_id} is active"
             )
+            if self._active.raiser == payload.raiser:
+                raise ProtocolViolation(held)
+            raise CapacityRefusal(held)
         self._active = payload
 
-    def retract(self, escalation_id: str) -> EscalationPayload | None:
+    def retract(self, escalation_id: str) -> SlotPayload | None:
         """Clear an escalation its session has withdrawn.
 
         Args:
@@ -186,7 +222,7 @@ class EscalationSlot:
         """
         return self._clear(escalation_id)
 
-    def resolve(self, escalation_id: str) -> EscalationPayload | None:
+    def resolve(self, escalation_id: str) -> SlotPayload | None:
         """Clear an escalation the developer has decided.
 
         Args:
@@ -197,7 +233,7 @@ class EscalationSlot:
         """
         return self._clear(escalation_id)
 
-    def _clear(self, escalation_id: str) -> EscalationPayload | None:
+    def _clear(self, escalation_id: str) -> SlotPayload | None:
         """Clear the active escalation when it matches ``escalation_id``.
 
         Args:
@@ -260,6 +296,54 @@ def render_escalation(p: EscalationPayload) -> str:
         "## What would change my mind",
         p.what_would_change_my_mind,
     ]
+    return "\n".join(lines)
+
+
+def _render_suggestion(suggestion: PermissionSuggestion) -> str:
+    """Render one of Claude Code's permission suggestions as its raw object."""
+    data = suggestion if isinstance(suggestion, dict) else suggestion.model_dump()
+    return json.dumps(data, sort_keys=True)
+
+
+def render_permission_escalation(
+    p: PermissionEscalationPayload, pane_id: str
+) -> str:
+    """Render the permission-escalation block, deterministic and verbatim.
+
+    Args:
+        p: Validated permission-escalation payload from a session broker.
+        pane_id: Pane holding the native prompt, or ``PANE_UNKNOWN``.
+
+    Returns:
+        The rendered block, to be displayed and passed on unchanged.
+    """
+    lines = [
+        f"Permission escalation {p.escalation_id} — session {p.session_id}",
+        "",
+        f"The developer answers this in pane {pane_id}, on the native "
+        "permission prompt already waiting there. It cannot be answered "
+        "here, and no decision sent from here reaches it.",
+        "",
+        "## Tool",
+        p.tool_name,
+        "",
+        "## Tool input",
+        json.dumps(p.tool_input, indent=2, sort_keys=True),
+        "",
+        "## Why it was escalated",
+        p.reason,
+        "",
+        "## Task intent it was judged against",
+        p.task_intent,
+        "",
+        "## Permission suggestions",
+    ]
+    if p.permission_suggestions:
+        lines += [
+            f"- {_render_suggestion(s)}" for s in p.permission_suggestions
+        ]
+    else:
+        lines.append("(none)")
     return "\n".join(lines)
 
 
@@ -357,6 +441,8 @@ class MasterRuntime:
         name = env.session_id or ""
         if env.type == T_ESCALATION:
             return await self._on_escalation(env, name)
+        if env.type == T_PERMISSION_ESCALATION:
+            return await self._on_permission_escalation(env, name)
         if env.type == T_COMPLETION:
             p = CompletionPayload.model_validate(env.payload)
             self._set_state(name, SessionState.COMPLETED)
@@ -414,8 +500,8 @@ class MasterRuntime:
             name: Session name from the envelope, used for rejection notices.
 
         Returns:
-            ``Response(ok=True)`` once live and announced, ``ok=False`` if
-            rejected.
+            ``Response(ok=True)`` once live and announced, ``ok=False`` with a
+            reason code if rejected.
         """
         try:
             p = EscalationPayload.model_validate(env.payload)
@@ -427,12 +513,13 @@ class MasterRuntime:
                     f"surfaced.\nvalidation: {exc}\nraw payload: {env.payload!r}"
                 )
             )
-            return self._ack(env, ok=False)
-        try:
-            self.slot.accept(p)
-        except ProtocolViolation as exc:
-            self.app_post(Notice(f"PROTOCOL VIOLATION: {exc}"))
-            return self._ack(env, ok=False)
+            return self._nack(env, f"malformed escalation: {exc}", NACK_MALFORMED)
+        unknown = self._reject_unknown_session(env, p.session_id, "escalation")
+        if unknown is not None:
+            return unknown
+        refused = self._accept_into_slot(env, p, "escalation")
+        if refused is not None:
+            return refused
         self._set_state(p.session_id, SessionState.ESCALATED)
         self.app_post(
             EscalationArrived(
@@ -445,6 +532,99 @@ class MasterRuntime:
             p.what_was_asked,
         )
         return self._ack(env, ok=True)
+
+    async def _on_permission_escalation(
+        self, env: Envelope, name: str
+    ) -> Response:
+        """Validate one permission escalation, make it active, and surface it.
+
+        Args:
+            env: Envelope carrying the permission-escalation payload.
+            name: Session name from the envelope, used for rejection notices.
+
+        Returns:
+            ``Response(ok=True)`` once live and announced, ``ok=False`` with a
+            reason code if rejected.
+        """
+        try:
+            p = PermissionEscalationPayload.model_validate(env.payload)
+        except ValidationError as exc:
+            # A permission escalation missing the tool, the reason or the
+            # session is not something the developer could act on.
+            self.app_post(
+                Notice(
+                    f"MALFORMED permission escalation from session {name!r} — "
+                    f"NOT surfaced.\nvalidation: {exc}\n"
+                    f"raw payload: {env.payload!r}"
+                )
+            )
+            return self._nack(
+                env, f"malformed permission escalation: {exc}", NACK_MALFORMED
+            )
+        unknown = self._reject_unknown_session(
+            env, p.session_id, "permission escalation"
+        )
+        if unknown is not None:
+            return unknown
+        refused = self._accept_into_slot(env, p, "permission escalation")
+        if refused is not None:
+            return refused
+        pane_id = self.registry.get(p.session_id).pane_id or PANE_UNKNOWN
+        self.app_post(
+            PermissionEscalationArrived(
+                p.session_id,
+                p.escalation_id,
+                render_permission_escalation(p, pane_id),
+            )
+        )
+        await self._notify(
+            notifier.notify_request,
+            f"Permission prompt in session {p.session_id}",
+            f"{p.tool_name} — answer it in pane {pane_id}",
+        )
+        return self._ack(env, ok=True)
+
+    def _reject_unknown_session(
+        self, env: Envelope, session_id: str, kind: str
+    ) -> Response | None:
+        """Refuse an escalation from a session the registry does not know.
+
+        Args:
+            env: Envelope being answered.
+            session_id: Session the payload claims to come from.
+            kind: Word naming the escalation kind, used in the notice.
+
+        Returns:
+            ``None`` when the session is known, otherwise the NACK.
+        """
+        if session_id in self.registry.records:
+            return None
+        msg = f"{kind} from unknown session {session_id!r} — NOT surfaced"
+        self.app_post(Notice(msg))
+        return self._nack(env, msg, NACK_UNKNOWN_SESSION)
+
+    def _accept_into_slot(
+        self, env: Envelope, payload: SlotPayload, kind: str
+    ) -> Response | None:
+        """Make ``payload`` active, or build the NACK refusing it.
+
+        Args:
+            env: Envelope being answered.
+            payload: The escalation offered to the slot.
+            kind: Word naming the escalation kind, used in the notice.
+
+        Returns:
+            ``None`` once accepted, otherwise the NACK.
+        """
+        try:
+            self.slot.accept(payload)
+        except ProtocolViolation as exc:
+            self.app_post(Notice(f"PROTOCOL VIOLATION: {exc}"))
+            return self._nack(env, str(exc), NACK_PROTOCOL_VIOLATION)
+        except CapacityRefusal as exc:
+            self.app_post(Notice(f"{kind} refused, slot occupied: {exc}"))
+            return self._nack(env, str(exc), NACK_SLOT_OCCUPIED)
+        return None
 
     # ── session control (LLM-layer tool implementations) ─────────────────────
 
@@ -598,7 +778,8 @@ class MasterRuntime:
 
         Returns:
             An outcome line: dispatched to the named session, a refusal
-            naming the escalation that is no longer live, or a rejection if
+            naming the escalation that is no longer live, a refusal naming the
+            pane when the escalation is a permission prompt, or a rejection if
             the session NACKed delivery.
         """
         # Liveness is checked THE INSTANT before the write, not at
@@ -609,6 +790,17 @@ class MasterRuntime:
             msg = (
                 f"decision NOT dispatched — escalation {escalation_id} is "
                 "no longer live"
+            )
+            self.app_post(Notice(msg))
+            return msg
+        if isinstance(active, PermissionEscalationPayload):
+            # The native prompt is the only thing that can answer it, and it is
+            # on the session's own screen.
+            pane_id = self.pane_of(active.session_id)
+            msg = (
+                f"decision NOT dispatched — escalation {escalation_id} is a "
+                f"permission prompt in session {active.session_id}. The "
+                f"developer answers it in pane {pane_id}."
             )
             self.app_post(Notice(msg))
             return msg
@@ -702,6 +894,25 @@ class MasterRuntime:
         )
         return DecisionLogPayload.model_validate(resp.payload).text
 
+    async def get_permission_log(self, session_id: str) -> str:
+        """Fetch a session's permission log as text.
+
+        Args:
+            session_id: Registry name of the session to query.
+
+        Returns:
+            The log text verbatim.
+
+        Raises:
+            ValidationError: The session's reply was not a permission log.
+        """
+        record = self.registry.get(session_id)
+        env = self._env(T_GET_PERMISSION_LOG, {})
+        resp = await client.request(
+            Path(record.socket_path), env, timeout_s=REQUEST_TIMEOUT_S
+        )
+        return PermissionLogPayload.model_validate(resp.payload).text
+
     async def stop_session(self, session_id: str) -> str:
         """Shut a session broker down and mark it stopped.
 
@@ -726,8 +937,23 @@ class MasterRuntime:
             except TimeoutError:
                 proc.terminate()
                 await proc.wait()
+        self._retract_stranded_permission_escalation(session_id)
         self._set_state(session_id, SessionState.STOPPED)
         return f"session {session_id} stopped"
+
+    def pane_of(self, session_id: str) -> str:
+        """Return the pane holding a session, or ``PANE_UNKNOWN``.
+
+        Args:
+            session_id: Registry name of the session.
+
+        Returns:
+            The pane id, or ``PANE_UNKNOWN`` when the registry has none.
+        """
+        try:
+            return self.registry.get(session_id).pane_id or PANE_UNKNOWN
+        except KeyError:
+            return PANE_UNKNOWN
 
     def pending_proposals(self) -> list[PendingProposal]:
         """Return every proposal awaiting approval, oldest first."""
@@ -752,6 +978,36 @@ class MasterRuntime:
             )
         return "\n".join(lines)
 
+    async def render_sessions_with_permission_prompts(self) -> str:
+        """Render the registry summary, probing each session for a live prompt.
+
+        The prompt flag lives in broker memory and is read on demand, so it
+        never enters the summary the master carries into every turn.
+
+        Returns:
+            The registry summary, followed by a line for each session found
+            waiting on a native permission prompt and for each session that
+            could not be reached.
+        """
+        lines = [self.render_registry_summary()]
+        for name in sorted(self.registry.records):
+            try:
+                status = await self.probe_status(name)
+            except PROBE_FAILURES as exc:
+                # An unreachable session costs one line of the listing, never
+                # the whole listing.
+                lines.append(
+                    f"- {name}: unreachable ({exc!r}) — could not read "
+                    "whether it is sitting on a permission prompt"
+                )
+                continue
+            if status.permission_prompt:
+                lines.append(
+                    f"- {name}: sitting on a permission prompt, answered in "
+                    f"pane {status.pane_id or PANE_UNKNOWN}"
+                )
+        return "\n".join(lines)
+
     # ── internals ────────────────────────────────────────────────────────────
 
     async def _spawn_broker(
@@ -768,6 +1024,12 @@ class MasterRuntime:
         Returns:
             The spawned process.
         """
+        settings_path = self.paths.session_claude_settings(record.name)
+        # The rules have to be on disk before the session reads them: the
+        # master is the only writer of anything outside the repo.
+        write_session_permissions(
+            settings_path, self.cfg.permission_rules.model_dump()
+        )
         config = SessionBrokerConfig(
             name=record.name,
             socket_path=record.socket_path,
@@ -779,8 +1041,10 @@ class MasterRuntime:
             budget_count=record.budget_count,
             model_id=self.cfg.model_id,
             max_tokens=self.cfg.max_tokens,
+            classifier=self.cfg.classifier,
             watchdog_seconds=self.cfg.watchdog_seconds,
             budget_max=self.cfg.budget_max,
+            claude_settings_path=str(settings_path),
             adopt=adopt,
         )
         # By module string, never by import — keeps the module boundary
@@ -816,6 +1080,30 @@ class MasterRuntime:
                     f"{path} after {STOP_WAIT_S:.0f} s — refusing to reassign"
                 )
             await asyncio.sleep(SOCKET_POLL_S)
+
+    def _retract_stranded_permission_escalation(self, session_id: str) -> None:
+        """Clear a permission escalation whose broker is gone.
+
+        A permission escalation is withdrawn by the module that raised it once
+        the native prompt is answered. With its broker stopped nothing is left
+        to withdraw it, and it would hold the slot indefinitely.
+
+        Args:
+            session_id: Session whose broker was stopped or replaced.
+        """
+        active = self.slot.active
+        if active is None:
+            return
+        raiser = RaiserIdentity(component="permission", session_id=session_id)
+        if active.raiser != raiser:
+            return
+        self.slot.retract(active.escalation_id)
+        self.app_post(
+            Notice(
+                f"permission escalation {active.escalation_id} from session "
+                f"{session_id} retracted: its broker was stopped"
+            )
+        )
 
     def _set_state(self, name: str, state: SessionState) -> None:
         """Record a session's new state and tell the TUI.
@@ -885,3 +1173,20 @@ class MasterRuntime:
     def _ack(self, env: Envelope, *, ok: bool) -> Response:
         """Build the ACK or NACK answering an envelope."""
         return Response(id=env.id, ok=ok)
+
+    def _nack(self, env: Envelope, error: str, reason_code: str) -> Response:
+        """Build a refusal a sender can act on without parsing the message.
+
+        Args:
+            env: Envelope being answered.
+            error: Human-readable reason, carried for the developer.
+            reason_code: Machine-readable reason from the closed NACK set.
+
+        Returns:
+            The refusal.
+        """
+        return Response(
+            id=env.id,
+            ok=False,
+            payload={"error": error, "reason_code": reason_code},
+        )

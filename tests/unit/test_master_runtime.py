@@ -20,23 +20,41 @@ from broker.master.messages import (
     CompletionArrived,
     EscalationArrived,
     Notice,
+    PermissionEscalationArrived,
     ProposalArrived,
 )
 from broker.master.registry import Registry, SessionRecord
-from broker.master.runtime import MasterRuntime, render_escalation
+from broker.master.runtime import (
+    PANE_UNKNOWN,
+    MasterRuntime,
+    render_escalation,
+    render_permission_escalation,
+)
 from broker.protocol import client
 from broker.protocol.constants import (
+    NACK_MALFORMED,
+    NACK_PROTOCOL_VIOLATION,
+    NACK_SLOT_OCCUPIED,
+    NACK_UNKNOWN_SESSION,
     SessionState,
     T_BUDGET_UPDATE,
     T_COMPLETION,
     T_DISPATCH_DECISION,
     T_ESCALATION,
     T_FATAL_ERROR,
+    T_GET_PERMISSION_LOG,
+    T_PERMISSION_ESCALATION,
     T_PROMPT_PROPOSAL,
     T_REACTIVATE,
     T_RETRACT,
+    T_STATUS,
 )
-from broker.protocol.schemas import Envelope, EscalationPayload, Response
+from broker.protocol.schemas import (
+    Envelope,
+    EscalationPayload,
+    PermissionEscalationPayload,
+    Response,
+)
 from broker.protocol.server import serve_unix
 
 
@@ -125,10 +143,44 @@ class MalformedLogSession:
         return Response(id=env.id, ok=True, payload={"oops": "not text"})
 
 
-def escalation_dict(esc_id: str = "e1") -> dict[str, Any]:
+class PermissionLogSession:
+    """Session-socket handler answering get_permission_log with fixed text."""
+
+    text = "ts=1 Bash allow — matches the stated task"
+
+    def __init__(self) -> None:
+        self.envelopes: list[Envelope] = []
+
+    async def handler(self, env: Envelope) -> Response:
+        self.envelopes.append(env)
+        return Response(id=env.id, ok=True, payload={"text": self.text})
+
+
+class StatusSession:
+    """Session-socket handler answering status with a scripted payload."""
+
+    def __init__(self, *, permission_prompt: bool) -> None:
+        self.permission_prompt = permission_prompt
+
+    async def handler(self, env: Envelope) -> Response:
+        if env.type != T_STATUS:
+            return Response(id=env.id, ok=False)
+        return Response(
+            id=env.id,
+            ok=True,
+            payload={
+                "state": "blocked_permission",
+                "pane_id": "w3:p2",
+                "permission_prompt": self.permission_prompt,
+            },
+        )
+
+
+def escalation_dict(esc_id: str = "e1", session: str = "s1") -> dict[str, Any]:
     return {
         "escalation_id": esc_id,
-        "session_id": "s1",
+        "session_id": session,
+        "raiser": {"component": "broker", "session_id": session},
         "task_context": "ctx-task-value",
         "situation": "situation-value",
         "what_was_asked": "asked-value",
@@ -140,6 +192,24 @@ def escalation_dict(esc_id: str = "e1") -> dict[str, Any]:
         "recommendation": "recommendation-value",
         "uncertainty": "uncertainty-value",
         "what_would_change_my_mind": "change-mind-value",
+    }
+
+
+def permission_escalation_dict(
+    esc_id: str = "p1", session: str = "s1"
+) -> dict[str, Any]:
+    return {
+        "escalation_id": esc_id,
+        "session_id": session,
+        "raiser": {"component": "permission", "session_id": session},
+        "tool_name": "tool-name-value",
+        "tool_input": {"command": "command-value"},
+        "task_intent": "task-intent-value",
+        "reason": "reason-value",
+        "raised_at": "2026-07-29T12:00:00+00:00",
+        "permission_suggestions": [
+            {"type": "setMode", "mode": "mode-value"}
+        ],
     }
 
 
@@ -229,8 +299,9 @@ async def test_escalation_rendered_verbatim(
     arrived = [m for m in posts if isinstance(m, EscalationArrived)]
     assert len(arrived) == 1
     rendered = arrived[0].rendered
-    # Every payload field value appears byte-for-byte — no paraphrase.
-    for value in _leaf_values(payload):
+    # Every value the developer decides on appears byte-for-byte — no
+    # paraphrase. The raiser is routing identity, not something they read.
+    for value in _leaf_values({k: v for k, v in payload.items() if k != "raiser"}):
         assert value in rendered
     assert rendered == render_escalation(
         EscalationPayload.model_validate(payload)
@@ -246,6 +317,8 @@ async def test_second_escalation_while_active_is_protocol_violation(
     assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
     resp = await send(runtime, T_ESCALATION, escalation_dict("e2"))
     assert not resp.ok
+    # Same raiser: the broker was told to hold one at a time and did not.
+    assert resp.payload["reason_code"] == NACK_PROTOCOL_VIOLATION
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("PROTOCOL VIOLATION" in t for t in notices)
     # The first escalation stays active; the second is never surfaced.
@@ -254,6 +327,241 @@ async def test_second_escalation_while_active_is_protocol_violation(
     assert (
         len([m for m in posts if isinstance(m, EscalationArrived)]) == 1
     )
+
+
+async def test_permission_escalation_rendered_names_pane_and_offers_no_dispatch(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    runtime, posts = rt
+    record = runtime.registry.get("s1")
+    record.pane_id = "w3:p2"
+    runtime.registry.upsert(record)
+    payload = permission_escalation_dict()
+    resp = await send(runtime, T_PERMISSION_ESCALATION, payload)
+    assert resp.ok
+    arrived = [m for m in posts if isinstance(m, PermissionEscalationArrived)]
+    assert len(arrived) == 1
+    rendered = arrived[0].rendered
+    assert rendered == render_permission_escalation(
+        PermissionEscalationPayload.model_validate(payload), "w3:p2"
+    )
+    # Every field the developer judges the prompt on appears byte-for-byte.
+    # The raiser is routing identity and raised_at is the resolution baseline;
+    # neither is something they read.
+    judged = {
+        k: v
+        for k, v in payload.items()
+        if k not in ("raiser", "raised_at")
+    }
+    for value in _leaf_values(judged):
+        assert value in rendered
+    # No timestamp reaches the block: it is carried into the master's LLM
+    # context, where a clock reading is only ever something to reason from.
+    assert payload["raised_at"] not in rendered
+    assert "w3:p2" in rendered  # the pane the native prompt is waiting in
+    assert "cannot be answered here" in rendered
+    assert "dispatch" not in rendered.lower()  # no affordance to answer it here
+    assert runtime.slot.active is not None
+    assert runtime.slot.active.escalation_id == "p1"
+
+
+async def test_same_raiser_double_raise_is_protocol_violation(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    runtime, posts = rt
+    assert (
+        await send(runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1"))
+    ).ok
+    resp = await send(
+        runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p2")
+    )
+    assert not resp.ok
+    assert resp.payload["reason_code"] == NACK_PROTOCOL_VIOLATION
+    assert runtime.slot.active is not None
+    assert runtime.slot.active.escalation_id == "p1"
+    assert (
+        len([m for m in posts if isinstance(m, PermissionEscalationArrived)]) == 1
+    )
+
+
+async def test_cross_raiser_is_slot_occupied(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    runtime, posts = rt
+    assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
+    resp = await send(
+        runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
+    )
+    assert not resp.ok
+    # Two distinct raisers: the second one broke no rule, the slot was simply
+    # taken. The raiser needs to tell that apart from being blamed.
+    assert resp.payload["reason_code"] == NACK_SLOT_OCCUPIED
+    assert runtime.slot.active is not None
+    assert runtime.slot.active.escalation_id == "e1"
+    assert [m for m in posts if isinstance(m, PermissionEscalationArrived)] == []
+
+
+async def test_malformed_permission_escalation_nacked_never_surfaced(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    runtime, posts = rt
+    thin = permission_escalation_dict()
+    del thin["reason"]
+    resp = await send(runtime, T_PERMISSION_ESCALATION, thin)
+    assert not resp.ok
+    assert resp.payload["reason_code"] == NACK_MALFORMED
+    # A prompt the developer cannot act on is worse than none at all.
+    assert [m for m in posts if isinstance(m, PermissionEscalationArrived)] == []
+    notices = [m.text for m in posts if isinstance(m, Notice)]
+    assert any("MALFORMED" in t for t in notices)
+    assert runtime.slot.active is None
+
+
+async def test_escalation_from_an_unknown_session_never_takes_the_slot(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    """Holding the slot for a session the master cannot route to would block
+    every session it can."""
+    runtime, posts = rt
+    resp = await send(
+        runtime, T_ESCALATION, escalation_dict("e1", "ghost"), session="ghost"
+    )
+    assert not resp.ok
+    assert resp.payload["reason_code"] == NACK_UNKNOWN_SESSION
+    resp = await send(
+        runtime,
+        T_PERMISSION_ESCALATION,
+        permission_escalation_dict("p1", "ghost"),
+        session="ghost",
+    )
+    assert not resp.ok
+    assert resp.payload["reason_code"] == NACK_UNKNOWN_SESSION
+    assert runtime.slot.active is None
+    assert [m for m in posts if isinstance(m, EscalationArrived)] == []
+    assert [m for m in posts if isinstance(m, PermissionEscalationArrived)] == []
+
+
+async def test_dispatch_refuses_permission_escalation(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, posts = rt
+    stub = StubSession()
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        assert (
+            await send(
+                runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
+            )
+        ).ok
+        result = await runtime.dispatch("p1", "yes, go ahead")
+        assert "NOT dispatched" in result
+        # The registry has no pane for s1 here; the refusal still has to say
+        # where the answer belongs rather than go silent.
+        assert PANE_UNKNOWN in result
+        assert stub.envelopes == []  # nothing reached the session
+        assert runtime.slot.active is not None  # nothing was resolved either
+        notices = [m.text for m in posts if isinstance(m, Notice)]
+        assert any("NOT dispatched" in t for t in notices)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_reassign_retracts_that_sessions_permission_escalation(
+    rt: tuple[MasterRuntime, list[Any]], home: Path, spawn: RecordingSpawn
+) -> None:
+    runtime, posts = rt
+    _bind_session(runtime)
+    # Another session's escalation must survive: reassigning s1 says nothing
+    # about it.
+    other = PermissionEscalationPayload.model_validate(
+        permission_escalation_dict("p9", "s9")
+    )
+    runtime.slot.accept(other)
+    await runtime.reassign_session("s1", "take it from here")
+    assert runtime.slot.active is other
+
+    runtime.slot.retract("p9")
+    assert (
+        await send(
+            runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
+        )
+    ).ok
+    await runtime.reassign_session("s1", "and again")
+    # Its raiser died with the broker, so nothing else would ever clear it.
+    assert runtime.slot.active is None
+    notices = [m.text for m in posts if isinstance(m, Notice)]
+    assert any("p1" in t and "retracted" in t for t in notices)
+
+
+async def test_stop_session_retracts_that_sessions_permission_escalation(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    runtime, posts = rt
+    # A broker-raised escalation from the same session must survive the stop:
+    # raiser identity is the only thing telling the two kinds apart.
+    assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
+    await runtime.stop_session("s1")
+    assert runtime.slot.active is not None
+    assert runtime.slot.active.escalation_id == "e1"
+
+    runtime.slot.retract("e1")
+    assert (
+        await send(
+            runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
+        )
+    ).ok
+    assert runtime.slot.active is not None
+    await runtime.stop_session("s1")
+    # Its raiser died with the broker and the native prompt is still on screen,
+    # so no retraction is ever coming and the slot would stay held for every
+    # other session too.
+    assert runtime.slot.active is None
+    notices = [m.text for m in posts if isinstance(m, Notice)]
+    assert any("p1" in t and "retracted" in t for t in notices)
+
+
+async def test_get_permission_log_round_trip(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, _ = rt
+    stub = PermissionLogSession()
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        assert await runtime.get_permission_log("s1") == stub.text
+        assert [e.type for e in stub.envelopes] == [T_GET_PERMISSION_LOG]
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_list_sessions_reports_permission_prompt_flag(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, _ = rt
+    stub = StatusSession(permission_prompt=True)
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        listing = await runtime.render_sessions_with_permission_prompts()
+        assert "s1" in listing
+        assert "sitting on a permission prompt" in listing
+        assert "w3:p2" in listing
+        # The flag is read on demand and must NOT reach the summary the master
+        # carries into every turn.
+        assert "permission prompt" not in runtime.render_registry_summary()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_list_sessions_degrades_when_a_session_is_unreachable(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    """One dead session costs a line of the listing, never the whole listing."""
+    runtime, _ = rt
+    listing = await runtime.render_sessions_with_permission_prompts()
+    assert "s1" in listing
+    assert "unreachable" in listing
 
 
 async def test_retract_clears_slot_and_informs(
@@ -370,6 +678,16 @@ async def test_every_broker_message_type_is_acked(
     assert (
         await send(
             runtime, T_RETRACT, {"escalation_id": "e1", "reason": "r"}
+        )
+    ).ok
+    assert (
+        await send(
+            runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
+        )
+    ).ok
+    assert (
+        await send(
+            runtime, T_RETRACT, {"escalation_id": "p1", "reason": "r"}
         )
     ).ok
     assert (
@@ -506,6 +824,40 @@ async def test_reassign_spawns_a_broker_that_adopts_the_live_session(
     assert reloaded.budget_count == 0
     assert reloaded.state == "spawning"
     assert reloaded.pid is not None  # the new broker, not the dead one
+
+
+class SpawnWatchingSettings(RecordingSpawn):
+    """Spawn stand-in that notes whether the rules file was already on disk."""
+
+    def __init__(self, settings_path: Path) -> None:
+        super().__init__()
+        self.settings_path = settings_path
+        self.existed_at_spawn: list[bool] = []
+
+    async def __call__(self, *argv: str) -> FakeProcess:
+        self.existed_at_spawn.append(self.settings_path.exists())
+        return await super().__call__(*argv)
+
+
+async def test_spawn_writes_the_session_rules_and_passes_them_on(
+    rt: tuple[MasterRuntime, list[Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _ = rt
+    settings_path = runtime.paths.session_claude_settings("s1")
+    spawn = SpawnWatchingSettings(settings_path)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    _bind_session(runtime)
+    await runtime.reassign_session("s1", "take it from here")
+    # A broker started before its rules exist runs the session unconfigured.
+    assert spawn.existed_at_spawn == [True]
+    written = cast(
+        dict[str, Any], json.loads(settings_path.read_text(encoding="utf-8"))
+    )
+    assert written["permissions"] == runtime.cfg.permission_rules.model_dump()
+    config = spawn.config()
+    assert config["claude_settings_path"] == str(settings_path)
+    assert config["classifier"] == runtime.cfg.classifier.model_dump()
 
 
 async def test_reassign_refuses_a_session_it_only_partly_knows(
