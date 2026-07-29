@@ -8,7 +8,7 @@ import pytest
 from broker import prompts
 
 PROMPT_DIR = Path(__file__).parent.parent.parent / "src" / "broker" / "prompts"
-NAMES = ["triage", "master", "grounding"]
+NAMES = ["triage", "master", "grounding", "permission"]
 
 
 @pytest.mark.parametrize("name", NAMES)
