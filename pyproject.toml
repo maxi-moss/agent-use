@@ -60,6 +60,7 @@ forbidden_modules = [
     "broker.claude",
     "broker.master",
     "broker.session",
+    "broker.permission",
     "broker.prompts",
     "broker.llm",
     "broker.config",
@@ -83,3 +84,26 @@ name = "master never imports session broker internals (spawn is by subprocess)"
 type = "forbidden"
 source_modules = ["broker.master"]
 forbidden_modules = ["broker.session"]
+
+[[tool.importlinter.contracts]]
+name = "permission imports neither broker internals nor the shared llm"
+type = "forbidden"
+source_modules = ["broker.permission"]
+forbidden_modules = [
+    "broker.session",
+    "broker.master",
+    "broker.transcript",
+    "broker.llm",
+]
+
+[[tool.importlinter.contracts]]
+name = "session reaches permission only through its public interface"
+type = "protected"
+protected_modules = [
+    "broker.permission.module",
+    "broker.permission.llm",
+    "broker.permission.schemas",
+    "broker.permission.cache",
+    "broker.permission.permission_log",
+]
+allowed_importers = ["broker.permission"]
