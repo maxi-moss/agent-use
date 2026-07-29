@@ -5,8 +5,8 @@ on the synchronous permission path of every tool call in every supervised
 session — pydantic here would tax every single tool call.
 
 Invariants (binding):
-- stdout carries the PreToolUse allow-decision JSON or NOTHING. Never "deny",
-  never allow-by-default.
+- stdout carries the PermissionRequest allow-decision JSON or NOTHING. Never
+  "deny", never allow-by-default.
 - exit 0 on every path, including every exception. A dead broker degrades the
   session to stock Claude Code; it never breaks one.
 - BROKER_SOCKET unset -> immediate silent no-op (the isolation gate).
@@ -28,11 +28,14 @@ from broker.protocol.constants import (
     T_PERMISSION_REQUEST,
 )
 
+ASK_USER_QUESTION = "AskUserQuestion"
+
+# PermissionRequest's own nested shape. Claude Code validates it and treats
+# PreToolUse's flat permissionDecision shape here as if nothing was printed.
 _ALLOW_OUTPUT = {
     "hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": "allow",
-        "permissionDecisionReason": "broker approved",
+        "hookEventName": "PermissionRequest",
+        "decision": {"behavior": "allow", "message": "broker approved"},
     }
 }
 
@@ -78,9 +81,15 @@ def main() -> None:
         return  # isolation gate
 
     event = payload.get("hook_event_name")
+    if event == "PreToolUse" and payload.get("tool_name") != ASK_USER_QUESTION:
+        # PreToolUse fires on every tool call. Returning here — above the
+        # socket — is what keeps ordinary tool calls free of any broker cost:
+        # no connection, no wait. The decision path is PermissionRequest.
+        return
+
     timeout = _timeout_seconds()
 
-    if event == "PreToolUse":
+    if event == "PermissionRequest":
         envelope = {
             "v": PROTOCOL_VERSION,
             "id": uuid.uuid4().hex,
@@ -89,10 +98,14 @@ def main() -> None:
             "payload": {
                 "tool_name": payload.get("tool_name", ""),
                 "tool_input": payload.get("tool_input", {}),
-                "tool_use_id": payload.get("tool_use_id", ""),
                 "cwd": payload.get("cwd", ""),
                 "transcript_path": payload.get("transcript_path", ""),
                 "permission_mode": payload.get("permission_mode"),
+                # Forwarded verbatim: this process is stdlib-only, so the
+                # broker owns validating the arms.
+                "permission_suggestions": payload.get(
+                    "permission_suggestions", []
+                ),
             },
         }
     else:
@@ -108,7 +121,7 @@ def main() -> None:
         sock.settimeout(timeout)
         sock.connect(sock_path)
         sock.sendall(json.dumps(envelope).encode() + b"\n")
-        if event != "PreToolUse":
+        if event != "PermissionRequest":
             return  # fire-and-forget
 
         line = _read_line(sock, timeout)

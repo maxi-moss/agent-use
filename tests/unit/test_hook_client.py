@@ -23,10 +23,22 @@ from broker.protocol.constants import HOOK_SETTINGS_TIMEOUT, HOOK_WAIT_SECONDS
 
 EXPECTED_ALLOW = {
     "hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": "allow",
-        "permissionDecisionReason": "broker approved",
+        "hookEventName": "PermissionRequest",
+        "decision": {"behavior": "allow", "message": "broker approved"},
     }
+}
+
+PERMISSION_REQUEST_PAYLOAD = {
+    "session_id": "sess-1",
+    "transcript_path": "/private/tmp/x/t.jsonl",
+    "cwd": "/private/tmp/x",
+    "hook_event_name": "PermissionRequest",
+    "tool_name": "Bash",
+    "tool_input": {"command": "rm -rf build", "description": "clean"},
+    "permission_mode": "default",
+    "permission_suggestions": [
+        {"type": "addDirectories", "directories": ["/private/tmp/x"]}
+    ],
 }
 
 PRE_TOOL_USE_PAYLOAD = {
@@ -40,6 +52,17 @@ PRE_TOOL_USE_PAYLOAD = {
     "permission_mode": "default",
 }
 
+ASK_USER_QUESTION_PAYLOAD = {
+    "session_id": "sess-1",
+    "transcript_path": "/private/tmp/x/t.jsonl",
+    "cwd": "/private/tmp/x",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "AskUserQuestion",
+    "tool_input": {"questions": [{"question": "which one?"}]},
+    "tool_use_id": "toolu_ask_1",
+    "permission_mode": "default",
+}
+
 STOP_PAYLOAD = {
     "session_id": "sess-1",
     "transcript_path": "/private/tmp/x/t.jsonl",
@@ -50,19 +73,27 @@ STOP_PAYLOAD = {
 
 
 class StubBroker(socketserver.ThreadingUnixStreamServer):
-    """Records every envelope; replies according to `mode`."""
+    """Counts accepted connections, records every envelope, replies per `mode`."""
 
     daemon_threads = True
 
     def __init__(self, sock_path: str, mode: str) -> None:
         self.mode = mode
         self.received: list[dict[str, Any]] = []
+        self.connections = 0
+        self._lock = threading.Lock()
         super().__init__(sock_path, _StubHandler)
+
+    def note_connection(self) -> None:
+        """Count one accepted connection, whether or not anything is sent on it."""
+        with self._lock:
+            self.connections += 1
 
 
 class _StubHandler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         server = cast(StubBroker, self.server)
+        server.note_connection()
         line = self.rfile.readline()
         if not line:
             return
@@ -129,10 +160,66 @@ def run_hook(
     )
 
 
-def test_allow_prints_exact_decision_json(sock_dir: Path) -> None:
+def wait_for_connections(stub: StubBroker, count: int) -> None:
+    deadline = time.monotonic() + 2.0
+    while stub.connections < count and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+def test_pretooluse_other_tool_never_connects(sock_dir: Path) -> None:
+    """An ordinary tool's PreToolUse never reaches the socket.
+
+    A zero-connection assertion is only worth as much as the counter behind
+    it, so the same stub instance is then handed a payload that must connect:
+    the counter is shown able to move before its zero is believed.
+    """
     sock_path = sock_dir / "broker.sock"
     with start_stub(sock_path, "allow") as stub:
+        start = time.monotonic()
         proc = run_hook(PRE_TOOL_USE_PAYLOAD, sock_path)
+        elapsed = time.monotonic() - start
+        assert proc.returncode == 0
+        assert proc.stdout == ""
+        assert elapsed < 1.0
+        # A connect racing the hook's exit would still land on the listener,
+        # so give the handler thread time to record one before claiming none.
+        time.sleep(0.3)
+        assert stub.connections == 0
+        assert stub.received == []
+
+        armed = run_hook(ASK_USER_QUESTION_PAYLOAD, sock_path)
+        assert armed.returncode == 0
+        wait_for_connections(stub, 1)
+        assert stub.connections == 1
+
+
+def test_pretooluse_askuserquestion_is_fire_and_forget(sock_dir: Path) -> None:
+    sock_path = sock_dir / "broker.sock"
+    # "mute" would block a reply-waiting client; returning immediately proves
+    # no reply is expected on this event.
+    with start_stub(sock_path, "mute") as stub:
+        start = time.monotonic()
+        proc = run_hook(ASK_USER_QUESTION_PAYLOAD, sock_path)
+        elapsed = time.monotonic() - start
+        assert proc.returncode == 0
+        assert proc.stdout == ""
+        assert elapsed < 1.0
+        deadline = time.monotonic() + 2.0
+        while not stub.received and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(stub.received) == 1
+        env = stub.received[0]
+        assert env["type"] == "hook_event"
+        assert env["session_id"] == "sess-1"
+        assert env["payload"]["hook_event_name"] == "PreToolUse"
+        # The broker dedups questions on the raw tool_use_id.
+        assert env["payload"]["raw"] == ASK_USER_QUESTION_PAYLOAD
+
+
+def test_permission_request_allow_prints_nested_shape(sock_dir: Path) -> None:
+    sock_path = sock_dir / "broker.sock"
+    with start_stub(sock_path, "allow") as stub:
+        proc = run_hook(PERMISSION_REQUEST_PAYLOAD, sock_path)
         assert proc.returncode == 0
         lines = proc.stdout.splitlines()
         assert len(lines) == 1
@@ -143,17 +230,24 @@ def test_allow_prints_exact_decision_json(sock_dir: Path) -> None:
         assert env["v"] == 1
         assert env["type"] == "permission_request"
         assert env["session_id"] == "sess-1"
-        assert env["payload"]["tool_name"] == "Bash"
-        assert env["payload"]["tool_use_id"] == "toolu_test_1"
-        assert env["payload"]["cwd"] == "/private/tmp/x"
-        assert env["payload"]["transcript_path"] == "/private/tmp/x/t.jsonl"
-        assert env["payload"]["permission_mode"] == "default"
+        assert env["payload"] == {
+            "tool_name": "Bash",
+            "tool_input": {"command": "rm -rf build", "description": "clean"},
+            "cwd": "/private/tmp/x",
+            "transcript_path": "/private/tmp/x/t.jsonl",
+            "permission_mode": "default",
+            "permission_suggestions": [
+                {"type": "addDirectories", "directories": ["/private/tmp/x"]}
+            ],
+        }
+        # The event carries no call identity; the hook must not invent one.
+        assert "tool_use_id" not in env["payload"]
 
 
-def test_escalated_prints_nothing(sock_dir: Path) -> None:
+def test_permission_request_escalated_prints_nothing(sock_dir: Path) -> None:
     sock_path = sock_dir / "broker.sock"
     with start_stub(sock_path, "escalated"):
-        proc = run_hook(PRE_TOOL_USE_PAYLOAD, sock_path)
+        proc = run_hook(PERMISSION_REQUEST_PAYLOAD, sock_path)
         assert proc.returncode == 0
         assert proc.stdout == ""
 
@@ -162,7 +256,9 @@ def test_timeout_prints_nothing_exits_zero(sock_dir: Path) -> None:
     sock_path = sock_dir / "broker.sock"
     with start_stub(sock_path, "mute"):
         start = time.monotonic()
-        proc = run_hook(PRE_TOOL_USE_PAYLOAD, sock_path, timeout_override="0.2")
+        proc = run_hook(
+            PERMISSION_REQUEST_PAYLOAD, sock_path, timeout_override="0.2"
+        )
         elapsed = time.monotonic() - start
         assert proc.returncode == 0
         assert proc.stdout == ""
@@ -170,7 +266,7 @@ def test_timeout_prints_nothing_exits_zero(sock_dir: Path) -> None:
 
 
 def test_unreachable_socket_exits_zero(sock_dir: Path) -> None:
-    proc = run_hook(PRE_TOOL_USE_PAYLOAD, sock_dir / "nonexistent.sock")
+    proc = run_hook(PERMISSION_REQUEST_PAYLOAD, sock_dir / "nonexistent.sock")
     assert proc.returncode == 0
     assert proc.stdout == ""
 
@@ -179,7 +275,7 @@ def test_unset_socket_noop(sock_dir: Path) -> None:
     """BROKER_SOCKET unset -> exit 0, nothing written to a canary socket."""
     canary_path = sock_dir / "canary.sock"
     with start_stub(canary_path, "allow") as canary:
-        proc = run_hook(PRE_TOOL_USE_PAYLOAD, sock_path=None)
+        proc = run_hook(PERMISSION_REQUEST_PAYLOAD, sock_path=None)
         assert proc.returncode == 0
         assert proc.stdout == ""
         assert canary.received == []
@@ -188,7 +284,7 @@ def test_unset_socket_noop(sock_dir: Path) -> None:
 def test_non_pretooluse_event_is_fire_and_forget(sock_dir: Path) -> None:
     sock_path = sock_dir / "broker.sock"
     # "mute" would block a reply-waiting client; a fire-and-forget hook returns
-    # immediately, proving no reply is expected for non-PreToolUse events.
+    # immediately, proving no reply is expected for non-decision events.
     with start_stub(sock_path, "mute") as stub:
         start = time.monotonic()
         proc = run_hook(STOP_PAYLOAD, sock_path)
