@@ -54,3 +54,11 @@ class BrokerPaths:
     def session_decisions(self, name: str) -> Path:
         """Append-only triage decision log for session ``name``."""
         return self.session_logs(name) / "decisions.ndjson"
+
+    def session_claude_settings(self, name: str) -> Path:
+        """Claude Code settings file loaded by session ``name``."""
+        return self.session_logs(name) / "claude-settings.json"
+
+    def session_permissions(self, name: str) -> Path:
+        """Append-only permission decision log for session ``name``."""
+        return self.session_logs(name) / "permissions.ndjson"

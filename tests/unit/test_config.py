@@ -5,9 +5,26 @@ from pathlib import Path
 
 import pytest
 
-from broker.config import BrokerConfig, ConfigError, load
+from broker.config import (
+    BrokerConfig,
+    ClassifierConfig,
+    ConfigError,
+    PermissionRules,
+    load,
+)
 
 SRC_ROOT = Path(__file__).parent.parent.parent / "src" / "broker"
+
+
+def _modules_mentioning(needle: str) -> list[Path]:
+    """Every file under src/broker containing ``needle``."""
+    hits: list[Path] = []
+    for path in SRC_ROOT.rglob("*"):
+        if path.suffix not in {".py", ".md"} or not path.is_file():
+            continue
+        if needle in path.read_text(encoding="utf-8"):
+            hits.append(path.relative_to(SRC_ROOT))
+    return hits
 
 
 def test_broker_home_env_override(
@@ -53,10 +70,71 @@ def test_load_missing_file_is_defaults(
 
 def test_model_id_pinned_in_exactly_one_module() -> None:
     """`claude-sonnet-5` lives in broker/config.py and nowhere else in src."""
-    hits: list[Path] = []
-    for path in SRC_ROOT.rglob("*"):
-        if path.suffix not in {".py", ".md"} or not path.is_file():
-            continue
-        if "claude-sonnet-5" in path.read_text(encoding="utf-8"):
-            hits.append(path.relative_to(SRC_ROOT))
+    hits = _modules_mentioning("claude-sonnet-5")
     assert hits == [Path("config.py")], f"model id leaked into {hits}"
+
+
+def test_classifier_model_id_pinned_in_exactly_one_module() -> None:
+    """`claude-haiku-4-5` lives in broker/config.py and nowhere else in src."""
+    hits = _modules_mentioning("claude-haiku-4-5")
+    assert hits == [Path("config.py")], f"classifier model id leaked into {hits}"
+
+
+def test_classifier_defaults() -> None:
+    assert ClassifierConfig().model_id == "claude-haiku-4-5"
+    assert ClassifierConfig().max_tokens == 1024
+    assert BrokerConfig().classifier == ClassifierConfig()
+
+
+@pytest.mark.parametrize("rule", ["Bash", "Bash(*)"])
+def test_blanket_bash_allow_rule_is_rejected(rule: str) -> None:
+    with pytest.raises(ValueError):
+        PermissionRules(allow=[rule])
+
+
+def test_bypass_permissions_is_rejected_in_every_list() -> None:
+    banned = ["bypassPermissions"]
+    with pytest.raises(ValueError):
+        PermissionRules(allow=banned)
+    with pytest.raises(ValueError):
+        PermissionRules(ask=banned)
+    with pytest.raises(ValueError):
+        PermissionRules(deny=banned)
+
+
+def test_blanket_bash_is_allow_only() -> None:
+    """`Bash` is a legitimate ask/deny rule — only allow-ing it is the hazard."""
+    assert PermissionRules(ask=["Bash"], deny=["Bash(*)"]).ask == ["Bash"]
+
+
+def test_load_overlay_carries_nested_permission_keys(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("BROKER_HOME", str(tmp_path))
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "classifier": {"max_tokens": 256},
+                "permission_rules": {
+                    "allow": ["Read"],
+                    "ask": ["Bash(git push:*)"],
+                    "deny": ["Bash(curl:*)"],
+                },
+            }
+        )
+    )
+    cfg = load()
+    assert cfg.classifier.max_tokens == 256
+    assert cfg.classifier.model_id == "claude-haiku-4-5"  # untouched default
+    assert cfg.permission_rules.deny == ["Bash(curl:*)"]
+
+
+def test_overlay_with_a_self_defeating_rule_fails_loud(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("BROKER_HOME", str(tmp_path))
+    (tmp_path / "config.json").write_text(
+        json.dumps({"permission_rules": {"allow": ["Bash(*)"]}})
+    )
+    with pytest.raises(ConfigError):
+        load()

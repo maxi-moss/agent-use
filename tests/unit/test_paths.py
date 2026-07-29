@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from broker.paths import BrokerPaths
-from broker.config import SessionBrokerConfig
+from broker.config import ClassifierConfig, SessionBrokerConfig
 
 
 def test_session_paths_follow_the_configured_home_not_the_env(
@@ -24,9 +24,16 @@ def test_session_paths_follow_the_configured_home_not_the_env(
         intent="i",
         model_id="test-model",
         max_tokens=1024,
+        classifier=ClassifierConfig(),
         watchdog_seconds=300.0,
         budget_max=8,
+        claude_settings_path=str(configured / "claude-settings.json"),
     )
-    decisions = BrokerPaths(cfg.broker_home).session_decisions(cfg.name)
-    assert decisions.is_relative_to(configured)
-    assert not decisions.is_relative_to(tmp_path / "env")
+    paths = BrokerPaths(cfg.broker_home)
+    for path in (
+        paths.session_decisions(cfg.name),
+        paths.session_permissions(cfg.name),
+        paths.session_claude_settings(cfg.name),
+    ):
+        assert path.is_relative_to(configured)
+        assert not path.is_relative_to(tmp_path / "env")
