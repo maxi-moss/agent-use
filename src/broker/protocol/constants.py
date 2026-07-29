@@ -16,6 +16,7 @@ T_DISPATCH_DECISION = "dispatch_decision"
 T_SEND_PROMPT = "send_prompt"
 T_STATUS = "status"
 T_GET_DECISION_LOG = "get_decision_log"
+T_GET_PERMISSION_LOG = "get_permission_log"
 T_SHUTDOWN = "shutdown"
 T_RESPONSE = "response"
 T_APPROVE_PROMPT = "approve_prompt"  # master -> broker
@@ -23,11 +24,22 @@ T_REACTIVATE = "reactivate"  # master -> broker
 
 # Master-socket message types
 T_ESCALATION = "escalation"
+T_PERMISSION_ESCALATION = "permission_escalation"
 T_COMPLETION = "completion"
 T_FATAL_ERROR = "fatal_error"
 T_RETRACT = "retract"
 T_PROMPT_PROPOSAL = "prompt_proposal"  # broker -> master
 T_BUDGET_UPDATE = "budget_update"  # broker -> master
+
+# Machine-readable refusal reasons carried alongside the human-readable error
+# string on a negative Response. Closed set: a sender that cannot tell a
+# capacity refusal from a protocol violation has to treat both as bugs.
+NACK_PROTOCOL_VIOLATION = "protocol_violation"
+NACK_SLOT_OCCUPIED = "slot_occupied"
+NACK_MALFORMED = "malformed"
+NACK_UNKNOWN_SESSION = "unknown_session"
+NACK_STALE_PROPOSAL = "stale_proposal"
+NACK_WRONG_STATE = "wrong_state"
 
 # permission_request reply decisions — NOT Claude Code's enum;
 # "escalated" deliberately avoids colliding with Claude Code's own "defer"

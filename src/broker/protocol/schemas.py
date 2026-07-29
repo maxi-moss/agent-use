@@ -31,17 +31,45 @@ class Response(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class AddDirectoriesSuggestion(BaseModel):
+    """Claude Code's offer to widen the accessible directory set."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    type: Literal["addDirectories"]
+    directories: list[str] = Field(default_factory=list[str])
+    destination: str | None = None
+
+
+class SetModeSuggestion(BaseModel):
+    """Claude Code's offer to switch the session's permission mode."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    type: Literal["setMode"]
+    mode: str | None = None
+    destination: str | None = None
+
+
+# The suggestion set is undocumented and grows with the binary, so an arm we
+# do not recognise must survive as its raw object rather than fail the
+# permission request that carries it.
+PermissionSuggestion = AddDirectoriesSuggestion | SetModeSuggestion | dict[str, Any]
+
+
 class PermissionRequestPayload(BaseModel):
-    """hook -> broker; mirrors the PreToolUse stdin payload."""
+    """hook -> broker; mirrors the PermissionRequest stdin payload."""
 
     model_config = ConfigDict(extra="ignore")
 
     tool_name: str
     tool_input: dict[str, Any]
-    tool_use_id: str
     cwd: str
     transcript_path: str
     permission_mode: str | None = None
+    permission_suggestions: list[PermissionSuggestion] = Field(
+        default_factory=list[PermissionSuggestion]
+    )
 
 
 class PermissionDecisionPayload(BaseModel):
@@ -95,6 +123,16 @@ class StatusPayload(BaseModel):
     pane_id: str | None = None
     claude_session_id: str | None = None
     transcript_path: str | None = None
+    permission_prompt: bool = False
+
+
+class RaiserIdentity(BaseModel):
+    """Who raised an escalation: the one-at-a-time rule is per raiser."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    component: Literal["broker", "permission"]
+    session_id: str
 
 
 class Alternative(BaseModel):
@@ -120,6 +158,37 @@ class EscalationPayload(BaseModel):
     recommendation: str
     uncertainty: str
     what_would_change_my_mind: str
+    raiser: RaiserIdentity
+
+
+class PermissionEscalationPayload(BaseModel):
+    """broker -> master: a tool call the developer must answer in the pane.
+
+    Every field is required. A permission escalation the developer cannot act
+    on — no tool, no pane, no reason — is worse than no escalation at all.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    escalation_id: str
+    session_id: str
+    tool_name: str
+    tool_input: dict[str, Any]
+    task_intent: str
+    reason: str
+    raised_at: str  # ISO timestamp; every resolution signal is dated against it
+    raiser: RaiserIdentity
+    permission_suggestions: list[PermissionSuggestion] = Field(
+        default_factory=list[PermissionSuggestion]
+    )
+
+
+class PermissionLogPayload(BaseModel):
+    """broker -> master reply payload carrying a rendered permission log."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    text: str
 
 
 class CompletionPayload(BaseModel):

@@ -3,13 +3,31 @@
 import subprocess
 import sys
 import typing
+from typing import Any
+
+import pytest
+from pydantic import ValidationError
 
 from broker.protocol import constants
 from broker.protocol.constants import SessionState
 from broker.protocol.schemas import (
+    AddDirectoriesSuggestion,
     PermissionDecisionPayload,
+    PermissionEscalationPayload,
+    PermissionRequestPayload,
     StatusPayload,
 )
+
+COMPLETE_PERMISSION_ESCALATION: dict[str, Any] = {
+    "escalation_id": "esc-1",
+    "session_id": "s1",
+    "tool_name": "Bash",
+    "tool_input": {"command": "git push"},
+    "task_intent": "ship the parser fix",
+    "reason": "publishes work outside the working tree",
+    "raised_at": "2026-07-29T12:00:00Z",
+    "raiser": {"component": "permission", "session_id": "s1"},
+}
 
 
 def test_constants_import_without_pydantic() -> None:
@@ -47,3 +65,50 @@ def test_status_payload_extension_is_additive() -> None:
         transcript_path="/private/tmp/t.jsonl",
     )
     assert StatusPayload.model_validate_json(new.model_dump_json()) == new
+
+
+def test_permission_escalation_rejects_every_missing_field() -> None:
+    """Dropping any field must fail: a partial one cannot be acted on."""
+    assert PermissionEscalationPayload.model_validate(
+        COMPLETE_PERMISSION_ESCALATION
+    ).permission_suggestions == []
+    for omitted in COMPLETE_PERMISSION_ESCALATION:
+        partial = {
+            k: v
+            for k, v in COMPLETE_PERMISSION_ESCALATION.items()
+            if k != omitted
+        }
+        with pytest.raises(ValidationError):
+            PermissionEscalationPayload.model_validate(partial)
+
+
+def test_unknown_suggestion_arm_survives_as_a_dict() -> None:
+    """An arm the binary grew must not fail the request that carries it."""
+    payload = PermissionEscalationPayload.model_validate(
+        {
+            **COMPLETE_PERMISSION_ESCALATION,
+            "permission_suggestions": [
+                {"type": "addDirectories", "directories": ["/repo"]},
+                {"type": "somethingNewer", "detail": 7},
+            ],
+        }
+    )
+    known, unknown = payload.permission_suggestions
+    assert isinstance(known, AddDirectoriesSuggestion)
+    assert known.directories == ["/repo"]
+    assert unknown == {"type": "somethingNewer", "detail": 7}
+
+
+def test_permission_request_needs_no_tool_use_id() -> None:
+    """The live PermissionRequest payload carries no tool_use_id."""
+    payload = PermissionRequestPayload.model_validate(
+        {
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/repo/x.py"},
+            "cwd": "/repo",
+            "transcript_path": "/private/tmp/t.jsonl",
+        }
+    )
+    assert payload.permission_mode is None
+    assert payload.permission_suggestions == []
+    assert "tool_use_id" not in PermissionRequestPayload.model_fields
