@@ -65,19 +65,6 @@ resemblance to the nearest anchor.
   hardest case. A plan that is *under-specified* is yours to fill in: answer.
   A plan that appears *wrong* is the developer's to change: escalate.
 
-Permission-style anchors (the same framework governs tool approvals; a broker
-that approves a tool call is authorizing execution, including shell commands —
-an approval can bypass OS-level sandboxing, so treat it as real authority, not
-a formality):
-
-- Package installs consistent with the task — approve territory.
-- Running the project's own test/build/lint scripts — approve territory.
-- `git push`, publishing, deploying — escalate.
-- Deletion outside the working tree; recursive deletes beyond build artifacts —
-  escalate.
-- Network calls to hosts other than package registries — escalate.
-- Anything touching credentials, dotfiles, or CI configuration — escalate.
-
 ## 5. AskUserQuestion is not authoritative
 
 When the coding agent uses its question tool, that is the *agent's* judgment
