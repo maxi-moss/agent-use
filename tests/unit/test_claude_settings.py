@@ -6,14 +6,22 @@ from typing import Any
 
 import pytest
 
+from broker.claude.atomic import AtomicWriteError
 from broker.claude.settings import (
     BROKER_HOOK_MARKER,
     hook_entry,
     register_hooks,
     verify_and_repair,
+    write_session_permissions,
 )
 COMMAND = "/usr/bin/env python3 -m broker.hook  # broker-hook"
 EVENTS = ["PreToolUse", "Stop", "SessionStart"]
+
+RULES: dict[str, Any] = {
+    "allow": ["Read", "Glob"],
+    "ask": ["Bash(git push:*)"],
+    "deny": [],
+}
 
 # A realistic foreign entry mimicking Herdr's integration hook.
 FAKE_HERDR_ENTRY: dict[str, Any] = {
@@ -91,3 +99,44 @@ def test_verify_and_repair_clean_reports_nothing(tmp_path: Path) -> None:
     report = verify_and_repair(EVENTS, COMMAND, target)
     assert report.repaired_events == []
     assert report.warnings == []
+
+
+def test_session_permissions_creates_file_and_parents(tmp_path: Path) -> None:
+    target = tmp_path / "sessions" / "s1" / "claude-settings.json"
+    write_session_permissions(target, RULES)
+    assert json.loads(target.read_text()) == {"permissions": RULES}
+    # the temp file the atomic write renames from must not survive it
+    assert [p.name for p in target.parent.iterdir()] == [target.name]
+
+
+def test_session_permissions_leaves_foreign_keys_intact(tmp_path: Path) -> None:
+    target = tmp_path / "claude-settings.json"
+    before: dict[str, Any] = {
+        "model": "opus",
+        "env": {"SOMETHING": "1"},
+        "permissions": {"allow": ["Write"], "ask": [], "deny": []},
+    }
+    target.write_text(json.dumps(before, indent=2))
+    write_session_permissions(target, RULES)
+    after = json.loads(target.read_text())
+    assert after["model"] == "opus"
+    assert after["env"] == {"SOMETHING": "1"}
+    assert after["permissions"] == RULES
+
+
+def test_session_permissions_refuses_to_clobber_invalid_json(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "claude-settings.json"
+    target.write_text("{not json")
+    with pytest.raises(AtomicWriteError):
+        write_session_permissions(target, RULES)
+    assert target.read_text() == "{not json"
+
+
+def test_session_permissions_refuses_incomplete_rules(tmp_path: Path) -> None:
+    """A missing list must fail loud, not be written out as an empty one."""
+    target = tmp_path / "claude-settings.json"
+    with pytest.raises(ValueError):
+        write_session_permissions(target, {"allow": ["Read"]})
+    assert not target.exists()

@@ -1,4 +1,4 @@
-"""Hook registration + verify-and-repair on ~/.claude/settings.json.
+"""Claude Code settings writers: hook registration and per-session rules.
 
 Foreign entries — including Herdr's integration hook — are preserved verbatim.
 Settings scopes REPLACE the whole hooks array per event, they don't merge; a
@@ -17,6 +17,9 @@ from broker.protocol.constants import HOOK_SETTINGS_TIMEOUT
 
 # Substring of our hook command used to identify OUR entries during repair.
 BROKER_HOOK_MARKER = "broker-hook"
+
+# The three rule lists Claude Code reads out of a settings "permissions" block.
+_RULE_LISTS = ("allow", "ask", "deny")
 
 
 @dataclass
@@ -112,6 +115,32 @@ def register_hooks(
         return data
 
     atomic_update_json(target, mutate)
+
+
+def write_session_permissions(path: Path, rules: dict[str, Any]) -> None:
+    """Write one session's native permission rules to its own settings file.
+
+    Args:
+        path: Settings file to write; every key outside ``permissions`` is
+            left as it was found.
+        rules: Rule lists keyed ``allow``, ``ask`` and ``deny``.
+
+    Raises:
+        ValueError: ``rules`` is missing one of the three rule lists.
+    """
+    missing = [key for key in _RULE_LISTS if key not in rules]
+    if missing:
+        # Writing the absent lists as empty would hand the session a weaker
+        # rule set than the developer configured, silently.
+        raise ValueError(f"permission rules missing {missing}; refusing to write")
+    permissions = {key: list(rules[key]) for key in _RULE_LISTS}
+
+    def mutate(data: dict[str, Any]) -> dict[str, Any]:
+        """Replace the permissions block, leaving every other key alone."""
+        data["permissions"] = permissions
+        return data
+
+    atomic_update_json(path, mutate)
 
 
 def verify_and_repair(
