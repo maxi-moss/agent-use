@@ -16,13 +16,15 @@ from anthropic.types import (
     ToolParam,
 )
 from rich.text import Text
-from textual.widgets import Input, Static
+from textual import events
+from textual.widgets import Static
 
 from broker.config import BrokerConfig
 from broker.llm import TurnResult
 from broker.master.messages import EscalationArrived, PermissionEscalationArrived
 from broker.master.registry import Registry
 from broker.master.tui.app import BrokerMasterApp
+from broker.master.tui.prompt_widget import PromptArea
 from broker.protocol import client
 from broker.protocol.schemas import Envelope
 
@@ -86,8 +88,8 @@ async def test_submit_disables_input_and_worker_reenables(home: Path) -> None:
         await pilot.press(*"hello")
         await pilot.press("enter")
         await pilot.pause()
-        box = app.query_one("#box", Input)
-        assert box.value == ""
+        box = app.query_one("#box", PromptArea)
+        assert box.text == ""
         assert box.disabled is True  # locked while the LLM worker runs
         llm.release.set()
         await pilot.pause(0.1)
@@ -95,6 +97,37 @@ async def test_submit_disables_input_and_worker_reenables(home: Path) -> None:
         assert box.disabled is False  # re-enabled by on_worker_state_changed
         assert llm.calls == 1
         assert any("routing done" in t for t in chat_texts(app))
+
+
+async def test_paste_preserves_all_lines_and_submits_together(home: Path) -> None:
+    llm = GatedLLM(reply="ok")
+    app = make_app(home, llm)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.05)
+        box = app.query_one("#box", PromptArea)
+        box.focus()
+        app.post_message(events.Paste(text="line one\nline two"))
+        await pilot.pause()
+        assert box.text == "line one\nline two"  # not truncated to the first line
+        await pilot.press("enter")
+        await pilot.pause()
+        assert llm.calls == 1
+        assert any("line one\nline two" in t for t in chat_texts(app))
+
+
+async def test_ctrl_j_inserts_newline_without_submitting(home: Path) -> None:
+    llm = GatedLLM(reply="ok")
+    app = make_app(home, llm)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.05)
+        await pilot.click("#box")
+        await pilot.press(*"line one")
+        await pilot.press("ctrl+j")
+        await pilot.press(*"line two")
+        await pilot.pause()
+        box = app.query_one("#box", PromptArea)
+        assert box.text == "line one\nline two"
+        assert llm.calls == 0  # ctrl+j composed a line, it did not submit
 
 
 async def test_escalation_arrived_renders_exact_string(home: Path) -> None:
@@ -135,7 +168,7 @@ async def test_llm_worker_error_reenables_input_and_surfaces(
         await pilot.pause()
         llm.release.set()
         await pilot.pause(0.1)
-        box = app.query_one("#box", Input)
+        box = app.query_one("#box", PromptArea)
         assert box.disabled is False  # app survived, input usable (fail loud)
         assert any("master error" in t for t in chat_texts(app))
 

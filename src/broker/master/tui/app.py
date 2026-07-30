@@ -4,7 +4,7 @@ Structural rules encoded here:
 - The socket server is a plain asyncio task: created in on_mount, cancelled
   and awaited in on_unmount (never action_quit — bypassed by App.exit()).
 - The LLM turn runs under a worker with an explicit group ("llm"),
-  exclusive=True, exit_on_error=False; the Input is re-enabled in
+  exclusive=True, exit_on_error=False; the prompt box is re-enabled in
   on_worker_state_changed, never at the worker body's end.
 - Widgets receive pre-rendered STRINGS from the runtime via post_message —
   never a payload they could re-render (thin-master rule).
@@ -17,7 +17,7 @@ from typing import cast
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import VerticalScroll
-from textual.widgets import Input, RichLog, Static
+from textual.widgets import RichLog, Static
 from textual.worker import Worker, WorkerState
 
 from broker.config import BrokerConfig
@@ -34,12 +34,14 @@ from broker.master.messages import (
 )
 from broker.master.registry import Registry
 from broker.master.runtime import MasterRuntime
+from broker.master.tui.prompt_widget import PromptArea
 
 
 class BrokerMasterApp(App[None]):
     CSS = """
     #chat { height: 1fr; }
     #events { height: 10; }
+    #box { height: 5; }
     """
 
     def __init__(
@@ -64,13 +66,16 @@ class BrokerMasterApp(App[None]):
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="chat")
         yield RichLog(id="events", wrap=True)
-        yield Input(placeholder="task, decision, or question…", id="box")
+        yield PromptArea(
+            placeholder="task, decision, or question… (ctrl+j for newline)",
+            id="box",
+        )
 
     async def on_mount(self) -> None:
         self._server_task = asyncio.create_task(self.runtime.serve())
         for warning in self.startup_warnings:
             self._event_line(f"warning: {warning}")
-        self.query_one("#box", Input).focus()
+        self.query_one("#box", PromptArea).focus()
 
     async def on_unmount(self) -> None:
         if self._server_task is not None:
@@ -82,12 +87,13 @@ class BrokerMasterApp(App[None]):
 
     # ── developer input → LLM worker ─────────────────────────────────────────
 
-    def on_input_submitted(self, message: Input.Submitted) -> None:
-        text = message.value.strip()
+    def on_prompt_area_submitted(self, message: PromptArea.Submitted) -> None:
+        text = message.text.strip()
         if not text:
             return
-        message.input.clear()
-        message.input.disabled = True
+        box = self.query_one("#box", PromptArea)
+        box.clear()
+        box.disabled = True
         self._chat_block(f"you: {text}")
         self.run_worker(
             self._master_turn(text),
@@ -112,7 +118,7 @@ class BrokerMasterApp(App[None]):
             WorkerState.ERROR,
             WorkerState.CANCELLED,
         ):
-            self.query_one("#box", Input).disabled = False
+            self.query_one("#box", PromptArea).disabled = False
         if event.state is WorkerState.ERROR:
             # Fail loud; the app (and its socket server) survives.
             self._chat_block(f"[master error] {worker.error!r}")
