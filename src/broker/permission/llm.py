@@ -120,16 +120,15 @@ PERMISSION_TOOLS: list[ToolParam] = [
     strict_tool(
         "allow",
         "Let the tool call execute without interrupting the developer. Use"
-        " when the call is reversible, small in blast radius, and plainly"
-        " serves the stated task.",
+        " when the call reads without changing anything, or when being wrong"
+        " about it costs little and comes back cheaply.",
         AllowCall,
     ),
     strict_tool(
         "escalate",
         "Hand the tool call to the developer, who answers the prompt already"
-        " on screen. Use whenever the call is irreversible, wide in blast"
-        " radius, significant, unrelatable to the stated task, or you are"
-        " unsure.",
+        " on screen. Use when being wrong about the call would be expensive"
+        " or would not come back, or when you are unsure.",
         EscalateCall,
     ),
 ]
