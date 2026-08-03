@@ -576,8 +576,35 @@ async def test_retract_clears_slot_and_informs(
     )
     assert resp.ok
     assert runtime.slot.active is None
+    # Raising it set ESCALATED; leaving it there outlives the escalation and
+    # every later read of the registry is wrong about the session.
+    assert runtime.registry.get("s1").state == SessionState.DRIVING
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("resolved in pane" in t for t in notices)
+
+
+async def test_permission_retract_leaves_session_state_alone(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    # A permission escalation never set the state, so withdrawing it must not
+    # claim the session is driving when its broker knows otherwise.
+    runtime, _ = rt
+    assert (
+        await send(
+            runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
+        )
+    ).ok
+    record = runtime.registry.get("s1")
+    record.state = SessionState.BLOCKED_PERMISSION
+    runtime.registry.upsert(record)
+    assert (
+        await send(
+            runtime, T_RETRACT, {"escalation_id": "p1", "reason": "answered"}
+        )
+    ).ok
+    assert (
+        runtime.registry.get("s1").state == SessionState.BLOCKED_PERMISSION
+    )
 
 
 async def test_dispatch_aborts_on_stale_escalation(

@@ -465,7 +465,11 @@ class MasterRuntime:
             return self._ack(env, ok=True)
         if env.type == T_RETRACT:
             p = RetractPayload.model_validate(env.payload)
-            self.slot.retract(p.escalation_id)
+            cleared = self.slot.retract(p.escalation_id)
+            if isinstance(cleared, EscalationPayload):
+                # Raising it set ESCALATED here; withdrawing it must undo that
+                # or the registry outlives the escalation it describes.
+                self._set_state(name, SessionState.DRIVING)
             # If it was surfaced, the developer must learn it is no longer
             # live.
             self.app_post(
