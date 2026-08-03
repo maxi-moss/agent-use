@@ -30,7 +30,7 @@ _DIRECTIONS = frozenset({"right", "down"})
 # for interactive readiness" but does not: called immediately after a split,
 # it fails instantly with agent_pane_busy roughly half the time (verified
 # live, repeatedly, against herdr 0.7.5). This fixed delay is the workaround.
-_PANE_READY_DELAY_S = 1.0
+_PANE_READY_DELAY_S = 4.0
 
 # Slack over herdr's own --timeout, so herdr hits its deadline first and
 # reports a structured error instead of being killed mid-run by ours.
