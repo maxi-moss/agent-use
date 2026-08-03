@@ -528,10 +528,9 @@ class SessionBroker:
         """Route one Claude Code hook event to state changes or queued jobs.
 
         ``Stop`` carries the classification input as ``last_assistant_message``,
-        never the transcript tail, and is diverted to an out-of-band resolution
-        check while escalated. ``StopFailure`` is surfaced as fatal, not treated
-        as a completed turn. ``PreToolUse`` reaches this broker only for
-        ``AskUserQuestion``, whose native menu no broker can drive.
+        never the transcript tail. ``StopFailure`` is surfaced as fatal, not
+        treated as a completed turn. ``PreToolUse`` reaches this broker only
+        for ``AskUserQuestion``, whose native menu no broker can drive.
 
         Args:
             hook: Validated hook payload; ``raw`` is the untyped hook JSON.
@@ -543,10 +542,7 @@ class SessionBroker:
         elif name == "Stop":
             self._permission_prompt_pending = False
             message = str(raw.get("last_assistant_message", "") or "")
-            if self.state == SessionState.ESCALATED:
-                self.queue.put_nowait(self._check_out_of_band_resolution)
-            else:
-                self.queue.put_nowait(lambda: self._classify(message))
+            self.queue.put_nowait(lambda: self._on_turn_end(message))
         elif name == "StopFailure":
             error_class = str(
                 raw.get("matcher") or raw.get("error") or "stop_failure"
@@ -836,6 +832,24 @@ class SessionBroker:
         self._set_state(SessionState.ESCALATED)  # QUIESCENT until dispatch or retract
         await self._to_master(T_ESCALATION, payload.model_dump())
 
+    async def _on_turn_end(self, last_assistant_message: str) -> None:
+        """Triage one turn boundary, clearing a resolved escalation first.
+
+        The Stop that ends the turn the developer resolved in the pane is the
+        same Stop that carries the question they left unanswered. Retracting
+        without triaging it drops the boundary: the pane sits idle with nobody
+        driving it until the watchdog deadline expires.
+
+        Args:
+            last_assistant_message: ``last_assistant_message`` from the Stop
+                payload.
+        """
+        if self.state == SessionState.ESCALATED:
+            await self._check_out_of_band_resolution()
+            if self.state == SessionState.ESCALATED:
+                return  # still escalated: stay quiescent
+        await self._classify(last_assistant_message)
+
     async def _check_out_of_band_resolution(self) -> None:
         """Retract the active escalation if the developer already answered.
 
@@ -942,7 +956,6 @@ class SessionBroker:
         """
         if self.state == SessionState.ESCALATED:
             await self._check_out_of_band_resolution()
-            return
         if self.state not in ACTIVE_STATES:
             return
         events = self._read_transcript()

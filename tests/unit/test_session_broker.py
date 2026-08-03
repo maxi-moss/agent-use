@@ -670,6 +670,45 @@ async def test_ask_user_question_escalates_and_retracts_on_answer(
     await wait_state(harness.broker, "driving")
 
 
+async def test_stop_that_resolves_an_escalation_still_triages_its_turn(
+    harness: Harness,
+) -> None:
+    # The Stop ending the turn the developer answered in the pane is the same
+    # Stop carrying the question they left open. Retracting without triaging
+    # it strands the pane: no further hook is coming to trigger one.
+    await launch(harness)
+    tool_input: dict[str, Any] = {
+        "questions": [
+            {
+                "question": "Pick a color",
+                "header": "Color",
+                "options": [{"label": "Blue", "description": "calm"}],
+                "multiSelect": False,
+            }
+        ]
+    }
+    await client.notify(harness.sock, ask_user_env(ANSWERED_ASK_ID, tool_input))
+    escalation = await harness.master.wait_for(T_ESCALATION)
+    await wait_state(harness.broker, "escalated")
+    harness.run.calls.clear()
+
+    await harness.llm.results.put(ANSWER_RESULT)
+    await client.notify(
+        harness.sock,
+        hook_env("Stop", {"last_assistant_message": "Which auth provider?"}),
+    )
+    retract = await harness.master.wait_for(T_RETRACT)
+    assert retract.payload["escalation_id"] == escalation.payload["escalation_id"]
+    await harness.master.wait_for(T_BUDGET_UPDATE)
+    assert harness.run.drive_calls() == [
+        ["herdr", "agent", "prompt", "s1", "use oauth"],
+        ["herdr", "pane", "send-keys", "w3:p2", "enter"],
+    ]
+    triage_call = harness.llm.calls[-1]
+    content = cast(list[dict[str, Any]], triage_call["messages"][0]["content"])
+    assert "Which auth provider?" in content[-1]["text"]
+
+
 async def test_dispatch_decision_submits_and_resets_budget(
     harness: Harness,
 ) -> None:
