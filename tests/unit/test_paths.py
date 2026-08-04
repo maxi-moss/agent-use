@@ -8,6 +8,15 @@ from broker.paths import BrokerPaths
 from broker.config import ClassifierConfig, SessionBrokerConfig
 
 
+def test_escalation_queue_path() -> None:
+    """The queue file lives directly under the broker home."""
+    paths = BrokerPaths(Path("/private/tmp/broker-home"))
+    path = paths.escalation_queue
+    assert isinstance(path, Path)
+    assert path.parent == paths.home
+    assert path.name == "escalation-queue.json"
+
+
 def test_session_paths_follow_the_configured_home_not_the_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

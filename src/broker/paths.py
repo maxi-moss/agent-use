@@ -20,6 +20,11 @@ class BrokerPaths:
         return self.home / "registry.json"
 
     @property
+    def escalation_queue(self) -> Path:
+        """The persisted escalation queue."""
+        return self.home / "escalation-queue.json"
+
+    @property
     def master_socket(self) -> Path:
         """The master's listening socket."""
         return self.home / "master.sock"
