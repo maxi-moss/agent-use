@@ -22,6 +22,7 @@ from broker.herdr import driver
 from broker.paths import BrokerPaths
 from broker.llm import build_client
 from broker.master.llm import bind_call_turn
+from broker.master.queue import EscalationQueue, QueueError
 from broker.master.registry import Registry
 from broker.master.tui.app import BrokerMasterApp
 from broker.protocol.constants import SessionState
@@ -81,6 +82,10 @@ def main() -> None:
     paths = BrokerPaths(cfg.broker_home)
     logging_setup.configure(paths.master_log)
     registry = Registry.load(paths.registry)
+    try:
+        queue = EscalationQueue.load(paths.escalation_queue)
+    except QueueError as exc:
+        _fail(str(exc))
 
     # 2. Hook registration at USER level (never project-level),
     #    then verify-and-repair with candidate shadow paths.
@@ -108,6 +113,7 @@ def main() -> None:
     app = BrokerMasterApp(
         cfg,
         registry,
+        queue,
         llm_call,
         anchor_pane=anchor,
         startup_warnings=warnings,

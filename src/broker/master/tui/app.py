@@ -30,8 +30,10 @@ from broker.master.messages import (
     Notice,
     PermissionEscalationArrived,
     ProposalArrived,
+    QueueDepthChanged,
     SessionStatusChanged,
 )
+from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry
 from broker.master.runtime import MasterRuntime
 from broker.master.tui.prompt_widget import PromptArea
@@ -40,6 +42,7 @@ from broker.master.tui.prompt_widget import PromptArea
 class BrokerMasterApp(App[None]):
     CSS = """
     #chat { height: 1fr; }
+    #queue-depth { height: 1; }
     #events { height: 10; }
     #box { height: 5; }
     """
@@ -48,6 +51,7 @@ class BrokerMasterApp(App[None]):
         self,
         cfg: BrokerConfig,
         registry: Registry,
+        queue: EscalationQueue,
         llm_call: LLMCaller[TurnResult],
         *,
         anchor_pane: str,
@@ -58,13 +62,14 @@ class BrokerMasterApp(App[None]):
         self.registry = registry
         self.startup_warnings = list(startup_warnings or [])
         self.runtime = MasterRuntime(
-            self.post_message, registry, cfg, anchor_pane=anchor_pane
+            self.post_message, registry, queue, cfg, anchor_pane=anchor_pane
         )
         self.master_llm = MasterLLM(llm_call, self.runtime, cfg)
         self._server_task: asyncio.Task[None] | None = None
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="chat")
+        yield Static(Text("escalation queue: empty"), id="queue-depth")
         yield RichLog(id="events", wrap=True)
         yield PromptArea(
             placeholder="task, decision, or question… (ctrl+j for newline)",
@@ -164,6 +169,19 @@ class BrokerMasterApp(App[None]):
 
     def on_session_status_changed(self, message: SessionStatusChanged) -> None:
         self._event_line(f"{message.session_id} → {message.state}")
+
+    def on_queue_depth_changed(self, message: QueueDepthChanged) -> None:
+        # Ids and a count only — payloads live in the chat, when surfaced.
+        if message.depth == 0:
+            text = "escalation queue: empty"
+        elif message.waiting:
+            text = (
+                f"escalation queue: {message.depth} "
+                f"(waiting: {', '.join(message.waiting)})"
+            )
+        else:
+            text = f"escalation queue: {message.depth}"
+        self.query_one("#queue-depth", Static).update(Text(text))
 
     # ── helpers ──────────────────────────────────────────────────────────────
 

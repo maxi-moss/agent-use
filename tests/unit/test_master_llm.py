@@ -18,7 +18,9 @@ from anthropic.types import (
 from broker.config import BrokerConfig
 from broker.llm import ToolCall, TurnResult
 from broker.master.llm import MAX_TOOL_ROUNDS, MASTER_TOOLS, MasterLLM
+from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry, SessionRecord
+from broker.paths import BrokerPaths
 from broker.protocol.constants import SessionState
 from broker.master.runtime import (
     MasterRuntime,
@@ -38,7 +40,12 @@ class RecordingRuntime(MasterRuntime):
     """Real runtime object; session-control methods record instead of act."""
 
     def __init__(self, registry: Registry, cfg: BrokerConfig) -> None:
-        super().__init__(lambda _msg: None, registry, cfg, anchor_pane="%1")
+        queue = EscalationQueue.load(
+            BrokerPaths(cfg.broker_home).escalation_queue
+        )
+        super().__init__(
+            lambda _msg: None, registry, queue, cfg, anchor_pane="%1"
+        )
         self.spawned: list[tuple[str, str]] = []
         self.dispatched: list[tuple[str, str]] = []
         self.sent: list[tuple[str, str]] = []
@@ -189,7 +196,7 @@ async def test_intent_passes_through_unrewritten(
 async def test_decision_dispatches_with_active_escalation(
     runtime: RecordingRuntime,
 ) -> None:
-    runtime.slot.accept(ESCALATION)
+    runtime.queue.accept(ESCALATION)
     fake = FakeLLM(
         [
             TurnResult(
@@ -214,7 +221,7 @@ async def test_decision_dispatches_with_active_escalation(
 async def test_escalation_block_is_byte_identical(
     runtime: RecordingRuntime,
 ) -> None:
-    runtime.slot.accept(ESCALATION)
+    runtime.queue.accept(ESCALATION)
     fake = FakeLLM([TurnResult(text="ok")])
     master = make_master(runtime, fake)
     await master.handle_developer_message("what is s1 waiting on?")
@@ -227,7 +234,7 @@ async def test_escalation_block_is_byte_identical(
 async def test_active_permission_escalation_reaches_llm_context(
     runtime: RecordingRuntime,
 ) -> None:
-    runtime.slot.accept(PERMISSION_ESCALATION)
+    runtime.queue.accept(PERMISSION_ESCALATION)
     fake = FakeLLM([TurnResult(text="ok")])
     master = make_master(runtime, fake)
     await master.handle_developer_message("what is s1 waiting on?")
@@ -239,6 +246,30 @@ async def test_active_permission_escalation_reaches_llm_context(
             PERMISSION_ESCALATION, runtime.pane_of("s1")
         )
         in texts
+    )
+
+
+async def test_llm_context_carries_only_the_surfaced_head(
+    runtime: RecordingRuntime,
+) -> None:
+    runtime.queue.accept(ESCALATION)
+    runtime.queue.accept(PERMISSION_ESCALATION)
+    fake = FakeLLM([TurnResult(text="ok")])
+    master = make_master(runtime, fake)
+    await master.handle_developer_message("status?")
+    texts = _block_texts(fake.calls[0])
+    joined = "\n".join(texts)
+    # Exactly the surfaced head, as its own verbatim block.
+    assert render_escalation(ESCALATION) in texts
+    assert "e1" in joined
+    # The waiting escalation and the queue itself never enter LLM context.
+    assert "p1" not in joined
+    assert "queue" not in joined.lower()
+    assert (
+        render_permission_escalation(
+            PERMISSION_ESCALATION, runtime.pane_of("s1")
+        )
+        not in texts
     )
 
 

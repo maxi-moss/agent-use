@@ -1,4 +1,4 @@
-"""Master runtime layer: socket server, escalation slot, session
+"""Master runtime layer: socket server, escalation queue, session
 spawn/stop, dispatch with liveness-at-dispatch, and the ONLY
 renderers of broker payloads.
 
@@ -36,14 +36,19 @@ from broker.master.messages import (
     Notice,
     PermissionEscalationArrived,
     ProposalArrived,
+    QueueDepthChanged,
     SessionStatusChanged,
+)
+from broker.master.queue import (
+    EscalationQueue,
+    ProtocolViolation,
+    QueuePayload,
 )
 from broker.master.registry import Registry, SessionRecord
 from broker.protocol import client
 from broker.protocol.constants import (
     NACK_MALFORMED,
     NACK_PROTOCOL_VIOLATION,
-    NACK_SLOT_OCCUPIED,
     NACK_UNKNOWN_SESSION,
     SessionState,
     T_APPROVE_PROMPT,
@@ -98,10 +103,6 @@ SOCKET_PROBE_TIMEOUT_S = 2.0
 # Stands in for a pane the registry cannot name. A permission escalation is
 # still worth surfacing without it: the developer knows the session.
 PANE_UNKNOWN = "(pane unknown)"
-
-# Whatever a session broker or its permission module escalated. Both carry the
-# identity the slot rules read: escalation_id, session_id and raiser.
-SlotPayload = EscalationPayload | PermissionEscalationPayload
 
 # Failures the on-demand status probe absorbs into a warning line: a session
 # that cannot be reached must not fail the whole listing.
@@ -166,91 +167,6 @@ def _adoption_fields(record: SessionRecord) -> AdoptedSession:
         claude_session_id=claude_session_id,
         transcript_path=transcript_path,
     )
-
-
-class ProtocolViolation(Exception):
-    """A raiser broke the one-outstanding-escalation invariant."""
-
-
-class CapacityRefusal(Exception):
-    """The slot is full, and a different raiser wanted it."""
-
-
-class EscalationSlot:
-    """Single active escalation (accept / retract / resolve / active)."""
-
-    def __init__(self) -> None:
-        """Start with no escalation active."""
-        self._active: SlotPayload | None = None
-
-    @property
-    def active(self) -> SlotPayload | None:
-        """Return the escalation awaiting the developer, or ``None``."""
-        return self._active
-
-    def accept(self, payload: SlotPayload) -> None:
-        """Make ``payload`` the active escalation.
-
-        Args:
-            payload: The escalation to surface to the developer.
-
-        Raises:
-            ProtocolViolation: The raiser that holds the slot raised again —
-                it is expected to wait for its own escalation to resolve.
-            CapacityRefusal: Another raiser holds the slot. That is legitimate
-                behaviour on the raiser's part, so it is refused rather than
-                blamed.
-        """
-        if self._active is not None:
-            held = (
-                f"escalation {payload.escalation_id} arrived while "
-                f"{self._active.escalation_id} is active"
-            )
-            if self._active.raiser == payload.raiser:
-                raise ProtocolViolation(held)
-            raise CapacityRefusal(held)
-        self._active = payload
-
-    def retract(self, escalation_id: str) -> SlotPayload | None:
-        """Clear an escalation its session has withdrawn.
-
-        Args:
-            escalation_id: The escalation being withdrawn.
-
-        Returns:
-            The cleared payload, or ``None`` when it was not the active one.
-        """
-        return self._clear(escalation_id)
-
-    def resolve(self, escalation_id: str) -> SlotPayload | None:
-        """Clear an escalation the developer has decided.
-
-        Args:
-            escalation_id: The escalation that was answered.
-
-        Returns:
-            The cleared payload, or ``None`` when it was not the active one.
-        """
-        return self._clear(escalation_id)
-
-    def _clear(self, escalation_id: str) -> SlotPayload | None:
-        """Clear the active escalation when it matches ``escalation_id``.
-
-        Args:
-            escalation_id: The escalation expected to be active.
-
-        Returns:
-            The cleared payload, or ``None`` when a different escalation — or
-            none at all — was active.
-        """
-        if (
-            self._active is not None
-            and self._active.escalation_id == escalation_id
-        ):
-            cleared = self._active
-            self._active = None
-            return cleared
-        return None
 
 
 def render_escalation(p: EscalationPayload) -> str:
@@ -382,15 +298,17 @@ class MasterRuntime:
         self,
         app_post: AppPost,
         registry: Registry,
+        queue: EscalationQueue,
         cfg: BrokerConfig,
         *,
         anchor_pane: str,
     ) -> None:
-        """Wire the runtime to the TUI, the registry and the broker config.
+        """Wire the runtime to the TUI, the registry, the queue and the config.
 
         Args:
             app_post: Posts a Textual message to the app.
             registry: Loaded session registry.
+            queue: Loaded escalation queue.
             cfg: Broker configuration.
             anchor_pane: Herdr pane every spawned session is anchored to.
         """
@@ -398,7 +316,8 @@ class MasterRuntime:
         self.registry = registry
         self.cfg = cfg
         self.anchor_pane = anchor_pane
-        self.slot = EscalationSlot()
+        self.queue = queue
+        self._surfaced_id: str | None = None
         self.paths = BrokerPaths(cfg.broker_home)
         self.master_socket_path = self.paths.master_socket
         self.proposals: dict[str, PendingProposal] = {}
@@ -408,6 +327,10 @@ class MasterRuntime:
 
     async def serve(self) -> None:
         """Bind the master socket and serve until cancelled."""
+        # A head loaded from disk has never been announced in this process, so
+        # it surfaces here, exactly once.
+        self._publish_queue_state()
+        await self._surface_head()
         server = await serve_unix(self.master_socket_path, self.handle)
         async with server:
             await server.serve_forever()
@@ -465,19 +388,27 @@ class MasterRuntime:
             return self._ack(env, ok=True)
         if env.type == T_RETRACT:
             p = RetractPayload.model_validate(env.payload)
-            cleared = self.slot.retract(p.escalation_id)
+            cleared = self.queue.retract(p.escalation_id)
             if isinstance(cleared, EscalationPayload):
                 # Raising it set ESCALATED here; withdrawing it must undo that
                 # or the registry outlives the escalation it describes.
                 self._set_state(name, SessionState.DRIVING)
-            # If it was surfaced, the developer must learn it is no longer
-            # live.
-            self.app_post(
-                Notice(
-                    f"escalation {p.escalation_id} from session {name} "
-                    f"retracted: {p.reason}"
+            if (
+                cleared is not None
+                and cleared.escalation_id == self._surfaced_id
+            ):
+                # It was surfaced, so the developer must learn it is no
+                # longer live; a waiting entry they never saw retracts
+                # silently.
+                self._surfaced_id = None
+                self.app_post(
+                    Notice(
+                        f"escalation {p.escalation_id} from session {name} "
+                        f"retracted: {p.reason}"
+                    )
                 )
-            )
+            self._publish_queue_state()
+            await self._surface_head()
             return self._ack(env, ok=True)
         if env.type == T_PROMPT_PROPOSAL:
             p = PromptProposalPayload.model_validate(env.payload)
@@ -497,15 +428,15 @@ class MasterRuntime:
         return self._ack(env, ok=False)
 
     async def _on_escalation(self, env: Envelope, name: str) -> Response:
-        """Validate one escalation, make it active, and surface it.
+        """Validate one escalation, queue it, and surface it if it is next.
 
         Args:
             env: Envelope carrying the escalation payload.
             name: Session name from the envelope, used for rejection notices.
 
         Returns:
-            ``Response(ok=True)`` once live and announced, ``ok=False`` with a
-            reason code if rejected.
+            ``Response(ok=True)`` once live, ``ok=False`` with a reason code
+            if rejected.
         """
         try:
             p = EscalationPayload.model_validate(env.payload)
@@ -521,34 +452,27 @@ class MasterRuntime:
         unknown = self._reject_unknown_session(env, p.session_id, "escalation")
         if unknown is not None:
             return unknown
-        refused = self._accept_into_slot(env, p, "escalation")
+        refused = self._accept_into_queue(env, p)
         if refused is not None:
             return refused
         self._set_state(p.session_id, SessionState.ESCALATED)
-        self.app_post(
-            EscalationArrived(
-                p.session_id, p.escalation_id, render_escalation(p)
-            )
-        )
-        await self._notify(
-            notifier.notify_request,
-            f"Escalation from session {p.session_id}",
-            p.what_was_asked,
-        )
+        self._publish_queue_state()
+        await self._surface_head()
         return self._ack(env, ok=True)
 
     async def _on_permission_escalation(
         self, env: Envelope, name: str
     ) -> Response:
-        """Validate one permission escalation, make it active, and surface it.
+        """Validate one permission escalation, queue it, and surface it if it
+        is next.
 
         Args:
             env: Envelope carrying the permission-escalation payload.
             name: Session name from the envelope, used for rejection notices.
 
         Returns:
-            ``Response(ok=True)`` once live and announced, ``ok=False`` with a
-            reason code if rejected.
+            ``Response(ok=True)`` once live, ``ok=False`` with a reason code
+            if rejected.
         """
         try:
             p = PermissionEscalationPayload.model_validate(env.payload)
@@ -570,22 +494,11 @@ class MasterRuntime:
         )
         if unknown is not None:
             return unknown
-        refused = self._accept_into_slot(env, p, "permission escalation")
+        refused = self._accept_into_queue(env, p)
         if refused is not None:
             return refused
-        pane_id = self.registry.get(p.session_id).pane_id or PANE_UNKNOWN
-        self.app_post(
-            PermissionEscalationArrived(
-                p.session_id,
-                p.escalation_id,
-                render_permission_escalation(p, pane_id),
-            )
-        )
-        await self._notify(
-            notifier.notify_request,
-            f"Permission prompt in session {p.session_id}",
-            f"{p.tool_name} — answer it in pane {pane_id}",
-        )
+        self._publish_queue_state()
+        await self._surface_head()
         return self._ack(env, ok=True)
 
     def _reject_unknown_session(
@@ -607,28 +520,60 @@ class MasterRuntime:
         self.app_post(Notice(msg))
         return self._nack(env, msg, NACK_UNKNOWN_SESSION)
 
-    def _accept_into_slot(
-        self, env: Envelope, payload: SlotPayload, kind: str
+    def _accept_into_queue(
+        self, env: Envelope, payload: QueuePayload
     ) -> Response | None:
-        """Make ``payload`` active, or build the NACK refusing it.
+        """Queue ``payload``, or build the NACK refusing it.
 
         Args:
             env: Envelope being answered.
-            payload: The escalation offered to the slot.
-            kind: Word naming the escalation kind, used in the notice.
+            payload: The escalation offered to the queue.
 
         Returns:
             ``None`` once accepted, otherwise the NACK.
         """
         try:
-            self.slot.accept(payload)
+            self.queue.accept(payload)
         except ProtocolViolation as exc:
             self.app_post(Notice(f"PROTOCOL VIOLATION: {exc}"))
             return self._nack(env, str(exc), NACK_PROTOCOL_VIOLATION)
-        except CapacityRefusal as exc:
-            self.app_post(Notice(f"{kind} refused, slot occupied: {exc}"))
-            return self._nack(env, str(exc), NACK_SLOT_OCCUPIED)
         return None
+
+    def _publish_queue_state(self) -> None:
+        """Tell the TUI the queue's depth and which sessions are waiting."""
+        self.app_post(QueueDepthChanged(self.queue.depth, self.queue.waiting))
+
+    async def _surface_head(self) -> None:
+        """Render, announce and notify the queue's head, exactly once."""
+        head = self.queue.active
+        if head is None or head.escalation_id == self._surfaced_id:
+            return
+        self._surfaced_id = head.escalation_id
+        if isinstance(head, PermissionEscalationPayload):
+            pane_id = self.pane_of(head.session_id)
+            self.app_post(
+                PermissionEscalationArrived(
+                    head.session_id,
+                    head.escalation_id,
+                    render_permission_escalation(head, pane_id),
+                )
+            )
+            await self._notify(
+                notifier.notify_request,
+                f"Permission prompt in session {head.session_id}",
+                f"{head.tool_name} — answer it in pane {pane_id}",
+            )
+            return
+        self.app_post(
+            EscalationArrived(
+                head.session_id, head.escalation_id, render_escalation(head)
+            )
+        )
+        await self._notify(
+            notifier.notify_request,
+            f"Escalation from session {head.session_id}",
+            head.what_was_asked,
+        )
 
     # ── session control (LLM-layer tool implementations) ─────────────────────
 
@@ -789,7 +734,7 @@ class MasterRuntime:
         # Liveness is checked THE INSTANT before the write, not at
         # surface time. A stale dispatch is the worst failure this system
         # can produce.
-        active = self.slot.active
+        active = self.queue.active
         if active is None or active.escalation_id != escalation_id:
             msg = (
                 f"decision NOT dispatched — escalation {escalation_id} is "
@@ -826,8 +771,11 @@ class MasterRuntime:
         if rejected is not None:
             self.app_post(Notice(rejected))
             return rejected
-        self.slot.resolve(escalation_id)
+        self.queue.resolve(escalation_id)
+        self._surfaced_id = None
         self._set_state(record.name, SessionState.DRIVING)
+        self._publish_queue_state()
+        await self._surface_head()
         return f"decision dispatched to session {record.name}"
 
     async def send_prompt(self, session_id: str, text: str) -> str:
@@ -941,7 +889,7 @@ class MasterRuntime:
             except TimeoutError:
                 proc.terminate()
                 await proc.wait()
-        self._retract_stranded_permission_escalation(session_id)
+        await self._retract_stranded_permission_escalation(session_id)
         self._set_state(session_id, SessionState.STOPPED)
         return f"session {session_id} stopped"
 
@@ -1085,29 +1033,33 @@ class MasterRuntime:
                 )
             await asyncio.sleep(SOCKET_POLL_S)
 
-    def _retract_stranded_permission_escalation(self, session_id: str) -> None:
+    async def _retract_stranded_permission_escalation(
+        self, session_id: str
+    ) -> None:
         """Clear a permission escalation whose broker is gone.
 
         A permission escalation is withdrawn by the module that raised it once
         the native prompt is answered. With its broker stopped nothing is left
-        to withdraw it, and it would hold the slot indefinitely.
+        to withdraw it, and it would wait in the queue indefinitely.
 
         Args:
             session_id: Session whose broker was stopped or replaced.
         """
-        active = self.slot.active
-        if active is None:
+        cleared = self.queue.retract_for_raiser(
+            RaiserIdentity(component="permission", session_id=session_id)
+        )
+        if cleared is None:
             return
-        raiser = RaiserIdentity(component="permission", session_id=session_id)
-        if active.raiser != raiser:
-            return
-        self.slot.retract(active.escalation_id)
+        if cleared.escalation_id == self._surfaced_id:
+            self._surfaced_id = None
         self.app_post(
             Notice(
-                f"permission escalation {active.escalation_id} from session "
+                f"permission escalation {cleared.escalation_id} from session "
                 f"{session_id} retracted: its broker was stopped"
             )
         )
+        self._publish_queue_state()
+        await self._surface_head()
 
     def _set_state(self, name: str, state: SessionState) -> None:
         """Record a session's new state and tell the TUI.

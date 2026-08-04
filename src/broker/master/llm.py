@@ -321,7 +321,7 @@ class MasterLLM:
                 + self.runtime.render_registry_summary(),
             }
         ]
-        active = self.runtime.slot.active
+        active = self.runtime.queue.active
         if isinstance(active, PermissionEscalationPayload):
             blocks.append(
                 {"type": "text", "text": "# Active permission escalation"}

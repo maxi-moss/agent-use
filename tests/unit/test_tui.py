@@ -21,7 +21,12 @@ from textual.widgets import Static
 
 from broker.config import BrokerConfig
 from broker.llm import TurnResult
-from broker.master.messages import EscalationArrived, PermissionEscalationArrived
+from broker.master.messages import (
+    EscalationArrived,
+    PermissionEscalationArrived,
+    QueueDepthChanged,
+)
+from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry
 from broker.master.tui.app import BrokerMasterApp
 from broker.master.tui.prompt_widget import PromptArea
@@ -67,7 +72,8 @@ def home(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
 def make_app(home: Path, llm: GatedLLM) -> BrokerMasterApp:
     cfg = BrokerConfig(model_id="test-model", broker_home=home)
     registry = Registry.load(home / "registry.json")
-    return BrokerMasterApp(cfg, registry, llm, anchor_pane="%1")
+    queue = EscalationQueue.load(home / "escalation-queue.json")
+    return BrokerMasterApp(cfg, registry, queue, llm, anchor_pane="%1")
 
 
 def chat_texts(app: BrokerMasterApp) -> list[str]:
@@ -171,6 +177,20 @@ async def test_llm_worker_error_reenables_input_and_surfaces(
         box = app.query_one("#box", PromptArea)
         assert box.disabled is False  # app survived, input usable (fail loud)
         assert any("master error" in t for t in chat_texts(app))
+
+
+async def test_queue_depth_surface_updates_and_carries_no_payload(
+    home: Path,
+) -> None:
+    app = make_app(home, GatedLLM())
+    async with app.run_test() as pilot:
+        await pilot.pause(0.05)
+        app.post_message(QueueDepthChanged(2, ("s1",)))
+        await pilot.pause()
+        content = app.query_one("#queue-depth", Static).content
+        assert isinstance(content, Text)
+        # A count and session ids only — never escalation text.
+        assert content.plain == "escalation queue: 2 (waiting: s1)"
 
 
 async def test_app_mounts_serves_and_unmounts_cleanly(home: Path) -> None:

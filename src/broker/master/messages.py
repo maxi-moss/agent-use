@@ -61,6 +61,14 @@ class SessionStatusChanged(Message):
         self.state = state
 
 
+class QueueDepthChanged(Message):
+    def __init__(self, depth: int, waiting: tuple[str, ...]) -> None:
+        """Carry the escalation queue's depth and waiting sessions to the TUI."""
+        super().__init__()
+        self.depth = depth
+        self.waiting = waiting  # session ids behind the head, in order
+
+
 class LLMReply(Message):
     def __init__(self, text: str) -> None:
         """Carry the LLM layer's reply text to the TUI."""
