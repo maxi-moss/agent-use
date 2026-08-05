@@ -59,7 +59,7 @@ def _entry_is_ours(entry: Any) -> bool:
 def _ensure_registered(
     data: dict[str, Any], events: list[str], command: str
 ) -> list[str]:
-    """Append our entry for each event lacking one.
+    """Bring our entry for each event up to ``command``, adding it if absent.
 
     Args:
         data: Parsed settings object; mutated in place.
@@ -67,7 +67,7 @@ def _ensure_registered(
         command: Hook command to install; must contain ``BROKER_HOOK_MARKER``.
 
     Returns:
-        The event names that were repaired.
+        The event names that were added or rewritten.
 
     Raises:
         ValueError: ``command`` lacks the marker, or ``hooks``/an event's
@@ -90,9 +90,16 @@ def _ensure_registered(
                 f"settings hooks[{event!r}] is not a list; refusing to touch it"
             )
         entries = cast(list[Any], raw_entries)
-        if any(_entry_is_ours(entry) for entry in entries):
+        desired = hook_entry(command)
+        ours = [i for i, entry in enumerate(entries) if _entry_is_ours(entry)]
+        if not ours:
+            entries.append(desired)
+            added.append(event)
             continue
-        entries.append(hook_entry(command))
+        if all(entries[i] == desired for i in ours):
+            continue
+        for i in ours:
+            entries[i] = desired
         added.append(event)
     return added
 
@@ -172,7 +179,7 @@ def verify_and_repair(
     atomic_update_json(target, mutate)
     if report.repaired_events:
         report.warnings.append(
-            f"re-added missing broker hook entries for {report.repaired_events}"
+            f"re-registered broker hook entries for {report.repaired_events}"
         )
     # Settings scopes REPLACE the whole hooks array per event, they don't
     # merge — a project-level file defining an event without our marker

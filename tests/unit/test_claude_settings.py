@@ -93,6 +93,20 @@ def test_verify_and_repair_readds_removed_entry(tmp_path: Path) -> None:
     assert repaired["hooks"]["Stop"][1] == hook_entry(COMMAND)
 
 
+def test_changed_command_rewrites_existing_entry(tmp_path: Path) -> None:
+    target = tmp_path / "settings.json"
+    register_hooks(EVENTS, COMMAND, target)
+
+    new_command = f'[ -n "$BROKER_SOCKET" ] || exit 0; exec {COMMAND}'
+    report = verify_and_repair(EVENTS, new_command, target)
+    assert set(report.repaired_events) == set(EVENTS)
+
+    data = json.loads(target.read_text())
+    for event in EVENTS:
+        ours = [e for e in data["hooks"][event] if BROKER_HOOK_MARKER in json.dumps(e)]
+        assert ours == [hook_entry(new_command)]  # rewritten, not duplicated
+
+
 def test_verify_and_repair_clean_reports_nothing(tmp_path: Path) -> None:
     target = tmp_path / "settings.json"
     register_hooks(EVENTS, COMMAND, target)

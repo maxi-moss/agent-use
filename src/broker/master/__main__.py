@@ -89,7 +89,10 @@ def main() -> None:
 
     # 2. Hook registration at USER level (never project-level),
     #    then verify-and-repair with candidate shadow paths.
-    command = f"{sys.executable} -m broker.hook  # broker-hook"
+    command = (
+        f'[ -n "$BROKER_SOCKET" ] || exit 0; '
+        f"exec {sys.executable} -m broker.hook  # broker-hook"
+    )
     register_hooks(EVENTS, command)
     candidates = [
         Path(record.cwd) / ".claude" / "settings.json"
