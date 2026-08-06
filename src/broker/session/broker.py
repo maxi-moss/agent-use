@@ -30,7 +30,12 @@ from pydantic import ValidationError
 
 from broker import llm as llm_module
 from broker.llm import LLMCaller, ToolCall
-from broker.config import AdoptedSession, BrokerConfig, SessionBrokerConfig
+from broker.config import (
+    AdoptedSession,
+    BrokerConfig,
+    ResumedTask,
+    SessionBrokerConfig,
+)
 from broker.paths import BrokerPaths
 from broker.herdr import driver
 from broker.claude.paths import transcript_dir_for_cwd
@@ -235,12 +240,17 @@ class SessionBroker:
             await server.wait_closed()
 
     async def _launch(self) -> None:
-        """Take over or start a Claude session, then ground and submit the task.
+        """Take over or start a Claude session, then resume or ground the task.
 
         Raises:
             FatalSessionError: A fresh start saw no SessionStart hook event
                 within ``SESSION_BIND_TIMEOUT_S``.
         """
+        if self.cfg.resume is not None:
+            assert self.cfg.adopt is not None  # enforced by config validation
+            self._adopt(self.cfg.adopt)
+            self._resume(self.cfg.resume)
+            return
         if self.cfg.adopt is not None:
             self._adopt(self.cfg.adopt)
         else:
@@ -264,6 +274,28 @@ class SessionBroker:
             "adopted",
             "reassigned to a session that was already running",
             f"pane={adopt.pane_id} claude_session={adopt.claude_session_id}",
+        )
+
+    def _resume(self, resume: ResumedTask) -> None:
+        """Pick a persisted task back up where the previous broker left it.
+
+        No grounding, no proposal, no approval wait: the developer already
+        approved this prompt, and re-grounding it would propose it a second
+        time.
+
+        Args:
+            resume: The persisted approved prompt and completed-ness.
+        """
+        self.approved_prompt = resume.approved_prompt
+        # AFTER restoring the prompt, so the module judges the resumed task.
+        self.permission.set_intent(self._intent())
+        self._log(
+            "resumed",
+            "attached to a session whose previous broker is gone",
+            f"completed={resume.completed}",
+        )
+        self._set_state(
+            SessionState.COMPLETED if resume.completed else SessionState.DRIVING
         )
 
     async def _start_session(self) -> None:

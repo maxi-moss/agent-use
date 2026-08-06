@@ -64,6 +64,7 @@ class SessionState(StrEnum):
     ERROR = "error"
     STOPPED = "stopped"
     UNMANAGED = "unmanaged"
+    DEAD = "dead"
 
 
 # A session live enough to accept a decision or a prompt.

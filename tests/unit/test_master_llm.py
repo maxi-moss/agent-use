@@ -357,6 +357,7 @@ def test_master_tools_are_strict_and_complete() -> None:
         "stop_session",
         "reactivate_session",
         "reassign_session",
+        "attach_session",
     ]
     for tool in MASTER_TOOLS:
         assert tool.get("strict") is True

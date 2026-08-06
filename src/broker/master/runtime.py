@@ -20,14 +20,21 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import ValidationError
 from textual.message import Message
 
 from broker.claude.settings import write_session_permissions
 from broker.claude.trust import seed_trust
-from broker.config import AdoptedSession, BrokerConfig, SessionBrokerConfig
+from broker.config import (
+    AdoptedSession,
+    BrokerConfig,
+    ResumedTask,
+    SessionBrokerConfig,
+)
+from broker.herdr import driver
+from broker.herdr.driver import HerdrError
 from broker.paths import BrokerPaths
 from broker.master import notifier
 from broker.master.messages import (
@@ -99,6 +106,7 @@ REQUEST_TIMEOUT_S = 10.0
 STOP_WAIT_S = 10.0
 SOCKET_POLL_S = 0.1
 SOCKET_PROBE_TIMEOUT_S = 2.0
+PANE_PROBE_TIMEOUT_S = 5.0
 
 # Stands in for a pane the registry cannot name. A permission escalation is
 # still worth surfacing without it: the developer knows the session.
@@ -136,7 +144,7 @@ def _adoption_fields(record: SessionRecord) -> AdoptedSession:
     """Build the block a replacement broker needs to adopt a live session.
 
     Args:
-        record: Registry record of the session being reassigned.
+        record: Registry record of the session a replacement broker takes over.
 
     Returns:
         The pane id, Claude session id and transcript path, all present.
@@ -159,7 +167,7 @@ def _adoption_fields(record: SessionRecord) -> AdoptedSession:
             if not value
         )
         raise ValueError(
-            f"session {record.name} cannot be reassigned: the registry has no "
+            f"session {record.name} cannot be adopted: the registry has no "
             + ", ".join(missing)
         )
     return AdoptedSession(
@@ -167,6 +175,93 @@ def _adoption_fields(record: SessionRecord) -> AdoptedSession:
         claude_session_id=claude_session_id,
         transcript_path=transcript_path,
     )
+
+
+async def reconcile_registry(
+    registry: Registry, queue: EscalationQueue
+) -> list[str]:
+    """Classify every registry session at startup, retracting for dead ones.
+
+    Probes are client-side connects and pane reads only — nothing is spawned
+    and nothing binds a socket. A session whose pane is definitively gone is
+    marked dead and its queued escalations are retracted; every other outcome
+    leaves the session recoverable. An inconclusive probe never marks a
+    session dead — a wrong ``unmanaged`` costs the developer a glance, a
+    wrong ``dead`` throws away queued decisions.
+
+    Args:
+        registry: Loaded session registry; states are updated in place and
+            saved once.
+        queue: Persisted escalation queue; a dead session's queued
+            escalations are retracted from it before the TUI re-announces
+            the head.
+
+    Returns:
+        One classification line per session, plus one line per retraction.
+    """
+    warnings: list[str] = []
+    for name in sorted(registry.records):
+        record = registry.records[name]
+        if await _broker_is_listening(Path(record.socket_path)):
+            warnings.append(
+                f"session {name}: broker still answering — left as-is"
+            )
+            continue
+        if not record.pane_id:
+            record.state = SessionState.UNMANAGED
+            warnings.append(
+                f"session {name}: nothing answers its socket and the "
+                "registry never learned its pane — marked unmanaged"
+            )
+            continue
+        try:
+            await asyncio.to_thread(
+                driver.pane_read, record.pane_id, timeout_s=PANE_PROBE_TIMEOUT_S
+            )
+        except HerdrError as exc:
+            if exc.code == "pane_not_found":
+                record.state = SessionState.DEAD
+                warnings.append(
+                    f"session {name}: pane {record.pane_id} gone — marked dead"
+                )
+                for component in ("broker", "permission"):
+                    cleared = queue.retract_for_raiser(
+                        RaiserIdentity(component=component, session_id=name)
+                    )
+                    if cleared is not None:
+                        warnings.append(
+                            f"session {name}: queued escalation "
+                            f"{cleared.escalation_id} retracted — the session "
+                            "is dead and no decision can reach it"
+                        )
+                continue
+            record.state = SessionState.UNMANAGED
+            warnings.append(
+                f"session {name}: pane probe inconclusive ({exc}) — "
+                "marked unmanaged"
+            )
+            continue
+        except Exception as exc:
+            record.state = SessionState.UNMANAGED
+            warnings.append(
+                f"session {name}: pane probe inconclusive ({exc!r}) — "
+                "marked unmanaged"
+            )
+            continue
+        record.state = SessionState.UNMANAGED
+        line = (
+            f"session {name}: pane alive with nothing driving it — marked "
+            "unmanaged; recover it with attach_session"
+        )
+        if record.approved_prompt is None:
+            line += (
+                " (no approved prompt persisted — reassign_session with a "
+                "new task is the route instead)"
+            )
+        warnings.append(line)
+    if registry.records:
+        registry.save()
+    return warnings
 
 
 def render_escalation(p: EscalationPayload) -> str:
@@ -648,6 +743,66 @@ class MasterRuntime:
             f"session {session_id} reassigned to a new broker (pid {proc.pid})"
         )
 
+    async def attach_session(self, session_id: str) -> str:
+        """Bind a fresh broker to a session whose own broker is gone.
+
+        A pure resume: the persisted approved prompt and budget count carry
+        over untouched, no new intent is taken, no grounding runs and no
+        proposal comes back. The new broker reuses the session's socket path,
+        because ``BROKER_SOCKET`` was baked into the pane's environment when
+        it was split and cannot be changed afterwards.
+
+        Args:
+            session_id: Registry name of the session to reattach.
+
+        Returns:
+            A confirmation line naming the session and the new broker's pid.
+
+        Raises:
+            ValueError: The session is marked dead, the registry only partly
+                knows it, or no approved prompt was ever persisted for it.
+            RuntimeError: A broker is still answering on the session socket.
+        """
+        record = self.registry.get(session_id)
+        # Every refusal fires before any side effect.
+        if record.state == SessionState.DEAD:
+            raise ValueError(
+                f"session {session_id} is marked dead — its pane is gone, "
+                "so there is nothing left to attach to"
+            )
+        adopt = _adoption_fields(record)
+        if record.approved_prompt is None:
+            raise ValueError(
+                f"session {session_id} has no persisted approved prompt to "
+                "resume — its broker died before a prompt was approved. Use "
+                "reassign_session with a new task instead."
+            )
+        # One probe, never a poll: nothing was stopped, so waiting cannot
+        # free the socket. Anything alive or ambiguous refuses.
+        if await _broker_is_listening(Path(record.socket_path)):
+            raise RuntimeError(
+                f"session {session_id}: a broker is still answering on "
+                f"{record.socket_path} — refusing to attach"
+            )
+        # The dead broker's stranded escalations, both raiser identities: a
+        # decision dispatched to one would be discarded, and a live
+        # same-raiser entry would refuse the resumed broker's first
+        # escalation. It re-raises if the situation still holds.
+        await self._retract_stranded_escalation(session_id, "broker")
+        await self._retract_stranded_escalation(session_id, "permission")
+        resume = ResumedTask(
+            approved_prompt=record.approved_prompt,
+            completed=record.state == SessionState.COMPLETED,
+        )
+        proc = await self._spawn_broker(record, adopt=adopt, resume=resume)
+        record.pid = proc.pid
+        self._procs[session_id] = proc
+        self.registry.upsert(record)
+        self._set_state(session_id, SessionState.SPAWNING)
+        return (
+            f"session {session_id} reattached to a new broker (pid {proc.pid})"
+        )
+
     async def reactivate_session(self, session_id: str, intent: str) -> str:
         """Give a completed session a new task without replacing its broker.
 
@@ -889,7 +1044,7 @@ class MasterRuntime:
             except TimeoutError:
                 proc.terminate()
                 await proc.wait()
-        await self._retract_stranded_permission_escalation(session_id)
+        await self._retract_stranded_escalation(session_id, "permission")
         self._set_state(session_id, SessionState.STOPPED)
         return f"session {session_id} stopped"
 
@@ -963,7 +1118,11 @@ class MasterRuntime:
     # ── internals ────────────────────────────────────────────────────────────
 
     async def _spawn_broker(
-        self, record: SessionRecord, *, adopt: AdoptedSession | None
+        self,
+        record: SessionRecord,
+        *,
+        adopt: AdoptedSession | None,
+        resume: ResumedTask | None = None,
     ) -> asyncio.subprocess.Process:
         """Start a session-broker subprocess for ``record``.
 
@@ -972,6 +1131,8 @@ class MasterRuntime:
                 broker starts from.
             adopt: Pane, Claude session and transcript of a running session the
                 broker takes over; ``None`` starts a fresh one.
+            resume: Approved prompt and completed-ness the broker resumes
+                instead of grounding; ``None`` grounds a new task.
 
         Returns:
             The spawned process.
@@ -998,6 +1159,7 @@ class MasterRuntime:
             budget_max=self.cfg.budget_max,
             claude_settings_path=str(settings_path),
             adopt=adopt,
+            resume=resume,
         )
         # By module string, never by import — keeps the module boundary
         # structural.
@@ -1033,20 +1195,21 @@ class MasterRuntime:
                 )
             await asyncio.sleep(SOCKET_POLL_S)
 
-    async def _retract_stranded_permission_escalation(
-        self, session_id: str
+    async def _retract_stranded_escalation(
+        self, session_id: str, component: Literal["broker", "permission"]
     ) -> None:
-        """Clear a permission escalation whose broker is gone.
+        """Clear a queued escalation whose raiser died with the broker.
 
-        A permission escalation is withdrawn by the module that raised it once
-        the native prompt is answered. With its broker stopped nothing is left
-        to withdraw it, and it would wait in the queue indefinitely.
+        An escalation is normally withdrawn by the component that raised it.
+        With the broker gone nothing is left to withdraw it, and it would
+        wait in the queue indefinitely.
 
         Args:
-            session_id: Session whose broker was stopped or replaced.
+            session_id: Session whose broker is gone.
+            component: Raiser component whose live entry is cleared.
         """
         cleared = self.queue.retract_for_raiser(
-            RaiserIdentity(component="permission", session_id=session_id)
+            RaiserIdentity(component=component, session_id=session_id)
         )
         if cleared is None:
             return
@@ -1054,8 +1217,8 @@ class MasterRuntime:
             self._surfaced_id = None
         self.app_post(
             Notice(
-                f"permission escalation {cleared.escalation_id} from session "
-                f"{session_id} retracted: its broker was stopped"
+                f"escalation {cleared.escalation_id} from session "
+                f"{session_id} retracted: its broker is gone"
             )
         )
         self._publish_queue_state()

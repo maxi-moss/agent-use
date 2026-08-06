@@ -108,6 +108,12 @@ class ReassignSessionArgs(BaseModel):
     intent: str
 
 
+class AttachSessionArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+
+
 @dataclass(frozen=True, slots=True)
 class MasterTool[M: BaseModel]:
     """A master tool's wire schema paired with the runtime call it dispatches to."""
@@ -190,6 +196,16 @@ _REGISTRY = (
         "errored. Pass the developer's intent VERBATIM.",
         ReassignSessionArgs,
         lambda rt, a: rt.reassign_session(a.session_id, a.intent),
+    ),
+    MasterTool(
+        "attach_session",
+        "Reattach a broker to a session whose own broker died or was lost — "
+        "e.g. one marked unmanaged at startup or reported unreachable. "
+        "Resumes the session's existing task, approved prompt and budget "
+        "unchanged; takes NO new intent and returns no proposal. Refuses if "
+        "a live broker still answers.",
+        AttachSessionArgs,
+        lambda rt, a: rt.attach_session(a.session_id),
     ),
 )
 

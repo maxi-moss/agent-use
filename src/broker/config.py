@@ -11,7 +11,14 @@ import os
 from pathlib import Path
 from typing import Any, cast
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 
 def default_broker_home() -> Path:
@@ -116,6 +123,15 @@ class AdoptedSession(BaseModel):
     transcript_path: str
 
 
+class ResumedTask(BaseModel):
+    """The task a replacement broker resumes instead of grounding a new one."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    approved_prompt: str  # the persisted authoritative intent
+    completed: bool = False  # resume as completed so reactivation still works
+
+
 class SessionBrokerConfig(BaseModel):
     """Session broker process configuration, passed as --config-json at spawn."""
 
@@ -136,6 +152,25 @@ class SessionBrokerConfig(BaseModel):
     budget_max: int
     claude_settings_path: str  # written by the master; passed to `agent start`
     adopt: AdoptedSession | None = None  # set only when reassigned
+    resume: ResumedTask | None = None  # set only when attached
+
+    @model_validator(mode="after")
+    def _resume_requires_adopt(self) -> "SessionBrokerConfig":
+        """Reject a resume without an adopt block.
+
+        Returns:
+            The validated config.
+
+        Raises:
+            ValueError: ``resume`` is set without ``adopt`` — a broker cannot
+                resume a task in a session it did not adopt.
+        """
+        if self.resume is not None and self.adopt is None:
+            raise ValueError(
+                "resume requires adopt: a broker cannot resume a task in a "
+                "session it did not adopt"
+            )
+        return self
 
 
 class ConfigError(Exception):
