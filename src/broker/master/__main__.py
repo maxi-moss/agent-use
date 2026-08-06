@@ -24,8 +24,13 @@ from broker.llm import build_client
 from broker.master.llm import bind_call_turn
 from broker.master.queue import EscalationQueue, QueueError
 from broker.master.registry import Registry
+from broker.master.testmode import test_mode_llm_call
 from broker.master.tui.app import BrokerMasterApp
 from broker.protocol.constants import SessionState
+
+TEST_MODE_ANCHOR = "%test-mode"
+TEST_MODE_WARNING = "TEST MODE — synthetic traffic only; LLM disabled"
+SCENARIOS_DIR = Path("tests/scenarios")
 
 # Core hook events plus observability extras
 EVENTS = [
@@ -53,30 +58,39 @@ def main() -> None:
     parser.add_argument(
         "--anchor", help="anchor pane id (overrides HERDR_PANE_ID)"
     )
+    parser.add_argument(
+        "--test-mode",
+        action="store_true",
+        help="synthetic escalation mode: no LLM, no hooks, no live sessions",
+    )
     args = parser.parse_args()
 
-    # 1. Environment assertions — FAIL LOUD on any of them.
-    if os.environ.get("CLAUDE_CODE_SKIP_PROMPT_HISTORY"):
-        _fail("CLAUDE_CODE_SKIP_PROMPT_HISTORY is set; unset it first")
-    if os.environ.get("CLAUDE_CODE_CHILD_SESSION"):
-        _fail(
-            "CLAUDE_CODE_CHILD_SESSION is set — it silently disables "
-            "transcripts; unset it first"
-        )
-    if shutil.which("claude") is None:
-        _fail("`claude` is not on PATH")
-    if shutil.which("herdr") is None:
-        _fail("`herdr` is not on PATH")
-    try:
-        if not driver.status().compatible:
-            _fail("herdr client/server report incompatible")
-    except Exception as exc:
-        _fail(f"`herdr status` failed: {exc}")
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        _fail("ANTHROPIC_API_KEY is not set")
-    anchor = args.anchor or os.environ.get("HERDR_PANE_ID")
-    if not anchor:
-        _fail("HERDR_PANE_ID is not set and --anchor was not given")
+    # 1. Environment assertions — FAIL LOUD on any of them. Test mode has no
+    #    hooks, no LLM and no live sessions, so none of them apply.
+    if not args.test_mode:
+        if os.environ.get("CLAUDE_CODE_SKIP_PROMPT_HISTORY"):
+            _fail("CLAUDE_CODE_SKIP_PROMPT_HISTORY is set; unset it first")
+        if os.environ.get("CLAUDE_CODE_CHILD_SESSION"):
+            _fail(
+                "CLAUDE_CODE_CHILD_SESSION is set — it silently disables "
+                "transcripts; unset it first"
+            )
+        if shutil.which("claude") is None:
+            _fail("`claude` is not on PATH")
+        if shutil.which("herdr") is None:
+            _fail("`herdr` is not on PATH")
+        try:
+            if not driver.status().compatible:
+                _fail("herdr client/server report incompatible")
+        except Exception as exc:
+            _fail(f"`herdr status` failed: {exc}")
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            _fail("ANTHROPIC_API_KEY is not set")
+        anchor = args.anchor or os.environ.get("HERDR_PANE_ID")
+        if not anchor:
+            _fail("HERDR_PANE_ID is not set and --anchor was not given")
+    else:
+        anchor = args.anchor or os.environ.get("HERDR_PANE_ID") or TEST_MODE_ANCHOR
 
     cfg = broker_config.load()
     paths = BrokerPaths(cfg.broker_home)
@@ -87,32 +101,37 @@ def main() -> None:
     except QueueError as exc:
         _fail(str(exc))
 
-    # 2. Hook registration at USER level (never project-level),
-    #    then verify-and-repair with candidate shadow paths.
-    command = (
-        f'[ -n "$BROKER_SOCKET" ] || exit 0; '
-        f"exec {sys.executable} -m broker.hook  # broker-hook"
-    )
-    register_hooks(EVENTS, command)
-    candidates = [
-        Path(record.cwd) / ".claude" / "settings.json"
-        for record in registry.records.values()
-    ]
-    report = verify_and_repair(EVENTS, command, shadow_candidates=candidates)
-    warnings = list(report.warnings)
+    if args.test_mode:
+        warnings = [TEST_MODE_WARNING]
+        llm_call = test_mode_llm_call
+    else:
+        # 2. Hook registration at USER level (never project-level),
+        #    then verify-and-repair with candidate shadow paths.
+        command = (
+            f'[ -n "$BROKER_SOCKET" ] || exit 0; '
+            f"exec {sys.executable} -m broker.hook  # broker-hook"
+        )
+        register_hooks(EVENTS, command)
+        candidates = [
+            Path(record.cwd) / ".claude" / "settings.json"
+            for record in registry.records.values()
+        ]
+        report = verify_and_repair(EVENTS, command, shadow_candidates=candidates)
+        warnings = list(report.warnings)
 
-    # 3. Sessions found at startup are unmanaged.
-    for record in registry.records.values():
-        if record.state != SessionState.UNMANAGED:
-            record.state = SessionState.UNMANAGED
-            warnings.append(
-                f"session {record.name} found in registry — marked unmanaged"
-            )
-    if registry.records:
-        registry.save()
+        # 3. Sessions found at startup are unmanaged.
+        for record in registry.records.values():
+            if record.state != SessionState.UNMANAGED:
+                record.state = SessionState.UNMANAGED
+                warnings.append(
+                    f"session {record.name} found in registry — marked unmanaged"
+                )
+        if registry.records:
+            registry.save()
+
+        llm_call = bind_call_turn(build_client(cfg))
 
     # 4. Runtime and app built before run; runtime.serve() starts in on_mount.
-    llm_call = bind_call_turn(build_client(cfg))
     app = BrokerMasterApp(
         cfg,
         registry,
@@ -120,6 +139,7 @@ def main() -> None:
         llm_call,
         anchor_pane=anchor,
         startup_warnings=warnings,
+        scenarios_dir=SCENARIOS_DIR if args.test_mode else None,
     )
     app.run()
 
