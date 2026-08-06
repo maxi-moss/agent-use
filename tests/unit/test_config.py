@@ -2,14 +2,19 @@
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from broker.config import (
+    AdoptedSession,
     BrokerConfig,
     ClassifierConfig,
     ConfigError,
     PermissionRules,
+    ResumedTask,
+    SessionBrokerConfig,
     load,
 )
 
@@ -127,6 +132,55 @@ def test_load_overlay_carries_nested_permission_keys(
     assert cfg.classifier.max_tokens == 256
     assert cfg.classifier.model_id == "claude-haiku-4-5"  # untouched default
     assert cfg.permission_rules.deny == ["Bash(curl:*)"]
+
+
+def _session_config_kwargs() -> dict[str, Any]:
+    """Every required SessionBrokerConfig field, without adopt or resume."""
+    return {
+        "name": "s1",
+        "socket_path": "/private/tmp/s/s1.sock",
+        "master_socket_path": "/private/tmp/m.sock",
+        "broker_home": Path("/private/tmp/broker-home"),
+        "cwd": "/private/tmp/work",
+        "anchor_pane": "%1",
+        "intent": "the raw intent",
+        "model_id": "test-model",
+        "max_tokens": 1024,
+        "classifier": ClassifierConfig(),
+        "watchdog_seconds": 300.0,
+        "budget_max": 8,
+        "claude_settings_path": "/private/tmp/claude-settings.json",
+    }
+
+
+def test_resume_requires_adopt() -> None:
+    with pytest.raises(ValidationError) as exc:
+        SessionBrokerConfig(
+            **_session_config_kwargs(),
+            resume=ResumedTask(approved_prompt="the first task"),
+        )
+    assert "adopt" in str(exc.value)
+
+
+def test_resume_round_trips() -> None:
+    cfg = SessionBrokerConfig(
+        **_session_config_kwargs(),
+        budget_count=6,
+        adopt=AdoptedSession(
+            pane_id="w1:p1",
+            claude_session_id="cc-1",
+            transcript_path="/private/tmp/t.jsonl",
+        ),
+        resume=ResumedTask(approved_prompt="the first task", completed=True),
+    )
+    round_tripped = SessionBrokerConfig.model_validate_json(
+        cfg.model_dump_json()
+    )
+    assert round_tripped == cfg
+    assert round_tripped.resume is not None
+    assert round_tripped.resume.approved_prompt == "the first task"
+    assert round_tripped.resume.completed is True
+    assert round_tripped.budget_count == 6
 
 
 def test_overlay_with_a_self_defeating_rule_fails_loud(

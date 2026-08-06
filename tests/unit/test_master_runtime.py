@@ -1162,6 +1162,145 @@ async def test_reassign_refuses_while_a_broker_still_answers(
         await server.wait_closed()
 
 
+async def test_attach_spawns_a_resuming_broker(
+    rt: tuple[MasterRuntime, list[Any]], home: Path, spawn: RecordingSpawn
+) -> None:
+    runtime, _ = rt
+    record = _bind_session(runtime)
+    intent_before = record.intent
+    result = await runtime.attach_session("s1")
+    assert "reattached" in result
+    config = spawn.config()
+    assert config["name"] == "s1"
+    # The SAME socket path: BROKER_SOCKET was baked into the pane's
+    # environment at split time.
+    assert config["socket_path"] == record.socket_path
+    assert config["budget_count"] == 6
+    assert config["adopt"] == {
+        "pane_id": "w3:p2",
+        "claude_session_id": "cc-1",
+        "transcript_path": "/private/tmp/t.jsonl",
+    }
+    assert config["resume"] == {
+        "approved_prompt": "the first task",
+        "completed": False,
+    }
+    # Attach touches none of intent, approved prompt or budget — the diff
+    # against reassignment IS the feature.
+    reloaded = Registry.load(home / "registry.json").get("s1")
+    assert reloaded.intent == intent_before
+    assert reloaded.approved_prompt == "the first task"
+    assert reloaded.budget_count == 6
+    assert reloaded.state == "spawning"
+    assert reloaded.pid is not None
+
+
+async def test_attach_refuses_while_a_broker_still_answers(
+    rt: tuple[MasterRuntime, list[Any]], home: Path, spawn: RecordingSpawn
+) -> None:
+    runtime, _ = rt
+    _bind_session(runtime)
+    stub = StubSession()
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        with pytest.raises(RuntimeError) as exc:
+            await runtime.attach_session("s1")
+        assert "refusing to attach" in str(exc.value)
+        assert spawn.argvs == []
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_attach_refuses_a_session_it_only_partly_knows(
+    rt: tuple[MasterRuntime, list[Any]], spawn: RecordingSpawn
+) -> None:
+    runtime, _ = rt
+    record = runtime.registry.get("s1")
+    record.pane_id = "w3:p2"  # no claude session id, no transcript path
+    runtime.registry.upsert(record)
+    with pytest.raises(ValueError) as exc:
+        await runtime.attach_session("s1")
+    assert "claude_session_id" in str(exc.value)
+    assert "transcript_path" in str(exc.value)
+    assert spawn.argvs == []
+    assert runtime.registry.get("s1").state == "driving"
+
+
+async def test_attach_refuses_without_an_approved_prompt(
+    rt: tuple[MasterRuntime, list[Any]], spawn: RecordingSpawn
+) -> None:
+    runtime, _ = rt
+    record = _bind_session(runtime)
+    record.approved_prompt = None
+    runtime.registry.upsert(record)
+    with pytest.raises(ValueError) as exc:
+        await runtime.attach_session("s1")
+    # A broker that died before approval left nothing to resume; the refusal
+    # names the route that takes a new task.
+    assert "reassign_session" in str(exc.value)
+    assert spawn.argvs == []
+
+
+async def test_attach_refuses_a_dead_session(
+    rt: tuple[MasterRuntime, list[Any]], spawn: RecordingSpawn
+) -> None:
+    runtime, _ = rt
+    record = _bind_session(runtime)
+    record.state = SessionState.DEAD
+    runtime.registry.upsert(record)
+    with pytest.raises(ValueError) as exc:
+        await runtime.attach_session("s1")
+    assert "dead" in str(exc.value)
+    assert spawn.argvs == []
+
+
+async def test_attach_resumes_completed(
+    rt: tuple[MasterRuntime, list[Any]], spawn: RecordingSpawn
+) -> None:
+    runtime, _ = rt
+    record = _bind_session(runtime)
+    record.state = SessionState.COMPLETED
+    runtime.registry.upsert(record)
+    await runtime.attach_session("s1")
+    # Resumed as completed, so reactivate_session still applies afterwards.
+    assert spawn.config()["resume"] == {
+        "approved_prompt": "the first task",
+        "completed": True,
+    }
+
+
+async def test_attach_retracts_stranded_escalations(
+    rt: tuple[MasterRuntime, list[Any]], spawn: RecordingSpawn
+) -> None:
+    runtime, posts = rt
+    _bind_session(runtime)
+    # Another session's escalation must survive: attaching s1 says nothing
+    # about it.
+    other = PermissionEscalationPayload.model_validate(
+        permission_escalation_dict("p9", "s9")
+    )
+    runtime.queue.accept(other)
+    runtime.queue.accept(
+        EscalationPayload.model_validate(escalation_dict("e1", "s1"))
+    )
+    runtime.queue.accept(
+        PermissionEscalationPayload.model_validate(
+            permission_escalation_dict("p1", "s1")
+        )
+    )
+    await runtime.attach_session("s1")
+    assert spawn.argvs != []  # the refusals all passed and a broker spawned
+    # Both raiser identities retracted: a live same-raiser entry would refuse
+    # the resumed broker's first escalation, and a dispatched decision would
+    # be discarded to its log.
+    assert runtime.queue.depth == 1
+    assert runtime.queue.active is other
+    notices = [m.text for m in posts if isinstance(m, Notice)]
+    assert any("e1" in t and "retracted" in t for t in notices)
+    assert any("p1" in t and "retracted" in t for t in notices)
+
+
 async def test_reactivate_relays_the_intent_and_supersedes_the_old_one(
     rt: tuple[MasterRuntime, list[Any]], home: Path
 ) -> None:

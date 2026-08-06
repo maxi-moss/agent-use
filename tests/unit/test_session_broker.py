@@ -38,7 +38,12 @@ from broker.protocol.constants import (
 from broker.protocol.schemas import Envelope, Response
 from broker.protocol.server import serve_unix
 from broker.session.broker import SessionBroker
-from broker.config import AdoptedSession, ClassifierConfig, SessionBrokerConfig
+from broker.config import (
+    AdoptedSession,
+    ClassifierConfig,
+    ResumedTask,
+    SessionBrokerConfig,
+)
 from broker.paths import BrokerPaths
 
 FIXTURES = Path(__file__).parent.parent / "fixtures"
@@ -53,6 +58,7 @@ ANSWERED_ASK_ID = "toolu_01JkpyNV1bx66fUu8xkoanws"
 # to starting its own session would show it.
 ADOPTED_PANE = "w9:p9"
 ADOPTED_SESSION = "cc-adopted"
+RESUMED_PROMPT = "the approved first task"
 
 ANSWER_RESULT = ToolCall(
     name="answer", input={"reasoning": "grounded", "answer": "use oauth"}
@@ -266,7 +272,12 @@ def home(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
 
 @asynccontextmanager
 async def _harness(
-    home: Path, monkeypatch: pytest.MonkeyPatch, *, adopt: bool
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    adopt: bool,
+    resume: ResumedTask | None = None,
+    budget_count: int = 0,
 ) -> AsyncGenerator[Harness]:
     transcript = home / "t.jsonl"
     shutil.copy(TRANSCRIPT_FIXTURE, transcript)
@@ -287,6 +298,7 @@ async def _harness(
         cwd=str(cwd),
         anchor_pane="w3:p1",
         intent="the raw intent",
+        budget_count=budget_count,
         model_id="test-model",
         max_tokens=1024,
         classifier=ClassifierConfig(model_id="test-classifier"),
@@ -302,6 +314,7 @@ async def _harness(
             if adopt
             else None
         ),
+        resume=resume,
     )
     broker = SessionBroker(
         cfg,
@@ -354,6 +367,20 @@ async def adopted(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> AsyncIterator[Harness]:
     async with _harness(home, monkeypatch, adopt=True) as h:
+        yield h
+
+
+@pytest.fixture
+async def resumed(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[Harness]:
+    async with _harness(
+        home,
+        monkeypatch,
+        adopt=True,
+        resume=ResumedTask(approved_prompt=RESUMED_PROMPT),
+        budget_count=6,
+    ) as h:
         yield h
 
 
@@ -829,6 +856,52 @@ async def test_adopted_broker_takes_over_without_touching_the_pane(
     assert resp.payload["pane_id"] == ADOPTED_PANE
     assert resp.payload["claude_session_id"] == ADOPTED_SESSION
     assert resp.payload["transcript_path"] == str(adopted.transcript)
+
+
+async def test_resume_skips_grounding(resumed: Harness) -> None:
+    # No grounding, no proposal, no pane write: there is no new task, and the
+    # developer already approved this prompt once.
+    await wait_state(resumed.broker, "driving")
+    assert resumed.llm.calls == []
+    assert resumed.run.calls == []
+    assert resumed.master.of_type(T_PROMPT_PROPOSAL) == []
+    assert resumed.broker.approved_prompt == RESUMED_PROMPT
+    # The permission module judges against the resumed task, not the raw
+    # intent the config also carries.
+    assert resumed.broker.permission.intent == RESUMED_PROMPT
+
+
+async def test_resume_restores_completed(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with _harness(
+        home,
+        monkeypatch,
+        adopt=True,
+        resume=ResumedTask(approved_prompt=RESUMED_PROMPT, completed=True),
+    ) as h:
+        await wait_state(h.broker, "completed")
+        assert h.llm.calls == []
+        # A resumed-completed session still takes a new task the normal way.
+        assert (await reactivate(h, "now write the docs")).ok is True
+        await ground_and_approve(h, count=1, prompt="THE SECOND TASK")
+        assert h.run.drive_calls() == [
+            ["herdr", "agent", "prompt", "s1", "THE SECOND TASK"],
+            ["herdr", "pane", "send-keys", ADOPTED_PANE, "enter"],
+        ]
+
+
+async def test_resume_budget_continues(resumed: Harness) -> None:
+    await wait_state(resumed.broker, "driving")
+    await client.notify(
+        resumed.sock,
+        hook_env("Stop", {"last_assistant_message": "Which auth provider?"}),
+    )
+    await resumed.llm.results.put(ANSWER_RESULT)
+    budget = await resumed.master.wait_for(T_BUDGET_UPDATE)
+    # The persisted count continues; a reattach must not refill the budget.
+    assert budget.payload == {"count": 7}
+    assert resumed.broker.budget_count == 7
 
 
 async def test_reactivate_grounds_new_task_and_supersedes_the_old_intent(
