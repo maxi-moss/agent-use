@@ -1,0 +1,8 @@
+{
+  "name": "attach-refusal",
+  "steps": [
+    {"op": "seed_session", "name": "s1", "pane_id": "w1:p1", "claude_session_id": "cs-1", "transcript_path": "/private/tmp/transcript.jsonl"},
+    {"op": "start_socket", "session": "s1"},
+    {"op": "reassign", "session": "s1", "intent": "a fresh task"}
+  ]
+}

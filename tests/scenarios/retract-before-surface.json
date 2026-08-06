@@ -1,0 +1,15 @@
+{
+  "name": "retract-before-surface",
+  "steps": [
+    {"op": "seed_session", "name": "s1"},
+    {"op": "seed_session", "name": "s2"},
+    {"op": "start_socket", "session": "s1"},
+    {"op": "escalate", "session": "s1", "escalation_id": "e1", "expect": "ack"},
+    {"op": "escalate", "session": "s2", "escalation_id": "e2", "expect": "ack"},
+    {"op": "assert_surfaced", "escalation_id": "e1"},
+    {"op": "retract", "session": "s2", "escalation_id": "e2", "reason": "resolved in the pane"},
+    {"op": "dispatch", "escalation_id": "e1", "decision": "go ahead", "expect": "dispatched"},
+    {"op": "assert_never_surfaced", "escalation_id": "e2"},
+    {"op": "assert_depth", "depth": 0, "waiting": []}
+  ]
+}

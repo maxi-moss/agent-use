@@ -1,0 +1,13 @@
+{
+  "name": "dispatch-race",
+  "steps": [
+    {"op": "seed_session", "name": "s1"},
+    {"op": "start_socket", "session": "s1"},
+    {"op": "escalate", "session": "s1", "escalation_id": "e1", "expect": "ack"},
+    {"op": "assert_surfaced", "escalation_id": "e1"},
+    {"op": "retract", "session": "s1", "escalation_id": "e1", "reason": "resolved in the pane while the answer was in flight"},
+    {"op": "dispatch", "escalation_id": "e1", "decision": "go ahead", "expect": "refused"},
+    {"op": "assert_no_dispatch_write", "session": "s1"},
+    {"op": "assert_depth", "depth": 0, "waiting": []}
+  ]
+}

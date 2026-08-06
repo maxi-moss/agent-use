@@ -1,0 +1,11 @@
+{
+  "name": "broker-death",
+  "steps": [
+    {"op": "seed_session", "name": "s1"},
+    {"op": "seed_session", "name": "s2"},
+    {"op": "start_socket", "session": "s1"},
+    {"op": "start_socket", "session": "s2"},
+    {"op": "stop_socket", "session": "s1"},
+    {"op": "assert_unreachable", "session": "s1"}
+  ]
+}

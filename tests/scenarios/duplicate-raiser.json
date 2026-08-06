@@ -1,0 +1,11 @@
+{
+  "name": "duplicate-raiser",
+  "steps": [
+    {"op": "seed_session", "name": "s1"},
+    {"op": "escalate", "session": "s1", "escalation_id": "e1", "expect": "ack"},
+    {"op": "assert_surfaced", "escalation_id": "e1"},
+    {"op": "escalate", "session": "s1", "escalation_id": "e2", "expect": "nack:protocol_violation"},
+    {"op": "assert_never_surfaced", "escalation_id": "e2"},
+    {"op": "assert_depth", "depth": 1, "waiting": []}
+  ]
+}

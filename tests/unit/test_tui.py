@@ -2,6 +2,7 @@
 /private/tmp and a scripted fake LLM."""
 
 import asyncio
+import json
 import tempfile
 import uuid
 from collections.abc import Iterator
@@ -191,6 +192,62 @@ async def test_queue_depth_surface_updates_and_carries_no_payload(
         assert isinstance(content, Text)
         # A count and session ids only — never escalation text.
         assert content.plain == "escalation queue: 2 (waiting: s1)"
+
+
+async def test_inject_runs_a_scenario_end_to_end(home: Path) -> None:
+    scenarios_dir = home / "scenarios"
+    scenarios_dir.mkdir()
+    (scenarios_dir / "smoke.json").write_text(
+        json.dumps(
+            {
+                "name": "smoke",
+                "steps": [
+                    {"op": "seed_session", "name": "s1"},
+                    {"op": "start_socket", "session": "s1"},
+                    {
+                        "op": "escalate",
+                        "session": "s1",
+                        "escalation_id": "e1",
+                        "expect": "ack",
+                    },
+                    {"op": "assert_surfaced", "escalation_id": "e1"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = BrokerConfig(model_id="test-model", broker_home=home)
+    registry = Registry.load(home / "registry.json")
+    queue = EscalationQueue.load(home / "escalation-queue.json")
+    app = BrokerMasterApp(
+        cfg,
+        registry,
+        queue,
+        GatedLLM(),
+        anchor_pane="%1",
+        scenarios_dir=scenarios_dir,
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)  # let the master socket bind
+        box = app.query_one("#box", PromptArea)
+        box.focus()
+        box.text = "/inject smoke"
+        await pilot.press("enter")
+        # The scenario drives real escalations over the socket; a single
+        # pause is CPU-idle detection, not a drain, so poll for the summary.
+        for _ in range(200):
+            await pilot.pause(0.05)
+            if any(
+                "scenario smoke: PASS" in t for t in chat_texts(app)
+            ):
+                break
+        else:
+            raise AssertionError(
+                f"scenario summary never rendered; chat: {chat_texts(app)}"
+            )
+        # The escalation itself surfaced into the chat, one block, verbatim.
+        assert any("Escalation e1 — session s1" in t for t in chat_texts(app))
+        assert app.query_one("#box", PromptArea).disabled is False
 
 
 async def test_app_mounts_serves_and_unmounts_cleanly(home: Path) -> None:

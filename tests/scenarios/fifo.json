@@ -1,0 +1,27 @@
+{
+  "name": "fifo",
+  "steps": [
+    {"op": "seed_session", "name": "s1"},
+    {"op": "seed_session", "name": "s2"},
+    {"op": "seed_session", "name": "s3"},
+    {"op": "start_socket", "session": "s1"},
+    {"op": "start_socket", "session": "s2"},
+    {"op": "start_socket", "session": "s3"},
+    {"op": "escalate", "session": "s1", "escalation_id": "e1", "expect": "ack"},
+    {"op": "escalate", "session": "s2", "escalation_id": "e2", "expect": "ack"},
+    {"op": "escalate", "session": "s3", "escalation_id": "e3", "expect": "ack"},
+    {"op": "assert_surfaced", "escalation_id": "e1"},
+    {"op": "assert_depth", "depth": 3, "waiting": ["s2", "s3"]},
+    {"op": "permission_escalate", "session": "s1", "escalation_id": "p1", "tool_name": "Bash", "tool_input": {"command": "rm work"}, "raised_at": "2026-07-29T12:00:00+00:00", "expect": "ack"},
+    {"op": "assert_depth", "depth": 4, "waiting": ["s2", "s3", "s1"]},
+    {"op": "dispatch", "escalation_id": "e1", "decision": "go ahead", "expect": "dispatched"},
+    {"op": "assert_surfaced", "escalation_id": "e2"},
+    {"op": "dispatch", "escalation_id": "e2", "decision": "go ahead", "expect": "dispatched"},
+    {"op": "assert_surfaced", "escalation_id": "e3"},
+    {"op": "dispatch", "escalation_id": "e3", "decision": "go ahead", "expect": "dispatched"},
+    {"op": "assert_surfaced", "escalation_id": "p1"},
+    {"op": "retract", "session": "s1", "escalation_id": "p1", "reason": "answered in the pane"},
+    {"op": "assert_depth", "depth": 0, "waiting": []},
+    {"op": "assert_isolated"}
+  ]
+}
