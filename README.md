@@ -53,6 +53,22 @@ Configuration is optional. Defaults live in `BrokerConfig` (`src/broker/config.p
 
 Diagnostic logs are written to files, never to the terminal — the master's TUI owns that display. Follow a run with `tail -f "$BROKER_HOME"/logs/master.log`.
 
+## Test mode
+
+```bash
+uv run python -m broker.master --test-mode
+```
+
+Test mode drives synthetic escalations through the **real** master — the real TUI, socket server, runtime handlers, and persisted queue. Everything above the socket is left out: no LLM, no hooks, no herdr, no Claude Code, no live sessions. So none of the startup requirements above apply — no `ANTHROPIC_API_KEY`, nothing on `PATH` — and it never writes `~/.claude/settings.json`.
+
+Inside the TUI, `/inject <scenario>` runs one scenario from `tests/scenarios/*.json` and reports each step, ending in a `PASS`/`FAIL` summary. Run the master from the repo root, since `/inject` resolves scenario files relative to the working directory. `/inject` with an unknown or missing name prints the available scenarios.
+
+The same scenarios run headless as part of the test suite:
+
+```bash
+uv run pytest tests/scenarios -v
+```
+
 ## Source tree
 
 ```bash
@@ -64,12 +80,14 @@ src/broker/
   hook/          Claude Code hook client
   session/       Session broker: triage, watchdog, decision log
   master/        Master: runtime, registry, routing LLM, TUI
+    testmode/    Synthetic escalation mode: --test-mode and /inject
   herdr/         Herdr CLI driver
   transcript/    Transcript reading: raw JSONL -> validated events
   claude/        Claude Code config: paths, settings, trust
 tests/
   unit/          Fast, no I/O
   integration/   Real subprocess and IO boundaries
+  scenarios/     Test-mode scenarios, run through the real master
 ```
 
 Each package's `__init__.py` or primary module carries a docstring explaining what
