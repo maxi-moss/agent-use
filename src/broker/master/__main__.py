@@ -1,14 +1,17 @@
 """broker-master entrypoint. Startup sequence — ORDER IS BINDING:
 environment assertions → hook registration (user level) + verify-and-repair →
-registry load with unmanaged marking → runtime/app built → App.run() (the
-socket server starts inside on_mount).
+registry reconciliation (probe, classify, retract — never spawn) →
+runtime/app built → App.run() (the socket server starts inside on_mount).
 
 The registry file is READ before hook registration only to supply candidate
-shadow paths (known cwds are needed here); the unmanaged marking and save
-happen in their bound position, after verify-and-repair.
+shadow paths (known cwds are needed here); reconciliation and its save happen
+in their bound position, after verify-and-repair and before the app is built,
+so a dead session's retracted escalations are gone from disk before the
+runtime re-announces the persisted head.
 """
 
 import argparse
+import asyncio
 import os
 import shutil
 import sys
@@ -24,9 +27,9 @@ from broker.llm import build_client
 from broker.master.llm import bind_call_turn
 from broker.master.queue import EscalationQueue, QueueError
 from broker.master.registry import Registry
+from broker.master.runtime import reconcile_registry
 from broker.master.testmode import test_mode_llm_call
 from broker.master.tui.app import BrokerMasterApp
-from broker.protocol.constants import SessionState
 
 TEST_MODE_ANCHOR = "%test-mode"
 TEST_MODE_WARNING = "TEST MODE — synthetic traffic only; LLM disabled"
@@ -119,15 +122,8 @@ def main() -> None:
         report = verify_and_repair(EVENTS, command, shadow_candidates=candidates)
         warnings = list(report.warnings)
 
-        # 3. Sessions found at startup are unmanaged.
-        for record in registry.records.values():
-            if record.state != SessionState.UNMANAGED:
-                record.state = SessionState.UNMANAGED
-                warnings.append(
-                    f"session {record.name} found in registry — marked unmanaged"
-                )
-        if registry.records:
-            registry.save()
+        # 3. Reconcile the registry: probe, classify, retract — never spawn.
+        warnings.extend(asyncio.run(reconcile_registry(registry, queue)))
 
         llm_call = bind_call_turn(build_client(cfg))
 
