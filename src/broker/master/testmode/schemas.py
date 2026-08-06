@@ -24,6 +24,7 @@ class SeedSession(BaseModel):
     pane_id: str | None = None
     claude_session_id: str | None = None
     transcript_path: str | None = None
+    approved_prompt: str | None = None
 
 
 class StartFakeSocket(BaseModel):
@@ -79,12 +80,14 @@ class Dispatch(BaseModel):
     expect: Literal["dispatched", "refused"]
 
 
-class Reassign(BaseModel):
+class Attach(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    op: Literal["reassign"]
+    op: Literal["attach"]
     session: str
-    intent: str = "a fresh task"
+    # "refused" is the only outcome a scenario uses: an "attached" expectation
+    # would spawn a real broker, which stays out of the scenario runner.
+    expect: Literal["attached", "refused"] = "refused"
 
 
 class AssertSurfaced(BaseModel):
@@ -137,7 +140,7 @@ Step = Annotated[
     | PermissionEscalate
     | Retract
     | Dispatch
-    | Reassign
+    | Attach
     | AssertSurfaced
     | AssertNeverSurfaced
     | AssertDepth

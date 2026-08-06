@@ -30,10 +30,10 @@ from broker.master.testmode.schemas import (
     AssertNoDispatchWrite,
     AssertSurfaced,
     AssertUnreachable,
+    Attach,
     Dispatch,
     Escalate,
     PermissionEscalate,
-    Reassign,
     Retract,
     Scenario,
     ScenarioError,
@@ -256,6 +256,7 @@ async def _run_step(
             pane_id=step.pane_id,
             claude_session_id=step.claude_session_id,
             transcript_path=step.transcript_path,
+            approved_prompt=step.approved_prompt,
         )
         runtime.registry.upsert(record)
         ctx.seeded.add(step.name)
@@ -322,19 +323,19 @@ async def _run_step(
             passed = outcome.startswith("decision NOT dispatched")
         return StepResult(index=index, op=op, passed=passed, detail=outcome)
 
-    if isinstance(step, Reassign):
+    if isinstance(step, Attach):
         ctx.require_seeded(index, step.session)
         try:
-            outcome = await runtime.reassign_session(step.session, step.intent)
-        except RuntimeError as exc:
-            return StepResult(
-                index=index, op=op, passed=True, detail=f"refused: {exc}"
-            )
+            detail = await runtime.attach_session(step.session)
+            outcome = "attached"
+        except (ValueError, RuntimeError) as exc:
+            detail = f"refused: {exc}"
+            outcome = "refused"
         return StepResult(
             index=index,
             op=op,
-            passed=False,
-            detail=f"expected refusal, got: {outcome}",
+            passed=outcome == step.expect,
+            detail=detail,
         )
 
     if isinstance(step, AssertSurfaced):

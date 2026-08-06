@@ -12,7 +12,6 @@ from typing import Any
 import pytest
 
 from broker.config import BrokerConfig
-from broker.master import runtime as runtime_module
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry
 from broker.master.runtime import MasterRuntime
@@ -94,12 +93,9 @@ async def test_broker_death(rt: tuple[MasterRuntime, list[Any]]) -> None:
     await _run(rt, "broker-death")
 
 
-async def test_attach_refusal(
-    rt: tuple[MasterRuntime, list[Any]], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Compress the socket-free wait so the refusal fires in well under a second.
-    monkeypatch.setattr(runtime_module, "STOP_WAIT_S", 0.5)
-    monkeypatch.setattr(runtime_module, "SOCKET_POLL_S", 0.01)
+async def test_attach_refusal(rt: tuple[MasterRuntime, list[Any]]) -> None:
+    # Attach probes the socket once and never polls, so the refusal is
+    # immediate — no wait to compress.
     await _run(rt, "attach-refusal")
 
 
