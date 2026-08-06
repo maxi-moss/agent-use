@@ -65,6 +65,7 @@ Then `Args:` / `Returns:` / `Raises:` as applicable. Nothing else.
 - **Write only tests that would still be needed after you delete them.** Ask what could silently break if this test vanished — if the answer is nothing because the assertion just restates the implementation, don't write it.
 - No `conftest.py` — each test module carries its own harness. Don't factor fixtures into a shared file.
 - A temp dir that will hold a unix socket goes under `/private/tmp`, never `tmp_path` — `AF_UNIX` paths cap at ~104 chars.
+- `pgrep`/`pkill` on `broker.session` can match the developer's LIVE brokers — this machine runs real sessions out of `~/.broker`. Never kill a broker process your run didn't spawn; assert no-leak by diffing PID sets before/after, never by expecting empty.
 
 ## Definition of done
 
