@@ -122,6 +122,7 @@ class MasterTool[M: BaseModel]:
     description: str
     model: type[M]
     handler: Callable[[MasterRuntime, M], Awaitable[str]]
+    activity: str  # dashboard phrase shown while the tool runs
 
 
 # Deliberately unannotated: a tuple[MasterTool[Any], ...] annotation would solve
@@ -133,6 +134,7 @@ _REGISTRY = (
         "intent VERBATIM — grounding belongs to the session broker.",
         SpawnSessionArgs,
         lambda rt, a: rt.spawn_session(a.intent, a.cwd),
+        "spawning a session…",
     ),
     MasterTool(
         "approve_prompt",
@@ -140,6 +142,7 @@ _REGISTRY = (
         "prompt. The final text passes through verbatim.",
         ApprovePromptArgs,
         lambda rt, a: rt.approve_prompt(a.proposal_id, a.prompt),
+        "approving a prompt…",
     ),
     MasterTool(
         "dispatch_decision",
@@ -147,6 +150,7 @@ _REGISTRY = (
         "owning session broker, unchanged.",
         DispatchDecisionArgs,
         lambda rt, a: rt.dispatch(a.escalation_id, a.decision),
+        "dispatching a decision…",
     ),
     MasterTool(
         "list_sessions",
@@ -154,18 +158,21 @@ _REGISTRY = (
         "are sitting on a native permission prompt right now.",
         ListSessionsArgs,
         lambda rt, _a: rt.render_sessions_with_permission_prompts(),
+        "probing the sessions…",
     ),
     MasterTool(
         "send_to_session",
         "Push a new developer instruction into an existing session.",
         SendToSessionArgs,
         lambda rt, a: rt.send_prompt(a.session_id, a.prompt),
+        "sending a prompt…",
     ),
     MasterTool(
         "get_decision_log",
         "Retrieve a session broker's triage reasoning.",
         GetDecisionLogArgs,
         lambda rt, a: rt.get_decision_log(a.session_id),
+        "fetching a decision log…",
     ),
     MasterTool(
         "get_permission_log",
@@ -174,12 +181,14 @@ _REGISTRY = (
         "decision log: that one carries triage reasoning about questions.",
         GetPermissionLogArgs,
         lambda rt, a: rt.get_permission_log(a.session_id),
+        "fetching a permission log…",
     ),
     MasterTool(
         "stop_session",
         "Terminate a session and its broker.",
         StopSessionArgs,
         lambda rt, a: rt.stop_session(a.session_id),
+        "stopping a session…",
     ),
     MasterTool(
         "reactivate_session",
@@ -188,6 +197,7 @@ _REGISTRY = (
         "grounds it. Refused unless the session is completed.",
         ReactivateSessionArgs,
         lambda rt, a: rt.reactivate_session(a.session_id, a.intent),
+        "reactivating a session…",
     ),
     MasterTool(
         "reassign_session",
@@ -196,6 +206,7 @@ _REGISTRY = (
         "errored. Pass the developer's intent VERBATIM.",
         ReassignSessionArgs,
         lambda rt, a: rt.reassign_session(a.session_id, a.intent),
+        "reassigning a session…",
     ),
     MasterTool(
         "attach_session",
@@ -206,6 +217,7 @@ _REGISTRY = (
         "a live broker still answers.",
         AttachSessionArgs,
         lambda rt, a: rt.attach_session(a.session_id),
+        "attaching a session…",
     ),
 )
 
@@ -273,11 +285,29 @@ class MasterLLM:
         self.cfg = cfg
         self.log = ConversationLog(BrokerPaths(cfg.broker_home).master_conversation)
 
-    async def handle_developer_message(self, text: str) -> str:
+    async def handle_developer_message(
+        self,
+        text: str,
+        on_activity: Callable[[str], None] | None = None,
+    ) -> str:
+        """Run one developer turn through the LLM tool loop and reply.
+
+        Args:
+            text: The developer's message.
+            on_activity: Called with a short phrase ("thinking…", a tool's
+                activity) as the turn progresses, so the TUI's fleet header
+                can show what the master is doing. ``None`` when nothing
+                displays it.
+
+        Returns:
+            The master's final text reply for the developer.
+        """
         messages = self._assemble(text)
         self.log.append("developer", text)
         reply = ""
         for round_no in range(MAX_TOOL_ROUNDS):
+            if on_activity is not None:
+                on_activity("thinking…")
             result = await self.llm_call(
                 model=self.cfg.model_id,
                 max_tokens=self.cfg.max_tokens,
@@ -295,6 +325,9 @@ class MasterLLM:
             messages.append(_assistant_message(result, ids))
             tool_results: list[dict[str, Any]] = []
             for i, call in enumerate(result.tool_calls):
+                tool = _BY_NAME.get(call.name)
+                if on_activity is not None and tool is not None:
+                    on_activity(tool.activity)
                 outcome = await self._execute(call)
                 self.log.append(
                     "tool", f"{call.name}({json.dumps(call.input)}) -> {outcome}"
