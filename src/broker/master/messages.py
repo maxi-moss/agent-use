@@ -61,6 +61,13 @@ class SessionStatusChanged(Message):
         self.state = state
 
 
+class FleetChanged(Message):
+    def __init__(self, rendered: str) -> None:
+        """Carry the runtime-rendered fleet dashboard to the TUI, verbatim."""
+        super().__init__()
+        self.rendered = rendered
+
+
 class QueueDepthChanged(Message):
     def __init__(self, depth: int, waiting: tuple[str, ...]) -> None:
         """Carry the escalation queue's depth and waiting sessions to the TUI."""

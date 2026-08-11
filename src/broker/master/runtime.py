@@ -40,6 +40,7 @@ from broker.master import notifier
 from broker.master.messages import (
     CompletionArrived,
     EscalationArrived,
+    FleetChanged,
     Notice,
     PermissionEscalationArrived,
     ProposalArrived,
@@ -66,6 +67,7 @@ from broker.protocol.constants import (
     T_FATAL_ERROR,
     T_GET_DECISION_LOG,
     T_GET_PERMISSION_LOG,
+    T_LIVE_STATUS,
     T_PERMISSION_ESCALATION,
     T_PROMPT_PROPOSAL,
     T_REACTIVATE,
@@ -83,6 +85,7 @@ from broker.protocol.schemas import (
     Envelope,
     EscalationPayload,
     FatalErrorPayload,
+    LiveStatusPayload,
     PermissionEscalationPayload,
     PermissionLogPayload,
     PermissionSuggestion,
@@ -115,6 +118,23 @@ PANE_UNKNOWN = "(pane unknown)"
 # Failures the on-demand status probe absorbs into a warning line: a session
 # that cannot be reached must not fail the whole listing.
 PROBE_FAILURES = (OSError, ConnectionError, TimeoutError, ValidationError)
+
+# A session in one of these states is settled or gone: it has no live
+# operating status, so a late-arriving push must not resurrect it. Left only
+# by a master-initiated boundary write (spawn/reassign/attach/reactivate).
+_ABSORBING = frozenset(
+    {
+        SessionState.COMPLETED,
+        SessionState.ERROR,
+        SessionState.STOPPED,
+        SessionState.DEAD,
+        SessionState.UNMANAGED,
+    }
+)
+
+# Content cells every rendered fleet line must fit in; the TUI sizes the
+# pane as this plus its scrollbar.
+FLEET_WIDTH = 54
 
 
 async def _broker_is_listening(path: Path) -> bool:
@@ -380,6 +400,65 @@ def render_proposal(p: PromptProposalPayload) -> str:
     )
 
 
+def _truncate(text: str, width: int) -> str:
+    """Cut ``text`` to ``width`` characters, marking the cut with an ellipsis."""
+    if len(text) <= width:
+        return text
+    return text[: width - 1] + "…"
+
+
+def render_fleet(
+    records: dict[str, SessionRecord],
+    activity: dict[str, str],
+    perm_pending: set[str],
+    master_activity: str | None,
+    budget_max: int,
+) -> str:
+    """Render the fleet dashboard: master activity line plus a block per session.
+
+    Every line fits in ``FLEET_WIDTH`` cells: a name/state/⚠/budget head line,
+    then indented intent and (when present) live-activity lines.
+
+    Args:
+        records: Registry records, rendered one block each.
+        activity: Pushed live-activity phrase per session; absent means idle.
+        perm_pending: Sessions currently sitting on a native permission prompt.
+        master_activity: What the master itself is doing, or ``None`` for idle.
+        budget_max: Budget ceiling every session's counter is shown against.
+
+    Returns:
+        The dashboard string, displayed verbatim.
+    """
+    header = _truncate(f"Master — {master_activity or 'idle'}", FLEET_WIDTH)
+    if not records:
+        return f"{header}\n\n(no sessions)"
+    names = sorted(records)
+    w_name = max(len(n) for n in names)
+    w_state = max(len(str(records[n].state)) for n in names)
+    indent = "    "
+    sub_width = FLEET_WIDTH - len(indent)
+    blocks: list[str] = []
+    for name in names:
+        r = records[name]
+        head = "  ".join(
+            (
+                name.ljust(w_name),
+                str(r.state).ljust(w_state),
+                ("⚠" if name in perm_pending else "").ljust(1),
+                f"{r.budget_count}/{budget_max}",
+            )
+        )
+        lines = [_truncate(head, FLEET_WIDTH)]
+        intent = r.approved_prompt or r.intent
+        if intent:
+            lines.append(indent + _truncate(intent, sub_width))
+        phrase = activity.get(name, "")
+        if phrase:
+            lines.append(indent + _truncate(phrase, sub_width))
+        blocks.append("\n".join(lines))
+    return "\n\n".join([header, *blocks])
+
+
 @dataclass(frozen=True, slots=True)
 class PendingProposal:
     """A prompt proposal awaiting the developer's approval."""
@@ -417,6 +496,11 @@ class MasterRuntime:
         self.master_socket_path = self.paths.master_socket
         self.proposals: dict[str, PendingProposal] = {}
         self._procs: dict[str, asyncio.subprocess.Process] = {}
+        # Dashboard-only, never persisted: pushed live status per session and
+        # the master's own current activity.
+        self._activity: dict[str, str] = {}
+        self._perm_pending: set[str] = set()
+        self._master_activity: str | None = None
 
     # ── socket server ────────────────────────────────────────────────────────
 
@@ -425,6 +509,7 @@ class MasterRuntime:
         # A head loaded from disk has never been announced in this process, so
         # it surfaces here, exactly once.
         self._publish_queue_state()
+        self._publish_fleet()
         await self._surface_head()
         server = await serve_unix(self.master_socket_path, self.handle)
         async with server:
@@ -518,6 +603,29 @@ class MasterRuntime:
             record = self.registry.get(name)
             record.budget_count = p.count
             self.registry.upsert(record)
+            self._publish_fleet()
+            return self._ack(env, ok=True)
+        if env.type == T_LIVE_STATUS:
+            p = LiveStatusPayload.model_validate(env.payload)
+            rec = self.registry.records.get(name)
+            # A settled/gone session ignores late pushes: absorbing states are
+            # left only by a master-initiated boundary write, never by a stale
+            # in-flight push arriving after the fact (cross-connection sends
+            # reorder even though each is individually ACKed).
+            if rec is not None and rec.state not in _ABSORBING:
+                if p.activity:
+                    self._activity[name] = p.activity
+                else:
+                    self._activity.pop(name, None)
+                if p.permission_pending:
+                    self._perm_pending.add(name)
+                else:
+                    self._perm_pending.discard(name)
+                state_changed = self._set_state(name, p.state)
+                if not state_changed:
+                    self._publish_fleet()  # activity/perm-only change
+            # ACK every push, absorbing/unknown included, so the sender never
+            # spins re-sending a snapshot the master refuses to apply.
             return self._ack(env, ok=True)
         self.app_post(Notice(f"unknown message type {env.type!r} from {name!r}"))
         return self._ack(env, ok=False)
@@ -703,6 +811,7 @@ class MasterRuntime:
         self._procs[name] = proc
         self.registry.upsert(record)
         self.app_post(SessionStatusChanged(name, record.state))
+        self._publish_fleet()
         return f"spawned session {name} (pid {proc.pid}) in {cwd_path}"
 
     async def reassign_session(self, session_id: str, intent: str) -> str:
@@ -871,6 +980,7 @@ class MasterRuntime:
         del self.proposals[proposal_id]
         record.approved_prompt = prompt  # the AUTHORITATIVE intent
         self.registry.upsert(record)
+        self._publish_fleet()
         return f"prompt approved for session {name}"
 
     async def dispatch(self, escalation_id: str, decision: str) -> str:
@@ -928,7 +1038,8 @@ class MasterRuntime:
             return rejected
         self.queue.resolve(escalation_id)
         self._surfaced_id = None
-        self._set_state(record.name, SessionState.DRIVING)
+        # No state write: DRIVING is the broker's transition to report, and
+        # its push carries it — the master never invents an operating state.
         self._publish_queue_state()
         await self._surface_head()
         return f"decision dispatched to session {record.name}"
@@ -956,6 +1067,7 @@ class MasterRuntime:
             return rejected
         record.budget_count = 0  # developer prompt resets the budget
         self.registry.upsert(record)
+        self._publish_fleet()
         return f"prompt sent to session {session_id}"
 
     async def probe_status(self, session_id: str) -> StatusPayload:
@@ -1224,22 +1336,62 @@ class MasterRuntime:
         self._publish_queue_state()
         await self._surface_head()
 
-    def _set_state(self, name: str, state: SessionState) -> None:
-        """Record a session's new state and tell the TUI.
+    def _set_state(self, name: str, state: SessionState) -> bool:
+        """Record a session's new state and tell the TUI, once per change.
 
         Args:
             name: Registry name of the session.
             state: New state to persist.
+
+        Returns:
+            ``True`` when the state changed, ``False`` when it was already
+            ``state`` or the session is unknown.
         """
+        # No ``await`` may sit between this read and the upsert below, or two
+        # interleaving handlers would read-modify-write clobber each other
+        # under N concurrent brokers.
         try:
             record = self.registry.get(name)
         except KeyError:
             self.app_post(Notice(f"message from unknown session {name!r}"))
-            return
+            return False
+        if record.state == state:
+            return False
         logger.info("session %s: %s -> %s", name, record.state, state)
         record.state = state
-        self.registry.upsert(record)
+        self.registry.upsert(record)  # sync; no await before this point
+        if state in _ABSORBING:
+            # A settled session shows no live status, and the absorbing
+            # guard blocks the pushes that would otherwise clear these.
+            self._activity.pop(name, None)
+            self._perm_pending.discard(name)
         self.app_post(SessionStatusChanged(name, state))
+        self._publish_fleet()
+        return True
+
+    def _publish_fleet(self) -> None:
+        """Post a freshly rendered fleet snapshot to the TUI."""
+        self.app_post(
+            FleetChanged(
+                render_fleet(
+                    self.registry.records,
+                    self._activity,
+                    self._perm_pending,
+                    self._master_activity,
+                    self.cfg.budget_max,
+                )
+            )
+        )
+
+    def note_master_activity(self, text: str) -> None:
+        """Show what the master itself is doing on the dashboard header."""
+        self._master_activity = text
+        self._publish_fleet()
+
+    def clear_master_activity(self) -> None:
+        """Return the dashboard header to idle."""
+        self._master_activity = None
+        self._publish_fleet()
 
     async def _notify(
         self,
