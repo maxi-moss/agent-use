@@ -245,6 +245,7 @@ async def start_harness(
     shutil.copy(TRANSCRIPT_FIXTURE, transcript)
     run = ScriptedRun()
     monkeypatch.setattr(driver.subprocess, "run", run)
+    monkeypatch.setattr("broker.herdr.driver._PANE_READY_DELAY_S", 0.0)
     llm = FakeLLM()
     classifier = FakePermissionLLM()
     master = StubMaster()

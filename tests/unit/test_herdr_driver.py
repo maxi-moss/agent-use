@@ -40,6 +40,8 @@ class FakeRun:
 
 @pytest.fixture
 def fake(monkeypatch: pytest.MonkeyPatch) -> Any:
+    monkeypatch.setattr("broker.herdr.driver._PANE_READY_DELAY_S", 0.0)
+
     def install(**kwargs: Any) -> FakeRun:
         run = FakeRun(**kwargs)
         monkeypatch.setattr(driver.subprocess, "run", run)
