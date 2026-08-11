@@ -17,7 +17,7 @@ from typing import Any, cast
 
 from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.containers import VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import RichLog, Static
 from textual.worker import Worker, WorkerState
@@ -28,6 +28,7 @@ from broker.master.llm import MasterLLM
 from broker.master.messages import (
     CompletionArrived,
     EscalationArrived,
+    FleetChanged,
     LLMReply,
     Notice,
     PermissionEscalationArrived,
@@ -37,13 +38,15 @@ from broker.master.messages import (
 )
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry
-from broker.master.runtime import MasterRuntime
+from broker.master.runtime import FLEET_WIDTH, MasterRuntime
 from broker.master.testmode import load_scenario, run_scenario
 from broker.master.tui.prompt_widget import PromptArea
 
 
 class BrokerMasterApp(App[None]):
-    CSS = """
+    # The fleet pane holds FLEET_WIDTH content cells plus Textual's default
+    # vertical scrollbar (2 cells).
+    CSS = f"#fleet {{ width: {FLEET_WIDTH + 2}; }}" + """
     #chat { height: 1fr; }
     #queue-depth { height: 1; }
     #events { height: 10; }
@@ -87,13 +90,19 @@ class BrokerMasterApp(App[None]):
         return self.post_message(message)
 
     def compose(self) -> ComposeResult:
-        yield VerticalScroll(id="chat")
-        yield Static(Text("escalation queue: empty"), id="queue-depth")
-        yield RichLog(id="events", wrap=True)
-        yield PromptArea(
-            placeholder="task, decision, or question… (ctrl+j for newline)",
-            id="box",
-        )
+        with Horizontal():
+            with VerticalScroll(id="fleet"):
+                yield Static(Text("Master — idle"), id="fleet-table")
+            with Vertical():
+                yield VerticalScroll(id="chat")
+                yield Static(Text("escalation queue: empty"), id="queue-depth")
+                yield RichLog(id="events", wrap=True)
+                yield PromptArea(
+                    placeholder=(
+                        "task, decision, or question… (ctrl+j for newline)"
+                    ),
+                    id="box",
+                )
 
     async def on_mount(self) -> None:
         self._server_task = asyncio.create_task(self.runtime.serve())
@@ -186,7 +195,9 @@ class BrokerMasterApp(App[None]):
         )
 
     async def _master_turn(self, text: str) -> None:
-        reply = await self.master_llm.handle_developer_message(text)
+        reply = await self.master_llm.handle_developer_message(
+            text, on_activity=self.runtime.note_master_activity
+        )
         self.post_message(LLMReply(reply))
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
@@ -202,6 +213,8 @@ class BrokerMasterApp(App[None]):
             WorkerState.CANCELLED,
         ):
             self.query_one("#box", PromptArea).disabled = False
+            if worker.group == "llm":
+                self.runtime.clear_master_activity()
         if event.state is WorkerState.ERROR:
             # Fail loud; the app (and its socket server) survives.
             self._chat_block(f"[master error] {worker.error!r}")
@@ -247,6 +260,10 @@ class BrokerMasterApp(App[None]):
 
     def on_session_status_changed(self, message: SessionStatusChanged) -> None:
         self._event_line(f"{message.session_id} → {message.state}")
+
+    def on_fleet_changed(self, message: FleetChanged) -> None:
+        # One in-place table ("now"); #events stays the scrolling history.
+        self.query_one("#fleet-table", Static).update(Text(message.rendered))
 
     def on_queue_depth_changed(self, message: QueueDepthChanged) -> None:
         # Ids and a count only — payloads live in the chat, when surfaced.
