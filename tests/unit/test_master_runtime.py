@@ -175,7 +175,7 @@ class StatusSession:
             id=env.id,
             ok=True,
             payload={
-                "state": "blocked_permission",
+                "state": "driving",
                 "pane_id": "w3:p2",
                 "permission_prompt": self.permission_prompt,
             },
@@ -597,7 +597,8 @@ async def test_permission_retract_leaves_session_state_alone(
     rt: tuple[MasterRuntime, list[Any]]
 ) -> None:
     # A permission escalation never set the state, so withdrawing it must not
-    # claim the session is driving when its broker knows otherwise.
+    # claim the session is driving when its broker knows otherwise — its own
+    # escalation may still be live.
     runtime, _ = rt
     assert (
         await send(
@@ -605,16 +606,14 @@ async def test_permission_retract_leaves_session_state_alone(
         )
     ).ok
     record = runtime.registry.get("s1")
-    record.state = SessionState.BLOCKED_PERMISSION
+    record.state = SessionState.ESCALATED
     runtime.registry.upsert(record)
     assert (
         await send(
             runtime, T_RETRACT, {"escalation_id": "p1", "reason": "answered"}
         )
     ).ok
-    assert (
-        runtime.registry.get("s1").state == SessionState.BLOCKED_PERMISSION
-    )
+    assert runtime.registry.get("s1").state == SessionState.ESCALATED
 
 
 async def test_queued_escalation_surfaces_after_resolve(
@@ -1327,7 +1326,7 @@ def test_render_fleet_blocks_show_state_perm_activity_budget_intent() -> None:
             socket_path="/private/tmp/s2.sock",
             cwd="/private/tmp",
             anchor_pane="%1",
-            state=SessionState.BLOCKED_PERMISSION,
+            state=SessionState.ESCALATED,
             approved_prompt="Migrate the users table",
             budget_count=5,
         ),
@@ -1352,7 +1351,7 @@ def test_render_fleet_blocks_show_state_perm_activity_budget_intent() -> None:
     assert s1_intent.endswith("…")  # the long intent is truncated
     assert s1_act.strip() == "reviewing the latest turn…"
     s2_head, s2_intent = lines[6], lines[7]
-    assert "blocked_permission" in s2_head
+    assert "escalated" in s2_head
     assert "⚠" in s2_head
     assert "5/8" in s2_head
     assert "Migrate the users table" in s2_intent  # approved prompt wins
@@ -1372,24 +1371,24 @@ async def test_live_status_updates_state_activity_and_perm(
         runtime,
         T_LIVE_STATUS,
         {
-            "state": "blocked_permission",
+            "state": "escalated",
             "activity": "reviewing a permission request…",
-            "permission_pending": True,
+            "permission_prompt": True,
         },
     )
     assert resp.ok  # every push is ACKed so the sender never spins
-    assert runtime.registry.get("s1").state == "blocked_permission"
+    assert runtime.registry.get("s1").state == "escalated"
     fleets = [m for m in posts if isinstance(m, FleetChanged)]
     assert fleets  # the push published a fresh snapshot
     last = fleets[-1].rendered
-    assert "blocked_permission" in last
+    assert "escalated" in last
     assert "⚠" in last
     assert "reviewing a permission request…" in last
     # A follow-up clearing push empties activity and the PERM column.
     resp = await send(
         runtime,
         T_LIVE_STATUS,
-        {"state": "driving", "activity": "", "permission_pending": False},
+        {"state": "driving", "activity": "", "permission_prompt": False},
     )
     assert resp.ok
     last = [m for m in posts if isinstance(m, FleetChanged)][-1].rendered
@@ -1471,9 +1470,9 @@ async def test_absorbing_transition_clears_live_status(
             runtime,
             T_LIVE_STATUS,
             {
-                "state": "blocked_permission",
+                "state": "driving",
                 "activity": "reviewing a permission request…",
-                "permission_pending": True,
+                "permission_prompt": True,
             },
         )
     ).ok
@@ -1498,7 +1497,7 @@ async def test_list_sessions_probes_rather_than_reading_the_pushed_map(
         await send(
             runtime,
             T_LIVE_STATUS,
-            {"state": "blocked_permission", "permission_pending": False},
+            {"state": "driving", "permission_prompt": False},
         )
     ).ok
     stub = StatusSession(permission_prompt=True)

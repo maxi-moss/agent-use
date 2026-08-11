@@ -517,7 +517,6 @@ async def test_permission_request_immediate_escalated_reply(
     assert resp.ok is True
     assert resp.payload["decision"] == "escalated"
     assert elapsed < 0.5  # hot path
-    await wait_state(harness.broker, "blocked_permission")
 
 
 async def test_permission_request_allow_flows_to_hook_decision(
@@ -616,7 +615,7 @@ async def test_permission_prompt_notification_shows_up_on_status(
         harness.sock,
         hook_env("Notification", {"notification_type": "permission_prompt"}),
     )
-    await wait_state(harness.broker, "blocked_permission")
+    await wait_live(harness.master, lambda p: p["permission_prompt"] is True)
     resp = await client.request(
         harness.sock,
         Envelope(id=uuid.uuid4().hex, type=T_STATUS, session_id="s1"),
@@ -1019,7 +1018,7 @@ async def test_state_changes_push_live_status_with_activity(
         h.master,
         lambda p: p["state"] == "driving" and p["activity"] == "",
     )
-    assert p["permission_pending"] is False
+    assert p["permission_prompt"] is False
 
 
 async def test_concurrent_phrases_both_appear_and_clear_independently(
@@ -1071,9 +1070,10 @@ async def test_permission_prompt_notification_is_pushed(
         hook_env("Notification", {"notification_type": "permission_prompt"}),
     )
     _, p = await wait_live(
-        h.master, lambda p: p["permission_pending"] is True, after=mark
+        h.master, lambda p: p["permission_prompt"] is True, after=mark
     )
-    assert p["state"] == "blocked_permission"
+    # The prompt is a flag, not a state: the broker keeps driving.
+    assert p["state"] == "driving"
 
 
 async def test_failed_push_is_retried(
@@ -1091,10 +1091,9 @@ async def test_failed_push_is_retried(
         h.sock,
         hook_env("Notification", {"notification_type": "permission_prompt"}),
     )
-    _, p = await wait_live(
-        h.master, lambda p: p["permission_pending"] is True, after=mark
+    await wait_live(
+        h.master, lambda p: p["permission_prompt"] is True, after=mark
     )
-    assert p["state"] == "blocked_permission"
     assert h.master.fail_types == set()  # the first attempt really failed
 
 

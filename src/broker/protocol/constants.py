@@ -60,7 +60,6 @@ class SessionState(StrEnum):
     AWAITING_APPROVAL = "awaiting_approval"
     DRIVING = "driving"
     ESCALATED = "escalated"
-    BLOCKED_PERMISSION = "blocked_permission"
     COMPLETED = "completed"
     ERROR = "error"
     STOPPED = "stopped"
@@ -69,9 +68,7 @@ class SessionState(StrEnum):
 
 
 # A session live enough to accept a decision or a prompt.
-ACTIVE_STATES = frozenset(
-    {SessionState.DRIVING, SessionState.BLOCKED_PERMISSION}
-)
+ACTIVE_STATES = frozenset({SessionState.DRIVING})
 
 # The hook's own deadline must always expire first, so it exits 0 on its own
 # terms and degrades the session predictably. If Claude Code's settings.json

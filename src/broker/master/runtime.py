@@ -410,7 +410,7 @@ def _truncate(text: str, width: int) -> str:
 def render_fleet(
     records: dict[str, SessionRecord],
     activity: dict[str, str],
-    perm_pending: set[str],
+    permission_prompt_pending: set[str],
     master_activity: str | None,
     budget_max: int,
 ) -> str:
@@ -422,7 +422,7 @@ def render_fleet(
     Args:
         records: Registry records, rendered one block each.
         activity: Pushed live-activity phrase per session; absent means idle.
-        perm_pending: Sessions currently sitting on a native permission prompt.
+        permission_prompt_pending: Sessions currently sitting on a native permission prompt.
         master_activity: What the master itself is doing, or ``None`` for idle.
         budget_max: Budget ceiling every session's counter is shown against.
 
@@ -444,7 +444,7 @@ def render_fleet(
             (
                 name.ljust(w_name),
                 str(r.state).ljust(w_state),
-                ("⚠" if name in perm_pending else "").ljust(1),
+                ("⚠" if name in permission_prompt_pending else "").ljust(1),
                 f"{r.budget_count}/{budget_max}",
             )
         )
@@ -499,7 +499,7 @@ class MasterRuntime:
         # Dashboard-only, never persisted: pushed live status per session and
         # the master's own current activity.
         self._activity: dict[str, str] = {}
-        self._perm_pending: set[str] = set()
+        self._permission_prompt_pending: set[str] = set()
         self._master_activity: str | None = None
 
     # ── socket server ────────────────────────────────────────────────────────
@@ -617,10 +617,10 @@ class MasterRuntime:
                     self._activity[name] = p.activity
                 else:
                     self._activity.pop(name, None)
-                if p.permission_pending:
-                    self._perm_pending.add(name)
+                if p.permission_prompt:
+                    self._permission_prompt_pending.add(name)
                 else:
-                    self._perm_pending.discard(name)
+                    self._permission_prompt_pending.discard(name)
                 state_changed = self._set_state(name, p.state)
                 if not state_changed:
                     self._publish_fleet()  # activity/perm-only change
@@ -1364,7 +1364,7 @@ class MasterRuntime:
             # A settled session shows no live status, and the absorbing
             # guard blocks the pushes that would otherwise clear these.
             self._activity.pop(name, None)
-            self._perm_pending.discard(name)
+            self._permission_prompt_pending.discard(name)
         self.app_post(SessionStatusChanged(name, state))
         self._publish_fleet()
         return True
@@ -1376,7 +1376,7 @@ class MasterRuntime:
                 render_fleet(
                     self.registry.records,
                     self._activity,
-                    self._perm_pending,
+                    self._permission_prompt_pending,
                     self._master_activity,
                     self.cfg.budget_max,
                 )

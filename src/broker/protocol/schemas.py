@@ -259,4 +259,4 @@ class LiveStatusPayload(BaseModel):
 
     state: SessionState
     activity: str = ""  # active gerund phrases joined, "" when idle
-    permission_pending: bool = False
+    permission_prompt: bool = False

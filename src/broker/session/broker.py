@@ -417,7 +417,7 @@ class SessionBroker:
             payload = LiveStatusPayload(
                 state=self.state,
                 activity=" · ".join(sorted(self._activity_phrases)),
-                permission_pending=self._permission_prompt_pending,
+                permission_prompt=self._permission_prompt_pending,
             )
             try:
                 await self._to_master(T_LIVE_STATUS, payload.model_dump())
@@ -497,8 +497,6 @@ class SessionBroker:
             reply = PermissionDecisionPayload(decision=DECISION_ALLOW)
         else:
             reply = PermissionDecisionPayload(decision=DECISION_ESCALATED)
-            if self.state == SessionState.DRIVING:
-                self._set_state(SessionState.BLOCKED_PERMISSION)
         return Response(id=env.id, ok=True, payload=reply.model_dump())
 
     async def _handle(self, env: Envelope) -> Response | None:
@@ -654,8 +652,6 @@ class SessionBroker:
             self._log("notification", "", str(raw.get("message", "")))
             if raw.get("notification_type") == "permission_prompt":
                 self._set_perm_pending(True)
-                if self.state == SessionState.DRIVING:
-                    self._set_state(SessionState.BLOCKED_PERMISSION)
         elif name == "SessionEnd":
             self.permission.note_session_ended()
             self._set_state(SessionState.STOPPED)
