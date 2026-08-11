@@ -250,3 +250,13 @@ class BudgetUpdatePayload(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     count: int
+
+
+class LiveStatusPayload(BaseModel):
+    """broker -> master: the broker's current live status, pushed on any change."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    state: SessionState
+    activity: str = ""  # active gerund phrases joined, "" when idle
+    permission_pending: bool = False

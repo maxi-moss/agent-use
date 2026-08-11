@@ -30,6 +30,7 @@ T_FATAL_ERROR = "fatal_error"
 T_RETRACT = "retract"
 T_PROMPT_PROPOSAL = "prompt_proposal"  # broker -> master
 T_BUDGET_UPDATE = "budget_update"  # broker -> master
+T_LIVE_STATUS = "live_status"  # broker -> master
 
 # Machine-readable refusal reasons carried alongside the human-readable error
 # string on a negative Response. Closed set: a sender that cannot tell a
