@@ -1,8 +1,8 @@
 # Broker
 
-Routes decisions between one developer and N headless Claude Code sessions driven through Herdr.
+Routes decisions between one developer and N interactive Claude Code sessions driven through Herdr.
 
-A supervised Claude Code session runs in its own Herdr pane. When it stops, asks a question, or requests a tool permission, a hook wakes a per-session broker process. That broker triages the moment with a single LLM call and either handles it or escalates it to the developer through the master TUI.
+A supervised Claude Code session runs in its own Herdr pane, with a real TTY and the native UI — fully usable by hand at any moment. When it stops, asks a question, or requests a tool permission, a hook wakes a per-session broker process. That broker triages the moment with a single LLM call and either handles it or escalates it to the developer through the master TUI.
 
 The point is attention economics: the developer sees the decisions that actually need a human, and nothing else.
 
@@ -49,6 +49,8 @@ uv run python -m broker.master
 
 Session brokers are never launched by hand — the master spawns them.
 
+The TUI's left pane is a live fleet dashboard: one block per session with its state, budget, current intent, a ⚠ when it is sitting on a native permission prompt, and what its broker is doing right now. The header line shows the master's own activity. It is display only — nothing on it enters any LLM context.
+
 Configuration is optional. Defaults live in `BrokerConfig` (`src/broker/config.py`) and are overlaid with `$BROKER_HOME/config.json` if present; `$BROKER_HOME` defaults to `~/.broker` and is where sockets, the session registry, and logs are kept. `src/broker/paths.py` defines where each of those lives and is the only place that builds a path inside it.
 
 Diagnostic logs are written to files, never to the terminal — the master's TUI owns that display. Follow a run with `tail -f "$BROKER_HOME"/logs/master.log`.
@@ -79,6 +81,7 @@ src/broker/
   protocol/      Wire schemas, socket server and client
   hook/          Claude Code hook client
   session/       Session broker: triage, watchdog, decision log
+  permission/    Permission triage: own model, client, prompt, log
   master/        Master: runtime, registry, routing LLM, TUI
     testmode/    Synthetic escalation mode: --test-mode and /inject
   herdr/         Herdr CLI driver
