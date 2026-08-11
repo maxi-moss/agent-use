@@ -13,9 +13,10 @@ Structure:
 """
 
 import asyncio
+import contextlib
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Generator
 from pathlib import Path
 from typing import Any, cast
 
@@ -57,6 +58,7 @@ from broker.protocol.constants import (
     T_GET_DECISION_LOG,
     T_GET_PERMISSION_LOG,
     T_HOOK_EVENT,
+    T_LIVE_STATUS,
     T_PERMISSION_REQUEST,
     T_PROMPT_PROPOSAL,
     T_REACTIVATE,
@@ -74,6 +76,7 @@ from broker.protocol.schemas import (
     Envelope,
     EscalationPayload,
     HookEventPayload,
+    LiveStatusPayload,
     PermissionDecisionPayload,
     PermissionLogPayload,
     PermissionRequestPayload,
@@ -114,6 +117,13 @@ SESSION_BIND_TIMEOUT_S = 60.0
 CLAUDE_AGENT_ARGS = ["--model", "opus", "--permission-mode", "auto"]
 
 ASK_USER_QUESTION = "AskUserQuestion"
+
+# Dashboard activity phrases, one per LLM call site.
+PHRASE_GROUNDING = "constructing the prompt…"
+PHRASE_TRIAGE = "reviewing the latest turn…"
+PHRASE_PERMISSION = "reviewing a permission request…"
+
+STATUS_RETRY_S = 1.0
 
 Job = Callable[[], Awaitable[None]]
 
@@ -206,6 +216,10 @@ class SessionBroker:
         self._user_prompt_baseline = 0
         self._last_event_count = -1
 
+        self._status_dirty = asyncio.Event()
+        self._activity_phrases: set[str] = set()
+        self._status_task: asyncio.Task[None] | None = None
+
         paths = BrokerPaths(cfg.broker_home)
         self.decision_log_path = paths.session_decisions(cfg.name)
         self.permission_log_path = paths.session_permissions(cfg.name)
@@ -229,12 +243,18 @@ class SessionBroker:
         if self._llm_call is None:
             self._llm_call = _bind_llm(llm_module.build_client(self.broker_cfg))
         self.watchdog.start()
+        self._status_task = asyncio.create_task(self._status_sender())
         try:
             await self._launch()
             await self._event_loop()
         except FatalSessionError as exc:
             await self._fatal(exc.error_class, exc.detail)
         finally:
+            # Cancellation, not a shutdown flag: a sender parked in
+            # _status_dirty.wait() would never observe one.
+            self._status_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._status_task
             await self.watchdog.stop()
             server.close()
             await server.wait_closed()
@@ -363,12 +383,13 @@ class SessionBroker:
         self.approved_prompt = None  # superseded until the developer approves
         self._set_state(SessionState.GROUNDING)
         assert self._llm_call is not None
-        proposal = await ground_intent(
-            self._llm_call,
-            self.broker_cfg,
-            intent=intent,
-            cwd=Path(self.cfg.cwd),
-        )
+        with self._activity(PHRASE_GROUNDING):
+            proposal = await ground_intent(
+                self._llm_call,
+                self.broker_cfg,
+                intent=intent,
+                cwd=Path(self.cfg.cwd),
+            )
         self._proposal_id = uuid.uuid4().hex
         loop = asyncio.get_running_loop()
         self._approval = loop.create_future()
@@ -387,6 +408,39 @@ class SessionBroker:
         self.permission.set_intent(self._intent())
         await self._submit(approved.prompt)
         self._set_state(SessionState.DRIVING)
+
+    async def _status_sender(self) -> None:
+        """Coalesce live-status changes into full-snapshot pushes to the master."""
+        while True:  # exits by cancellation at teardown
+            await self._status_dirty.wait()
+            self._status_dirty.clear()
+            payload = LiveStatusPayload(
+                state=self.state,
+                activity=" · ".join(sorted(self._activity_phrases)),
+                permission_pending=self._permission_prompt_pending,
+            )
+            try:
+                await self._to_master(T_LIVE_STATUS, payload.model_dump())
+            except Exception as exc:
+                # Master unreachable: re-send the current snapshot next loop;
+                # the backoff keeps a dead master from spinning the broker hot.
+                logger.warning("live-status push failed, retrying: %r", exc)
+                self._status_dirty.set()
+                await asyncio.sleep(STATUS_RETRY_S)
+
+    @contextlib.contextmanager
+    def _activity(self, phrase: str) -> Generator[None]:
+        """Show ``phrase`` on the dashboard for the duration of the block."""
+        # A set, not a string: a permission decision on a socket-handler task
+        # and a triage on the event loop run concurrently, so each must show
+        # and clear exactly its own phrase.
+        self._activity_phrases.add(phrase)
+        self._status_dirty.set()
+        try:
+            yield
+        finally:
+            self._activity_phrases.discard(phrase)
+            self._status_dirty.set()
 
     async def _event_loop(self) -> None:
         """Run queued jobs one at a time until shutdown or the sentinel."""
@@ -433,9 +487,12 @@ class SessionBroker:
             The decision reply for the hook.
         """
         payload = PermissionRequestPayload.model_validate(env.payload)
-        decision = await self.permission.decide(
-            payload.tool_name, payload.tool_input, payload.permission_suggestions
-        )
+        with self._activity(PHRASE_PERMISSION):
+            decision = await self.permission.decide(
+                payload.tool_name,
+                payload.tool_input,
+                payload.permission_suggestions,
+            )
         if decision == DECISION_ALLOW:
             reply = PermissionDecisionPayload(decision=DECISION_ALLOW)
         else:
@@ -572,7 +629,7 @@ class SessionBroker:
         if name == "SessionStart":
             self._bind_session(raw)
         elif name == "Stop":
-            self._permission_prompt_pending = False
+            self._set_perm_pending(False)
             message = str(raw.get("last_assistant_message", "") or "")
             self.queue.put_nowait(lambda: self._on_turn_end(message))
         elif name == "StopFailure":
@@ -586,7 +643,7 @@ class SessionBroker:
             self._on_pre_tool_use(raw)
         elif name in {"UserPromptSubmit", "PostToolUse"}:
             if name == "PostToolUse":
-                self._permission_prompt_pending = False
+                self._set_perm_pending(False)
                 tool_name, tool_input = _raw_tool(raw)
                 self.permission.note_tool_completed(tool_name, tool_input)
             else:
@@ -596,7 +653,7 @@ class SessionBroker:
         elif name == "Notification":
             self._log("notification", "", str(raw.get("message", "")))
             if raw.get("notification_type") == "permission_prompt":
-                self._permission_prompt_pending = True
+                self._set_perm_pending(True)
                 if self.state == SessionState.DRIVING:
                     self._set_state(SessionState.BLOCKED_PERMISSION)
         elif name == "SessionEnd":
@@ -675,14 +732,15 @@ class SessionBroker:
         events = self._read_transcript()  # context ONLY; input is the message
         self._last_event_count = len(events)
         assert self._llm_call is not None
-        result = await triage(
-            self._llm_call,
-            self.broker_cfg,
-            intent=self._intent(),
-            events=events,
-            event_name="Stop",
-            last_assistant_message=last_assistant_message,
-        )
+        with self._activity(PHRASE_TRIAGE):
+            result = await triage(
+                self._llm_call,
+                self.broker_cfg,
+                intent=self._intent(),
+                events=events,
+                event_name="Stop",
+                last_assistant_message=last_assistant_message,
+            )
         if isinstance(result, AnswerCall):
             if self.budget_count >= self.cfg.budget_max:
                 await self._escalate_handover(result, last_assistant_message, events)
@@ -1098,6 +1156,12 @@ class SessionBroker:
         """Assign a new state and log the transition."""
         logger.info("session %s: %s -> %s", self.cfg.name, self.state, state)
         self.state = state
+        self._status_dirty.set()
+
+    def _set_perm_pending(self, pending: bool) -> None:
+        """Record whether the session sits on a native permission prompt."""
+        self._permission_prompt_pending = pending
+        self._status_dirty.set()
 
     def _herdr_state(self) -> str:
         """Report the agent's state as Herdr sees it, for the watchdog gate.
