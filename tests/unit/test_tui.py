@@ -250,6 +250,45 @@ async def test_inject_runs_a_scenario_end_to_end(home: Path) -> None:
         assert app.query_one("#box", PromptArea).disabled is False
 
 
+def _fleet_text(app: BrokerMasterApp) -> str:
+    content = app.query_one("#fleet-table", Static).content
+    assert isinstance(content, Text)
+    return content.plain
+
+
+async def test_fleet_panel_updates_and_worker_clears_master_activity(
+    home: Path,
+) -> None:
+    llm = GatedLLM(reply="ok", gated=True)
+    app = make_app(home, llm)
+    async with app.run_test() as pilot:
+        # serve() publishes the initial snapshot once the socket is up.
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if "Master — idle" in _fleet_text(app):
+                break
+        else:
+            raise AssertionError(f"no initial fleet render: {_fleet_text(app)!r}")
+        await pilot.click("#box")
+        await pilot.press(*"hello")
+        await pilot.press("enter")
+        # The turn is gated inside the LLM call: the header shows thinking.
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if "Master — thinking…" in _fleet_text(app):
+                break
+        else:
+            raise AssertionError(f"no thinking header: {_fleet_text(app)!r}")
+        llm.release.set()
+        # Worker finish clears the master activity back to idle.
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if "Master — idle" in _fleet_text(app):
+                break
+        else:
+            raise AssertionError(f"header never cleared: {_fleet_text(app)!r}")
+
+
 async def test_app_mounts_serves_and_unmounts_cleanly(home: Path) -> None:
     app = make_app(home, GatedLLM())
     async with app.run_test() as pilot:

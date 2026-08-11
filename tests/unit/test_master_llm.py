@@ -344,6 +344,29 @@ async def test_conversation_log_windowed_not_wholesale(
     assert f"old-entry-{runtime.cfg.recent_turns_window + 14}" in recent
 
 
+async def test_on_activity_reports_thinking_then_the_tool_phrase(
+    runtime: RecordingRuntime,
+) -> None:
+    fake = FakeLLM(
+        [
+            TurnResult(
+                tool_calls=[
+                    ToolCall(
+                        name="spawn_session",
+                        input={"intent": "task", "cwd": "/private/tmp"},
+                    )
+                ]
+            ),
+            TurnResult(text="spawned"),
+        ]
+    )
+    master = make_master(runtime, fake)
+    activities: list[str] = []
+    await master.handle_developer_message("go", on_activity=activities.append)
+    # One "thinking…" per LLM round, the tool's own phrase before it runs.
+    assert activities == ["thinking…", "spawning a session…", "thinking…"]
+
+
 def test_master_tools_are_strict_and_complete() -> None:
     names = [t["name"] for t in MASTER_TOOLS]
     assert names == [

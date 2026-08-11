@@ -19,17 +19,21 @@ from broker.herdr import driver
 from broker.master.messages import (
     CompletionArrived,
     EscalationArrived,
+    FleetChanged,
     Notice,
     PermissionEscalationArrived,
     ProposalArrived,
     QueueDepthChanged,
+    SessionStatusChanged,
 )
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry, SessionRecord
 from broker.master.runtime import (
+    FLEET_WIDTH,
     PANE_UNKNOWN,
     MasterRuntime,
     render_escalation,
+    render_fleet,
     render_permission_escalation,
 )
 from broker.protocol import client
@@ -44,6 +48,7 @@ from broker.protocol.constants import (
     T_ESCALATION,
     T_FATAL_ERROR,
     T_GET_PERMISSION_LOG,
+    T_LIVE_STATUS,
     T_PERMISSION_ESCALATION,
     T_PROMPT_PROPOSAL,
     T_REACTIVATE,
@@ -880,6 +885,12 @@ async def test_dispatch_delivers_decision_when_live(
         assert env.payload["escalation_id"] == "e1"
         assert env.payload["response"] == "use option B"
         assert runtime.queue.active is None
+        # Single authority: the master never invents DRIVING at dispatch —
+        # the state stays until the broker reports its own transition.
+        assert runtime.registry.get("s1").state == "escalated"
+        assert (
+            await send(runtime, T_LIVE_STATUS, {"state": "driving"})
+        ).ok
         assert runtime.registry.get("s1").state == "driving"
     finally:
         server.close()
@@ -1299,6 +1310,206 @@ async def test_attach_retracts_stranded_escalations(
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("e1" in t and "retracted" in t for t in notices)
     assert any("p1" in t and "retracted" in t for t in notices)
+
+
+def test_render_fleet_blocks_show_state_perm_activity_budget_intent() -> None:
+    records = {
+        "s1": SessionRecord(
+            name="s1",
+            socket_path="/private/tmp/s1.sock",
+            cwd="/private/tmp",
+            anchor_pane="%1",
+            state=SessionState.DRIVING,
+            intent="Fix the auth bug in the checkout flow before the demo",
+        ),
+        "s2": SessionRecord(
+            name="s2",
+            socket_path="/private/tmp/s2.sock",
+            cwd="/private/tmp",
+            anchor_pane="%1",
+            state=SessionState.BLOCKED_PERMISSION,
+            approved_prompt="Migrate the users table",
+            budget_count=5,
+        ),
+    }
+    rendered = render_fleet(
+        records,
+        {"s1": "reviewing the latest turn…"},
+        {"s2"},
+        "thinking…",
+        8,
+    )
+    lines = rendered.splitlines()
+    assert lines[0] == "Master — thinking…"
+    # Every line fits the fleet pane; nothing wraps and breaks alignment.
+    assert all(len(line) <= FLEET_WIDTH for line in lines)
+    s1_head, s1_intent, s1_act = lines[2], lines[3], lines[4]
+    # State text is the live SessionState VALUE, not the enum name.
+    assert "driving" in s1_head
+    assert "0/8" in s1_head
+    assert "⚠" not in s1_head  # perm cell blank when no prompt is pending
+    assert s1_intent.startswith("    Fix the auth bug")
+    assert s1_intent.endswith("…")  # the long intent is truncated
+    assert s1_act.strip() == "reviewing the latest turn…"
+    s2_head, s2_intent = lines[6], lines[7]
+    assert "blocked_permission" in s2_head
+    assert "⚠" in s2_head
+    assert "5/8" in s2_head
+    assert "Migrate the users table" in s2_intent  # approved prompt wins
+
+
+def test_render_fleet_idle_master_and_empty_registry() -> None:
+    rendered = render_fleet({}, {}, set(), None, 8)
+    assert rendered.splitlines()[0] == "Master — idle"
+    assert "(no sessions)" in rendered
+
+
+async def test_live_status_updates_state_activity_and_perm(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    runtime, posts = rt
+    resp = await send(
+        runtime,
+        T_LIVE_STATUS,
+        {
+            "state": "blocked_permission",
+            "activity": "reviewing a permission request…",
+            "permission_pending": True,
+        },
+    )
+    assert resp.ok  # every push is ACKed so the sender never spins
+    assert runtime.registry.get("s1").state == "blocked_permission"
+    fleets = [m for m in posts if isinstance(m, FleetChanged)]
+    assert fleets  # the push published a fresh snapshot
+    last = fleets[-1].rendered
+    assert "blocked_permission" in last
+    assert "⚠" in last
+    assert "reviewing a permission request…" in last
+    # A follow-up clearing push empties activity and the PERM column.
+    resp = await send(
+        runtime,
+        T_LIVE_STATUS,
+        {"state": "driving", "activity": "", "permission_pending": False},
+    )
+    assert resp.ok
+    last = [m for m in posts if isinstance(m, FleetChanged)][-1].rendered
+    assert "driving" in last
+    assert "⚠" not in last
+    assert "reviewing a permission request…" not in last
+    # A push from an unknown session is still ACKed.
+    resp = await send(
+        runtime, T_LIVE_STATUS, {"state": "driving"}, session="ghost"
+    )
+    assert resp.ok
+
+
+async def test_set_state_is_idempotent(
+    rt: tuple[MasterRuntime, list[Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, posts = rt
+    saves: list[int] = []
+    orig_save = runtime.registry.save
+
+    def counting_save() -> None:
+        saves.append(1)
+        orig_save()
+
+    monkeypatch.setattr(runtime.registry, "save", counting_save)
+    assert (await send(runtime, T_LIVE_STATUS, {"state": "escalated"})).ok
+    changed = [m for m in posts if isinstance(m, SessionStatusChanged)]
+    assert len(changed) == 1
+    assert len(saves) == 1
+    fleet_count = len([m for m in posts if isinstance(m, FleetChanged)])
+    # The same state again: no second announcement, no second save — but the
+    # snapshot still publishes for the activity/perm side of the push.
+    assert (await send(runtime, T_LIVE_STATUS, {"state": "escalated"})).ok
+    changed = [m for m in posts if isinstance(m, SessionStatusChanged)]
+    assert len(changed) == 1
+    assert len(saves) == 1
+    assert (
+        len([m for m in posts if isinstance(m, FleetChanged)])
+        == fleet_count + 1
+    )
+
+
+async def test_absorbing_state_ignores_late_pushes(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, _ = rt
+    assert (await send(runtime, T_COMPLETION, {"summary": "done"})).ok
+    assert runtime.registry.get("s1").state == "completed"
+    # A stale in-flight push carrying an older state arrives late: it must
+    # not resurrect the settled session — but it is still ACKed.
+    resp = await send(
+        runtime,
+        T_LIVE_STATUS,
+        {"state": "driving", "activity": "reviewing the latest turn…"},
+    )
+    assert resp.ok
+    assert runtime.registry.get("s1").state == "completed"
+    # The sanctioned exit is a master-initiated boundary write: reactivate
+    # lifts the session back into work, after which pushes apply again.
+    stub = StubSession()
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        result = await runtime.reactivate_session("s1", "next task")
+        assert "reactivated" in result
+        assert runtime.registry.get("s1").state == "grounding"
+        assert (await send(runtime, T_LIVE_STATUS, {"state": "driving"})).ok
+        assert runtime.registry.get("s1").state == "driving"
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_absorbing_transition_clears_live_status(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    runtime, posts = rt
+    assert (
+        await send(
+            runtime,
+            T_LIVE_STATUS,
+            {
+                "state": "blocked_permission",
+                "activity": "reviewing a permission request…",
+                "permission_pending": True,
+            },
+        )
+    ).ok
+    # The master stops the session mid-activity. The broker is gone, so no
+    # clearing push is coming and the guard would refuse it anyway — the
+    # boundary write itself must retire the phrase and the ⚠.
+    await runtime.stop_session("s1")
+    last = [m for m in posts if isinstance(m, FleetChanged)][-1].rendered
+    assert "stopped" in last
+    assert "reviewing a permission request…" not in last
+    assert "⚠" not in last
+
+
+async def test_list_sessions_probes_rather_than_reading_the_pushed_map(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, _ = rt
+    # The last push said no prompt was pending — as after a master restart,
+    # where the transient map is empty and no re-seeding push is coming for a
+    # session already sitting on its prompt.
+    assert (
+        await send(
+            runtime,
+            T_LIVE_STATUS,
+            {"state": "blocked_permission", "permission_pending": False},
+        )
+    ).ok
+    stub = StatusSession(permission_prompt=True)
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        listing = await runtime.render_sessions_with_permission_prompts()
+        # The tool's authoritative probe wins over the stale pushed state.
+        assert "sitting on a permission prompt" in listing
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 async def test_reactivate_relays_the_intent_and_supersedes_the_old_one(

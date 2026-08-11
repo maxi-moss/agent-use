@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,15 +29,22 @@ from broker.protocol.constants import (
     T_FATAL_ERROR,
     T_GET_PERMISSION_LOG,
     T_HOOK_EVENT,
+    T_LIVE_STATUS,
     T_PERMISSION_REQUEST,
     T_PROMPT_PROPOSAL,
     T_REACTIVATE,
     T_RETRACT,
+    T_SHUTDOWN,
     T_STATUS,
 )
 from broker.protocol.schemas import Envelope, Response
 from broker.protocol.server import serve_unix
-from broker.session.broker import SessionBroker
+from broker.session.broker import (
+    PHRASE_GROUNDING,
+    PHRASE_PERMISSION,
+    PHRASE_TRIAGE,
+    SessionBroker,
+)
 from broker.config import (
     AdoptedSession,
     ClassifierConfig,
@@ -178,8 +185,14 @@ class SpyPermission(PermissionModule):
 class StubMaster:
     def __init__(self) -> None:
         self.received: list[Envelope] = []
+        # Message types whose NEXT delivery is refused (dropped connection),
+        # each consumed on first use — models one failed ACK.
+        self.fail_types: set[str] = set()
 
     async def __call__(self, env: Envelope) -> Response | None:
+        if env.type in self.fail_types:
+            self.fail_types.discard(env.type)
+            raise ConnectionError("scripted delivery failure")
         self.received.append(env)
         return Response(id=env.id, ok=True)
 
@@ -263,6 +276,27 @@ async def wait_state(
             await asyncio.sleep(0.01)
 
 
+async def wait_live(
+    master: StubMaster,
+    pred: Callable[[dict[str, Any]], bool],
+    *,
+    after: int = 0,
+    timeout: float = 5.0,
+) -> tuple[int, dict[str, Any]]:
+    """Wait for a live-status push matching ``pred``, scanning from ``after``.
+
+    Returns:
+        The absolute index of the matching envelope in ``master.received``
+        and its payload, so follow-up waits can scan past it.
+    """
+    async with asyncio.timeout(timeout):
+        while True:
+            for i, env in enumerate(master.received[after:], start=after):
+                if env.type == T_LIVE_STATUS and pred(env.payload):
+                    return i, env.payload
+            await asyncio.sleep(0.01)
+
+
 @pytest.fixture
 def home(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     with tempfile.TemporaryDirectory(dir="/private/tmp") as d:
@@ -285,6 +319,9 @@ async def _harness(
     cwd.mkdir()
     run = ScriptedRun()
     monkeypatch.setattr(driver.subprocess, "run", run)
+    # ScriptedRun splits no real pane, so the driver's pane-ready delay is
+    # 4 dead seconds per test here.
+    monkeypatch.setattr("broker.herdr.driver._PANE_READY_DELAY_S", 0.0)
     llm = FakeLLM()
     classifier = FakePermissionLLM()
     master = StubMaster()
@@ -959,3 +996,120 @@ async def test_status_answers_with_bound_identifiers(harness: Harness) -> None:
     assert resp.payload["pane_id"] == "w3:p2"
     assert resp.payload["claude_session_id"] == "cc-1"
     assert resp.payload["transcript_path"] == str(harness.transcript)
+
+
+async def test_state_changes_push_live_status_with_activity(
+    harness: Harness,
+) -> None:
+    h = harness
+    await client.notify(
+        h.sock,
+        hook_env(
+            "SessionStart",
+            {"session_id": "cc-1", "transcript_path": str(h.transcript)},
+        ),
+    )
+    # The grounding call is parked on the empty fake LLM, so the push carries
+    # the state and the phrase together.
+    _, p = await wait_live(h.master, lambda p: p["state"] == "grounding")
+    assert PHRASE_GROUNDING in p["activity"]
+    await ground_and_approve(h, count=1, prompt="APPROVED PROMPT")
+    # Grounding done: the phrase was discarded and the state moved on.
+    _, p = await wait_live(
+        h.master,
+        lambda p: p["state"] == "driving" and p["activity"] == "",
+    )
+    assert p["permission_pending"] is False
+
+
+async def test_concurrent_phrases_both_appear_and_clear_independently(
+    harness: Harness,
+) -> None:
+    h = harness
+    await launch(h)
+    # Turn triage in flight on the serial event loop (empty LLM queue).
+    await client.notify(
+        h.sock, hook_env("Stop", {"last_assistant_message": "which way?"})
+    )
+    await wait_live(h.master, lambda p: PHRASE_TRIAGE in p["activity"])
+    # A permission decision in flight on a socket-handler task, concurrently.
+    req = asyncio.create_task(
+        client.request(
+            h.sock, permission_env("Bash", {"command": "ls"}), timeout_s=5.0
+        )
+    )
+    both, _ = await wait_live(
+        h.master,
+        lambda p: PHRASE_TRIAGE in p["activity"]
+        and PHRASE_PERMISSION in p["activity"],
+    )
+    # The permission decision resolves and clears ONLY its own phrase.
+    await h.classifier.script("allow", "a listing is reversible")
+    resp = await req
+    assert resp.payload["decision"] == "allow"
+    cleared, _ = await wait_live(
+        h.master,
+        lambda p: PHRASE_TRIAGE in p["activity"]
+        and PHRASE_PERMISSION not in p["activity"],
+        after=both + 1,
+    )
+    # The triage resolves and the activity goes idle.
+    await h.llm.results.put(ANSWER_RESULT)
+    await wait_live(
+        h.master, lambda p: p["activity"] == "", after=cleared + 1
+    )
+
+
+async def test_permission_prompt_notification_is_pushed(
+    harness: Harness,
+) -> None:
+    h = harness
+    await launch(h)
+    mark = len(h.master.received)
+    await client.notify(
+        h.sock,
+        hook_env("Notification", {"notification_type": "permission_prompt"}),
+    )
+    _, p = await wait_live(
+        h.master, lambda p: p["permission_pending"] is True, after=mark
+    )
+    assert p["state"] == "blocked_permission"
+
+
+async def test_failed_push_is_retried(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("broker.session.broker.STATUS_RETRY_S", 0.05)
+    h = harness
+    await launch(h)
+    await wait_live(h.master, lambda p: p["state"] == "driving")
+    mark = len(h.master.received)
+    h.master.fail_types.add(T_LIVE_STATUS)
+    # Exactly one change after the scripted failure: only the retry can
+    # deliver it.
+    await client.notify(
+        h.sock,
+        hook_env("Notification", {"notification_type": "permission_prompt"}),
+    )
+    _, p = await wait_live(
+        h.master, lambda p: p["permission_pending"] is True, after=mark
+    )
+    assert p["state"] == "blocked_permission"
+    assert h.master.fail_types == set()  # the first attempt really failed
+
+
+async def test_shutdown_cancels_the_status_sender_cleanly(
+    harness: Harness,
+) -> None:
+    h = harness
+    await launch(h)
+    resp = await client.request(
+        h.sock,
+        Envelope(id=uuid.uuid4().hex, type=T_SHUTDOWN, session_id="s1"),
+        timeout_s=5.0,
+    )
+    assert resp.ok is True
+    # run() returns only once its finally cancelled and awaited the sender;
+    # a sender parked in its wait() would hang this forever.
+    async with asyncio.timeout(5.0):
+        await h.run_task
