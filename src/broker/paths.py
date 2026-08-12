@@ -48,6 +48,11 @@ class BrokerPaths:
         """The master's append-only conversation log."""
         return self.logs / "master-log.ndjson"
 
+    @property
+    def llm_timings(self) -> Path:
+        """Shared append-only LLM-call timing log, written by master and sessions."""
+        return self.logs / "llm-timings.ndjson"
+
     def session_logs(self, name: str) -> Path:
         """Log directory for session ``name``."""
         return self.logs / "sessions" / name
