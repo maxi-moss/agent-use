@@ -18,6 +18,7 @@ from anthropic.types import (
 )
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from broker import diagnostics
 from broker import prompts
 from broker.config import BrokerConfig
 from broker.llm import LLMCaller, LLMCallError, ToolCall, strict_tool
@@ -72,7 +73,7 @@ class ProposePromptCall(BaseModel):
 TriageResult = AnswerCall | EscalateCall | CompleteCall | NoActionCall
 
 
-_tool = strict_tool  # derivation now lives in broker.llm (neutral module)
+_tool = strict_tool  # derivation lives in broker.llm (neutral module)
 
 
 TRIAGE_TOOLS: list[ToolParam] = [
@@ -167,6 +168,7 @@ def assemble_context(
     return system, messages
 
 
+@diagnostics.timed("triage")
 async def triage(
     llm_call: LLMCaller[ToolCall],
     cfg: BrokerConfig,
@@ -251,6 +253,7 @@ def _git_ls_files(cwd: Path) -> str:
     return "\n".join(head)
 
 
+@diagnostics.timed("grounding")
 async def ground_intent(
     llm_call: LLMCaller[ToolCall],
     cfg: BrokerConfig,
