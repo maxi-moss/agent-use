@@ -71,6 +71,12 @@ The same scenarios run headless as part of the test suite:
 uv run pytest tests/scenarios -v
 ```
 
+## Calibration
+
+The two judgment prompts — triage (`prompts/triage.md`) and permission (`prompts/permission.md`) — are tuned against a small set of developer-owned cases in `calibration-cases/`, each carrying the answer-or-escalate (or allow-or-escalate) label the developer stands behind. `scripts/calibrate.py` feeds each case through the **real** triage and permission stacks against the pinned models and prints the model's decision and reasoning beside the recorded label, plus the aggregate escalation rate. It makes real API calls and is a tuning aid, never a CI gate — the only automated check is an offline schema guard on the case files.
+
+`scripts/cache_probe.py` issues two identical triage calls and reports the prompt-cache token counts, so caching is measured rather than assumed.
+
 ## Source tree
 
 ```bash
@@ -87,6 +93,8 @@ src/broker/
   herdr/         Herdr CLI driver
   transcript/    Transcript reading: raw JSONL -> validated events
   claude/        Claude Code config: paths, settings, trust
+  calibration/   Calibration case schemas (offline prompt tuning)
+calibration-cases/  Developer-owned triage/permission cases
 tests/
   unit/          Fast, no I/O
   integration/   Real subprocess and IO boundaries
