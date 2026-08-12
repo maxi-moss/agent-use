@@ -22,6 +22,7 @@ from anthropic.types import (
 )
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from broker import llm_timing
 from broker import prompts
 from broker.config import BrokerConfig
 from broker.paths import BrokerPaths
@@ -429,6 +430,7 @@ class MasterLLM:
 def bind_call_turn(client: AsyncAnthropic) -> LLMCaller[TurnResult]:
     """Production binding of the injected seam (tests pass a fake)."""
 
+    @llm_timing.timed("master")
     async def call(
         *,
         model: str,

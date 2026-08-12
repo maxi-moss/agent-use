@@ -18,7 +18,7 @@ from anthropic.types import (
 )
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from broker import diagnostics
+from broker import llm_timing
 from broker import prompts
 from broker.config import BrokerConfig
 from broker.llm import LLMCaller, LLMCallError, ToolCall, strict_tool
@@ -168,7 +168,7 @@ def assemble_context(
     return system, messages
 
 
-@diagnostics.timed("triage")
+@llm_timing.timed("triage")
 async def triage(
     llm_call: LLMCaller[ToolCall],
     cfg: BrokerConfig,
@@ -253,7 +253,7 @@ def _git_ls_files(cwd: Path) -> str:
     return "\n".join(head)
 
 
-@diagnostics.timed("grounding")
+@llm_timing.timed("grounding")
 async def ground_intent(
     llm_call: LLMCaller[ToolCall],
     cfg: BrokerConfig,

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from broker import config as broker_config
+from broker import llm_timing
 from broker import logging_setup
 from broker.claude.settings import register_hooks, verify_and_repair
 from broker.herdr import driver
@@ -98,6 +99,7 @@ def main() -> None:
     cfg = broker_config.load()
     paths = BrokerPaths(cfg.broker_home)
     logging_setup.configure(paths.master_log)
+    llm_timing.configure(paths.llm_timings, "master")
     registry = Registry.load(paths.registry)
     try:
         queue = EscalationQueue.load(paths.escalation_queue)

@@ -28,6 +28,7 @@ from anthropic.types import (
 )
 from pydantic import BaseModel, ValidationError
 
+from broker import llm_timing
 from broker import prompts
 from broker.config import ClassifierConfig
 from broker.permission.schemas import AllowCall, EscalateCall, PermissionResult
@@ -311,6 +312,7 @@ def assemble_context(
     return system, messages
 
 
+@llm_timing.timed("permission")
 async def classify(
     llm_call: PermissionCaller,
     cfg: ClassifierConfig,
