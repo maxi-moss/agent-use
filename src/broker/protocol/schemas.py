@@ -80,6 +80,24 @@ class PermissionDecisionPayload(BaseModel):
     decision: Literal["allow", "escalated"]
 
 
+class AskQuestionRequestPayload(BaseModel):
+    """hook -> broker: a pending AskUserQuestion awaiting a decision."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    tool_input: dict[str, Any]
+    tool_use_id: str
+
+
+class AskQuestionDecisionPayload(BaseModel):
+    """broker -> hook reply for a pending AskUserQuestion."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    decision: Literal["answer", "escalated"]
+    updated_input: dict[str, Any] | None = None
+
+
 class HookEventPayload(BaseModel):
     """Fire-and-forget wrapper for every non-PreToolUse hook event."""
 

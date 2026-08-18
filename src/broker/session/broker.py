@@ -2,8 +2,9 @@
 
 Structure:
 - `handle()` is the socket handler and does NO slow work: it replies, then
-  enqueues. The one exception is permission_request, which is answered in the
-  handler because it must never queue behind an unrelated turn triage.
+  enqueues. The exceptions are permission_request and ask_question, answered
+  inline because a hook blocks on each — they must never queue behind an
+  unrelated turn triage.
 - The serial event queue is the only place pane writes happen.
 - Classification input is `last_assistant_message` from the Stop payload,
   never the transcript tail. The watchdog reconciliation is the
@@ -14,6 +15,7 @@ Structure:
 
 import asyncio
 import contextlib
+import json
 import logging
 import uuid
 from collections.abc import Awaitable, Callable, Generator
@@ -44,12 +46,14 @@ from broker.permission import PermissionModule, render_permission_log
 from broker.protocol import client
 from broker.protocol.constants import (
     ACTIVE_STATES,
+    ASK_DECISION_ANSWER,
     DECISION_ALLOW,
     DECISION_ESCALATED,
     NACK_STALE_PROPOSAL,
     NACK_WRONG_STATE,
     SessionState,
     T_APPROVE_PROMPT,
+    T_ASK_QUESTION,
     T_BUDGET_UPDATE,
     T_COMPLETION,
     T_DISPATCH_DECISION,
@@ -71,6 +75,8 @@ from broker.protocol.server import serve_unix
 from broker.protocol.schemas import (
     Alternative,
     ApprovePromptPayload,
+    AskQuestionDecisionPayload,
+    AskQuestionRequestPayload,
     DecisionLogPayload,
     DispatchDecisionPayload,
     Envelope,
@@ -86,7 +92,7 @@ from broker.protocol.schemas import (
     SendPromptPayload,
     StatusPayload,
 )
-from broker.session import decision_log
+from broker.session import ask, decision_log
 from broker.session.triage import (
     AnswerCall,
     CompleteCall,
@@ -111,6 +117,15 @@ SUBMIT_TIMEOUT_S = 15.0
 MASTER_TIMEOUT_S = 10.0
 SESSION_BIND_TIMEOUT_S = 60.0
 
+# Both waits are named and bounded (global rule). The decision deadline sits
+# inside HOOK_WAIT_SECONDS (30) so the hook never gives up while the broker
+# still intends to answer — a reply after hook death would be an answer the
+# broker believes in and Claude Code never saw.
+ASK_DECISION_TIMEOUT_S = 20.0
+# updatedInput delivery is instantaneous when it works (duration_ms: 0
+# observed); this only fires when the mechanism broke or a hook was dropped.
+ASK_VERIFY_TIMEOUT_S = 30.0
+
 # Forwarded to the claude binary at spawn. "auto" classifies each tool call and
 # still prompts on the risky ones, so the hook's escalation path survives;
 # "bypassPermissions" would silently approve every escalation.
@@ -122,6 +137,7 @@ ASK_USER_QUESTION = "AskUserQuestion"
 PHRASE_GROUNDING = "constructing the prompt…"
 PHRASE_TRIAGE = "reviewing the latest turn…"
 PHRASE_PERMISSION = "reviewing a permission request…"
+PHRASE_ASK = "deciding a question…"
 
 STATUS_RETRY_S = 1.0
 
@@ -211,7 +227,9 @@ class SessionBroker:
 
         self._active_escalation: EscalationPayload | None = None
         self._pending_ask_id: str | None = None
-        self._seen_ask_ids: set[str] = set()
+        self._ask_decisions: dict[str, AskQuestionDecisionPayload] = {}
+        self._ask_expected: dict[str, dict[str, ask.AnswerValue]] = {}
+        self._ask_verify_tasks: dict[str, asyncio.Task[None]] = {}
         self._permission_prompt_pending = False
         self._user_prompt_baseline = 0
         self._last_event_count = -1
@@ -255,6 +273,10 @@ class SessionBroker:
             self._status_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._status_task
+            for task in list(self._ask_verify_tasks.values()):
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
             await self.watchdog.stop()
             server.close()
             await server.wait_closed()
@@ -499,6 +521,124 @@ class SessionBroker:
             reply = PermissionDecisionPayload(decision=DECISION_ESCALATED)
         return Response(id=env.id, ok=True, payload=reply.model_dump())
 
+    async def _on_ask_question(self, env: Envelope) -> Response:
+        """Decide a pending AskUserQuestion and reply answer-or-escalated.
+
+        Args:
+            env: Envelope carrying an ``AskQuestionRequestPayload``.
+
+        Returns:
+            The decision reply for the hook.
+        """
+        self.watchdog.reset()
+        payload = AskQuestionRequestPayload.model_validate(env.payload)
+        # Cached per tool_use_id: PreToolUse can fire several times per logical
+        # operation, and a duplicate must get the same reply without a second
+        # LLM call.
+        cached = self._ask_decisions.get(payload.tool_use_id)
+        if cached is None:
+            with self._activity(PHRASE_ASK):
+                cached = await self._decide_ask(payload)
+            self._ask_decisions[payload.tool_use_id] = cached
+        return Response(id=env.id, ok=True, payload=cached.model_dump())
+
+    async def _decide_ask(
+        self, payload: AskQuestionRequestPayload
+    ) -> AskQuestionDecisionPayload:
+        """Run the answer-or-escalate decision for one pending menu.
+
+        Every failure arm returns ``escalated`` — the safe default that hands
+        the menu to the developer rather than answering it.
+
+        Args:
+            payload: The pending question payload from the hook.
+
+        Returns:
+            The reply payload to cache and send to the hook.
+        """
+        tool_use_id = payload.tool_use_id
+        escalated = AskQuestionDecisionPayload(decision=DECISION_ESCALATED)
+        if self.state not in ACTIVE_STATES:
+            # The developer is already engaged (escalated/completed/...): do
+            # not raise a second escalation on top; let the picker render.
+            self._log(
+                "ask_skipped",
+                f"question arrived in state {self.state!r}; picker left to "
+                "the developer",
+                tool_use_id,
+            )
+            return escalated
+        try:
+            questions = ask.parse_questions(payload.tool_input)
+        except ask.AskInputError as exc:
+            self._enqueue_ask_escalation(
+                payload.tool_input, tool_use_id, None,
+                f"unusable question payload: {exc}",
+            )
+            return escalated
+        if self.budget_count >= self.cfg.budget_max:
+            self._enqueue_ask_escalation(
+                payload.tool_input, tool_use_id, None,
+                "autonomy budget exhausted — this question is handed over "
+                "rather than answered",
+            )
+            return escalated
+        assert self._llm_call is not None
+        try:
+            async with asyncio.timeout(ASK_DECISION_TIMEOUT_S):
+                events = self._read_transcript()
+                result = await ask.decide_questions(
+                    self._llm_call,
+                    self.broker_cfg,
+                    intent=self._intent(),
+                    events=events,
+                    questions=questions,
+                )
+        except Exception as exc:
+            # Deliberately broad: LLMCallError, AnswerValidationError (both
+            # attempts), timeout, and transcript failure all escalate rather
+            # than narrowing to one type and dropping the rest.
+            self._enqueue_ask_escalation(
+                payload.tool_input, tool_use_id, None,
+                f"{type(exc).__name__}: {exc}",
+            )
+            return escalated
+        if isinstance(result, ask.EscalateCall):
+            self._enqueue_ask_escalation(
+                payload.tool_input, tool_use_id, result, result.reasoning
+            )
+            return escalated
+        call, answers = result
+        updated_input = dict(payload.tool_input)
+        updated_input["answers"] = answers
+        self._log("ask_answered", call.reasoning, json.dumps(answers))
+        self._ask_expected[tool_use_id] = answers
+        self._spawn_ask_verify(tool_use_id)
+        self.budget_count += 1
+        # Queued, and captured by value: the hook is blocking on this return,
+        # so master traffic never runs on the reply path, and the job must
+        # report the count as of this answer, not whatever it is when the
+        # queue drains.
+        count = self.budget_count
+        self.queue.put_nowait(
+            lambda: self._to_master(T_BUDGET_UPDATE, {"count": count})
+        )
+        return AskQuestionDecisionPayload(
+            decision=ASK_DECISION_ANSWER, updated_input=updated_input
+        )
+
+    def _enqueue_ask_escalation(
+        self,
+        tool_input: dict[str, Any],
+        tool_use_id: str,
+        esc: ask.EscalateCall | None,
+        reasoning: str,
+    ) -> None:
+        """Queue the escalation raise so the hook reply is never delayed by it."""
+        self.queue.put_nowait(
+            lambda: self._ask_escalate(tool_input, tool_use_id, esc, reasoning)
+        )
+
     async def _handle(self, env: Envelope) -> Response | None:
         """Reply to one message type, enqueuing anything slow onto the queue.
 
@@ -512,6 +652,9 @@ class SessionBroker:
         """
         if env.type == T_PERMISSION_REQUEST:
             return await self._on_permission_request(env)
+
+        if env.type == T_ASK_QUESTION:
+            return await self._on_ask_question(env)
 
         if env.type == T_HOOK_EVENT:
             self.watchdog.reset()
@@ -616,8 +759,7 @@ class SessionBroker:
 
         ``Stop`` carries the classification input as ``last_assistant_message``,
         never the transcript tail. ``StopFailure`` is surfaced as fatal, not
-        treated as a completed turn. ``PreToolUse`` reaches this broker only
-        for ``AskUserQuestion``, whose native menu no broker can drive.
+        treated as a completed turn.
 
         Args:
             hook: Validated hook payload; ``raw`` is the untyped hook JSON.
@@ -637,13 +779,13 @@ class SessionBroker:
             detail = str(raw.get("message") or raw)
             # Surfaced, NOT a completed turn.
             self.queue.put_nowait(lambda: self._fatal(error_class, detail))
-        elif name == "PreToolUse":
-            self._on_pre_tool_use(raw)
         elif name in {"UserPromptSubmit", "PostToolUse"}:
             if name == "PostToolUse":
                 self._set_perm_pending(False)
                 tool_name, tool_input = _raw_tool(raw)
                 self.permission.note_tool_completed(tool_name, tool_input)
+                if tool_name == ASK_USER_QUESTION:
+                    self._verify_ask(raw)
             else:
                 self.permission.note_developer_input()
             if self.state == SessionState.ESCALATED:
@@ -660,24 +802,6 @@ class SessionBroker:
             self._log("compaction", "", name)  # continue normally
         else:
             logger.debug("unhandled hook event %s", name)
-
-    def _on_pre_tool_use(self, raw: dict[str, Any]) -> None:
-        """Escalate a pending ``AskUserQuestion``, once per tool use.
-
-        Args:
-            raw: Raw ``PreToolUse`` hook JSON.
-        """
-        tool_name, tool_input = _raw_tool(raw)
-        if tool_name != ASK_USER_QUESTION:
-            return
-        tool_use_id = str(raw.get("tool_use_id", "") or "")
-        # PreToolUse can fire several times per logical operation.
-        if tool_use_id in self._seen_ask_ids:
-            return
-        self._seen_ask_ids.add(tool_use_id)
-        self.queue.put_nowait(
-            lambda: self._ask_user_question(tool_input, tool_use_id)
-        )
 
     def _bind_session(self, raw: dict[str, Any]) -> None:
         """Bind the Claude session id and transcript path from SessionStart.
@@ -856,40 +980,201 @@ class SessionBroker:
         )
         await self._raise_escalation(payload, result.reasoning, events)
 
-    async def _ask_user_question(
-        self, tool_input: dict[str, Any], tool_use_id: str
+    async def _ask_escalate(
+        self,
+        tool_input: dict[str, Any],
+        tool_use_id: str,
+        esc: ask.EscalateCall | None,
+        reasoning: str,
     ) -> None:
-        """Escalate a pending AskUserQuestion mechanically, without the LLM.
-
-        The broker cannot drive the native menu, so the escalation points the
-        developer at the pane and is retracted once they answer there.
+        """Escalate a pending AskUserQuestion; the native menu is on screen.
 
         Args:
             tool_input: Raw ``AskUserQuestion`` tool input.
             tool_use_id: Recorded as the pending ask so
                 ``_check_out_of_band_resolution`` can match the answer.
+            esc: The LLM's escalation when it ran; ``None`` on the mechanical
+                arms (bad payload, budget, LLM failure, timeout).
+            reasoning: Why this is escalated; recorded in the decision log.
         """
         rendered, alternatives, recommendation = _render_ask_user(tool_input)
+        pane_note = (
+            f"The native menu is on screen in pane {self.pane_id or '?'} — "
+            "answer it directly in that pane."
+        )
+        if esc is None:
+            payload = self._new_escalation(
+                situation=f"AskUserQuestion pending — {pane_note}",
+                what_was_asked=rendered,
+                what_is_at_stake=(
+                    "The session is blocked on this menu until it is "
+                    "answered."
+                ),
+                alternatives=alternatives,
+                recommendation=recommendation,
+                uncertainty=reasoning,
+                what_would_change_my_mind=(
+                    "Answering in the pane retracts this escalation "
+                    "automatically."
+                ),
+            )
+        else:
+            payload = self._new_escalation(
+                situation=esc.situation + "\n\n" + pane_note,
+                what_was_asked=esc.what_was_asked,
+                what_is_at_stake=esc.what_is_at_stake,
+                alternatives=esc.alternatives,
+                recommendation=esc.recommendation,
+                uncertainty=esc.uncertainty,
+                what_would_change_my_mind=esc.what_would_change_my_mind,
+            )
+        self._pending_ask_id = tool_use_id
+        await self._raise_escalation(payload, reasoning, None)
+
+    def _verify_ask(self, raw: dict[str, Any]) -> None:
+        """Compare the PostToolUse echo against the injected answers.
+
+        Args:
+            raw: Raw ``PostToolUse`` hook JSON for an AskUserQuestion.
+        """
+        tool_use_id = str(raw.get("tool_use_id", "") or "")
+        expected = self._ask_expected.pop(tool_use_id, None)
+        if expected is None:
+            return  # not broker-answered, or already verified
+        task = self._ask_verify_tasks.pop(tool_use_id, None)
+        if task is not None:
+            task.cancel()
+        response = raw.get("tool_response")
+        echoed: Any = (
+            cast(dict[str, Any], response).get("answers")
+            if isinstance(response, dict)
+            else None
+        )
+        if echoed == expected:
+            self._log("ask_verified", "PostToolUse echo matches", tool_use_id)
+            return
+        self.queue.put_nowait(
+            lambda: self._ask_verify_failed(
+                tool_use_id,
+                "the session recorded different answers than the broker "
+                "injected — it is proceeding on those answers",
+                answer_recorded=True,
+            )
+        )
+
+    def _spawn_ask_verify(self, tool_use_id: str) -> None:
+        """Arm the transcript backstop for one injected answer."""
+        task = asyncio.create_task(self._ask_verify_backstop(tool_use_id))
+        self._ask_verify_tasks[tool_use_id] = task
+        task.add_done_callback(
+            lambda _: self._ask_verify_tasks.pop(tool_use_id, None)
+        )
+
+    async def _ask_verify_backstop(self, tool_use_id: str) -> None:
+        """Check the transcript when no PostToolUse confirmed the answer.
+
+        Transcript writes are asynchronous and may lag the hooks, so this is
+        a bounded second look, not the primary signal.
+
+        Args:
+            tool_use_id: The injected answer being verified.
+        """
+        await asyncio.sleep(ASK_VERIFY_TIMEOUT_S)
+        expected = self._ask_expected.pop(tool_use_id, None)
+        if expected is None:
+            return  # verified by PostToolUse in the meantime
+        try:
+            answer = next(
+                (
+                    e
+                    for e in self._read_transcript()
+                    if isinstance(e, AskUserAnswer) and e.id == tool_use_id
+                ),
+                None,
+            )
+        except Exception as exc:
+            # A raise here would vanish into the task and drop verification
+            # silently. Whether an answer was recorded is unknown, so take
+            # the non-retracting arm. `exc` is cleared when this block
+            # exits, before the queued job runs — bind the reason now.
+            reason = (
+                f"verification itself failed ({type(exc).__name__}: {exc}) "
+                "— the broker cannot confirm its answers were delivered"
+            )
+            self.queue.put_nowait(
+                lambda: self._ask_verify_failed(
+                    tool_use_id, reason, answer_recorded=True
+                )
+            )
+            return
+        if answer is not None and answer.answers == expected:
+            self._log("ask_verified", "transcript backstop", tool_use_id)
+            return
+        if answer is None:
+            reason = (
+                "no answer was recorded — the injected answers may never "
+                "have been delivered and the menu may still be on screen"
+            )
+        else:
+            reason = (
+                "the recorded answers differ from what the broker injected"
+            )
+        answer_recorded = answer is not None
+        self.queue.put_nowait(
+            lambda: self._ask_verify_failed(
+                tool_use_id, reason, answer_recorded=answer_recorded
+            )
+        )
+
+    async def _ask_verify_failed(
+        self, tool_use_id: str, reason: str, *, answer_recorded: bool
+    ) -> None:
+        """Escalate a failed answer verification; the state is the message.
+
+        Args:
+            tool_use_id: The injected answer that failed verification.
+            reason: What the verification found; shown to the developer.
+            answer_recorded: Whether the session already recorded an answer
+                for this id. Gates the pending-ask auto-retract: retraction
+                keys on answer-id existence alone, so with an answer already
+                in the transcript this escalation would retract on the very
+                next hook event, before the developer ever saw it — silent
+                under-escalation. Only the undelivered arm may auto-retract
+                on a pane answer.
+        """
+        self._log("ask_verify_failed", reason, tool_use_id)
         payload = self._new_escalation(
             situation=(
-                "AskUserQuestion pending — manual input required in pane "
-                f"{self.pane_id or '?'}. The native menu is on screen; "
-                "answer it directly in that pane."
+                "AskUserQuestion answer verification failed — " + reason
+                + f" Check pane {self.pane_id or '?'} and the session's "
+                "recent turns."
             ),
-            what_was_asked=rendered,
+            what_was_asked=(
+                "Confirm what the session actually proceeded on, and correct "
+                "it in the pane if needed."
+            ),
             what_is_at_stake=(
-                "The session is blocked on this menu until it is answered."
+                "The session may be running on answers the broker did not "
+                "choose, or may be stalled on an unanswered menu."
             ),
-            alternatives=alternatives,
-            recommendation=recommendation,
-            uncertainty="This broker cannot drive menus.",
+            alternatives=[
+                Alternative(
+                    option="inspect the pane",
+                    pros="the pane and transcript are authoritative",
+                    cons="",
+                )
+            ],
+            recommendation="inspect the pane",
+            uncertainty=reason,
             what_would_change_my_mind=(
-                "Answering in the pane retracts this escalation "
-                "automatically."
+                "Answering the menu in the pane resolves this."
+                if not answer_recorded
+                else "Only your explicit decision resolves this."
             ),
         )
-        self._pending_ask_id = tool_use_id
-        await self._raise_escalation(payload, "AskUserQuestion (mechanical)", None)
+        if not answer_recorded:
+            self._pending_ask_id = tool_use_id
+        await self._raise_escalation(payload, reason, None)
 
     async def _raise_escalation(
         self,

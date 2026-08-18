@@ -5,8 +5,9 @@ on the synchronous permission path of every tool call in every supervised
 session — pydantic here would tax every single tool call.
 
 Invariants (binding):
-- stdout carries the PermissionRequest allow-decision JSON or NOTHING. Never
-  "deny", never allow-by-default.
+- stdout carries the PermissionRequest allow-decision JSON, the PreToolUse
+  AskUserQuestion answer JSON, or NOTHING. Never "deny", never
+  allow-by-default, never an answer the broker did not supply.
 - exit 0 on every path, including every exception. A dead broker degrades the
   session to stock Claude Code; it never breaks one.
 - BROKER_SOCKET unset -> immediate silent no-op (the isolation gate).
@@ -20,10 +21,12 @@ import uuid
 from typing import Any, cast
 
 from broker.protocol.constants import (
+    ASK_DECISION_ANSWER,
     DECISION_ALLOW,
     HOOK_WAIT_SECONDS,
     MAX_LINE_BYTES,
     PROTOCOL_VERSION,
+    T_ASK_QUESTION,
     T_HOOK_EVENT,
     T_PERMISSION_REQUEST,
 )
@@ -88,6 +91,7 @@ def main() -> None:
         return
 
     timeout = _timeout_seconds()
+    blocking = event in ("PermissionRequest", "PreToolUse")
 
     if event == "PermissionRequest":
         envelope = {
@@ -108,6 +112,17 @@ def main() -> None:
                 ),
             },
         }
+    elif event == "PreToolUse":
+        envelope = {
+            "v": PROTOCOL_VERSION,
+            "id": uuid.uuid4().hex,
+            "type": T_ASK_QUESTION,
+            "session_id": payload.get("session_id"),
+            "payload": {
+                "tool_input": payload.get("tool_input", {}),
+                "tool_use_id": payload.get("tool_use_id", ""),
+            },
+        }
     else:
         envelope = {
             "v": PROTOCOL_VERSION,
@@ -121,7 +136,7 @@ def main() -> None:
         sock.settimeout(timeout)
         sock.connect(sock_path)
         sock.sendall(json.dumps(envelope).encode() + b"\n")
-        if event != "PermissionRequest":
+        if not blocking:
             return  # fire-and-forget
 
         line = _read_line(sock, timeout)
@@ -134,10 +149,33 @@ def main() -> None:
         if not isinstance(raw_decision, dict):
             return
         decision_payload = cast(dict[str, Any], raw_decision)
-        if decision_payload.get("decision") == DECISION_ALLOW:
-            # The ONE sanctioned stdout write. Anything but an explicit allow
-            # (escalated / malformed / timeout) prints nothing -> native flow.
-            print(json.dumps(_ALLOW_OUTPUT))
+
+        if event == "PermissionRequest":
+            if decision_payload.get("decision") == DECISION_ALLOW:
+                # The sanctioned stdout write for permissions. Anything but an
+                # explicit allow (escalated / malformed / timeout) prints
+                # nothing -> native flow.
+                print(json.dumps(_ALLOW_OUTPUT))
+            return
+
+        # PreToolUse / AskUserQuestion: print the broker's answers, or nothing.
+        if decision_payload.get("decision") != ASK_DECISION_ANSWER:
+            return
+        updated: Any = decision_payload.get("updated_input")
+        if not isinstance(updated, dict):
+            return
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "permissionDecisionReason": "broker answered",
+                        "updatedInput": updated,
+                    }
+                }
+            )
+        )
 
 
 if __name__ == "__main__":

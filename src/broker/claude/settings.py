@@ -109,6 +109,12 @@ def register_hooks(
 ) -> None:
     """Register our hook entry for ``events`` in Claude Code's settings.
 
+    Never register a SECOND PreToolUse hook that can match AskUserQuestion,
+    in any scope: when two PreToolUse hooks match one call and a sibling
+    returns "ask", Claude Code silently drops the first hook's updatedInput
+    and an approval executes the ORIGINAL input — the broker's injected
+    answers die without an error.
+
     Args:
         events: Hook event names to register under.
         command: Hook command to install; must contain ``BROKER_HOOK_MARKER``.

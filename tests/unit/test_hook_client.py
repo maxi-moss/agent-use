@@ -63,6 +63,20 @@ ASK_USER_QUESTION_PAYLOAD = {
     "permission_mode": "default",
 }
 
+ASK_UPDATED_INPUT = {
+    "questions": [{"question": "which one?"}],
+    "answers": {"which one?": "option A"},
+}
+
+EXPECTED_ASK_ANSWER = {
+    "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "permissionDecisionReason": "broker answered",
+        "updatedInput": ASK_UPDATED_INPUT,
+    }
+}
+
 STOP_PAYLOAD = {
     "session_id": "sess-1",
     "transcript_path": "/private/tmp/x/t.jsonl",
@@ -108,6 +122,25 @@ class _StubHandler(socketserver.StreamRequestHandler):
                 "payload": {"decision": "allow"},
             }
         elif server.mode == "escalated":
+            reply = {
+                "v": 1,
+                "id": envelope["id"],
+                "type": "response",
+                "ok": True,
+                "payload": {"decision": "escalated"},
+            }
+        elif server.mode == "ask_answer":
+            reply = {
+                "v": 1,
+                "id": envelope["id"],
+                "type": "response",
+                "ok": True,
+                "payload": {
+                    "decision": "answer",
+                    "updated_input": ASK_UPDATED_INPUT,
+                },
+            }
+        elif server.mode == "ask_escalated":
             reply = {
                 "v": 1,
                 "id": envelope["id"],
@@ -193,27 +226,46 @@ def test_pretooluse_other_tool_never_connects(sock_dir: Path) -> None:
         assert stub.connections == 1
 
 
-def test_pretooluse_askuserquestion_is_fire_and_forget(sock_dir: Path) -> None:
+def test_askuserquestion_answer_prints_flat_shape(sock_dir: Path) -> None:
     sock_path = sock_dir / "broker.sock"
-    # "mute" would block a reply-waiting client; returning immediately proves
-    # no reply is expected on this event.
-    with start_stub(sock_path, "mute") as stub:
-        start = time.monotonic()
+    with start_stub(sock_path, "ask_answer") as stub:
         proc = run_hook(ASK_USER_QUESTION_PAYLOAD, sock_path)
+        assert proc.returncode == 0
+        lines = proc.stdout.splitlines()
+        assert len(lines) == 1
+        assert json.loads(lines[0]) == EXPECTED_ASK_ANSWER
+        assert len(stub.received) == 1
+        env = stub.received[0]
+        assert env["v"] == 1
+        assert env["type"] == "ask_question"
+        assert env["session_id"] == "sess-1"
+        assert env["payload"] == {
+            "tool_input": {"questions": [{"question": "which one?"}]},
+            "tool_use_id": "toolu_ask_1",
+        }
+
+
+def test_askuserquestion_escalated_prints_nothing(sock_dir: Path) -> None:
+    sock_path = sock_dir / "broker.sock"
+    with start_stub(sock_path, "ask_escalated"):
+        proc = run_hook(ASK_USER_QUESTION_PAYLOAD, sock_path)
+        assert proc.returncode == 0
+        assert proc.stdout == ""
+
+
+def test_askuserquestion_mute_prints_nothing_within_budget(
+    sock_dir: Path,
+) -> None:
+    sock_path = sock_dir / "broker.sock"
+    with start_stub(sock_path, "mute"):
+        start = time.monotonic()
+        proc = run_hook(
+            ASK_USER_QUESTION_PAYLOAD, sock_path, timeout_override="0.2"
+        )
         elapsed = time.monotonic() - start
         assert proc.returncode == 0
         assert proc.stdout == ""
-        assert elapsed < 1.0
-        deadline = time.monotonic() + 2.0
-        while not stub.received and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert len(stub.received) == 1
-        env = stub.received[0]
-        assert env["type"] == "hook_event"
-        assert env["session_id"] == "sess-1"
-        assert env["payload"]["hook_event_name"] == "PreToolUse"
-        # The broker dedups questions on the raw tool_use_id.
-        assert env["payload"]["raw"] == ASK_USER_QUESTION_PAYLOAD
+        assert elapsed < 2.0
 
 
 def test_permission_request_allow_prints_nested_shape(sock_dir: Path) -> None:

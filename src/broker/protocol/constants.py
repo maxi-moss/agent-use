@@ -21,6 +21,7 @@ T_SHUTDOWN = "shutdown"
 T_RESPONSE = "response"
 T_APPROVE_PROMPT = "approve_prompt"  # master -> broker
 T_REACTIVATE = "reactivate"  # master -> broker
+T_ASK_QUESTION = "ask_question"
 
 # Master-socket message types
 T_ESCALATION = "escalation"
@@ -46,6 +47,10 @@ NACK_WRONG_STATE = "wrong_state"
 # "escalated" deliberately avoids colliding with Claude Code's own "defer"
 DECISION_ALLOW = "allow"
 DECISION_ESCALATED = "escalated"
+
+# ask_question reply decisions — "answer" carries updated_input for the hook
+# to print; anything else (escalated / timeout / malformed) prints nothing.
+ASK_DECISION_ANSWER = "answer"
 
 
 class SessionState(StrEnum):
