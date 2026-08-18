@@ -23,6 +23,9 @@ KIND_TOOL_RESULT = "tool_result"
 #   continue with these answers in mind.
 # It is exposed verbatim as `raw`; consumers never string-match it. The only
 # parsing the public surface needs is answer-vs-denial, below.
+# A free-text answer uses a second template ("The user answered: ..."), and a
+# hook-injected multiSelect joins labels with no space — one more reason
+# consumers never string-match this prose.
 _REJECTED_TOOL_USE_RESULT = "User rejected tool use"
 _REJECTED_DENIAL_KIND = "user-rejected"
 
@@ -151,6 +154,25 @@ def _map_tool_use(block: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
     return None
 
 
+def _structured_answers(obj: dict[str, Any]) -> dict[str, str | list[str]] | None:
+    """Return toolUseResult's answers with only well-typed entries, or None."""
+    tool_use_result = _as_dict(obj.get("toolUseResult"))
+    if tool_use_result is None:
+        return None
+    raw_answers = _as_dict(tool_use_result.get("answers"))
+    if raw_answers is None:
+        return None
+    out: dict[str, str | list[str]] = {}
+    for key, value in raw_answers.items():
+        if isinstance(value, str):
+            out[key] = value
+        elif isinstance(value, list) and all(
+            isinstance(item, str) for item in cast(list[Any], value)
+        ):
+            out[key] = cast(list[str], value)
+    return out or None
+
+
 def _map_user(obj: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     """Map a user record to a prompt event or to internal tool_result pairs.
 
@@ -176,6 +198,7 @@ def _map_user(obj: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
         obj.get("toolDenialKind") == _REJECTED_DENIAL_KIND
         or obj.get("toolUseResult") == _REJECTED_TOOL_USE_RESULT
     )
+    answers = _structured_answers(obj)
     out: list[tuple[str, dict[str, Any]]] = []
     for raw_block in blocks:
         block = _as_dict(raw_block)
@@ -191,6 +214,7 @@ def _map_user(obj: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
                     "tool_use_id": tool_use_id,
                     "raw": _content_text(block.get("content")),
                     "rejected": bool(block.get("is_error")) or rejected_record,
+                    "answers": answers,
                 },
             )
         )

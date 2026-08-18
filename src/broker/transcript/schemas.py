@@ -45,6 +45,12 @@ class AskUserAnswer(BaseModel):
     id: str
     raw: str
     rejected: bool = False
+    # Structured answers from the transcript record (2.1.234): label str for
+    # single-select, list[str] when injected via updatedInput multiSelect,
+    # comma-joined str when answered in the native UI. None when rejected or
+    # on records that predate the field. Comparisons are structural — the
+    # prose in `raw` has two templates and is never parsed.
+    answers: dict[str, str | list[str]] | None = None
 
 
 class ExitPlanMode(BaseModel):

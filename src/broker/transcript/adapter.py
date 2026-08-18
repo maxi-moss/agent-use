@@ -147,6 +147,7 @@ def _resolve_tool_result(
         "id": tool_use_id,
         "raw": data["raw"],
         "rejected": data["rejected"],
+        "answers": data["answers"],
     }
 
 

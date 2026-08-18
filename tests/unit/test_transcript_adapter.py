@@ -1,6 +1,8 @@
 """Adapter determinism + real-fixture behaviour."""
 
+import json
 from pathlib import Path
+from typing import Any
 
 from broker.transcript.adapter import (
     ReadReport,
@@ -69,6 +71,88 @@ def test_ask_prose_variants_pass_through_verbatim() -> None:
     assert raws[2].count('"=') == 2
     for raw in raws:
         assert raw.startswith("Your questions have been answered: ")
+
+
+def test_structured_answers_on_answered_and_rejected() -> None:
+    events = read_cleaned(MINIMAL_ASK)
+    questions = [e for e in events if isinstance(e, AskUserQuestion)]
+    answers = {a.id: a for a in events if isinstance(a, AskUserAnswer)}
+    answered = answers[questions[0].id]
+    assert answered.answers == {
+        "Which database should this project use?": "PostgreSQL"
+    }
+    rejected = answers[questions[1].id]
+    assert rejected.rejected is True
+    assert rejected.answers is None
+
+
+def test_native_multiselect_answer_is_joined_str() -> None:
+    """A native-UI multiSelect answer arrives as one comma-joined str, not a list."""
+    events = read_cleaned(ASK_VARIANTS)
+    questions = [e for e in events if isinstance(e, AskUserQuestion)]
+    answers = {a.id: a for a in events if isinstance(a, AskUserAnswer)}
+    multi = answers[questions[1].id]
+    assert multi.answers is not None
+    (value,) = multi.answers.values()
+    assert isinstance(value, str)
+    assert value == (
+        "Bundle + Claude Code skills (Recommended), Auto-capture from "
+        "Gmail/Slack/Jira"
+    )
+
+
+def test_rejected_ask_answers_is_none() -> None:
+    events = read_cleaned(REJECTED_ASK)
+    answers = [e for e in events if isinstance(e, AskUserAnswer)]
+    assert len(answers) == 1
+    assert answers[0].rejected is True
+    assert answers[0].answers is None
+
+
+def test_ill_typed_answer_entries_dropped_entry_wise(tmp_path: Path) -> None:
+    question_record: dict[str, Any] = {
+        "type": "assistant",
+        "version": VALIDATED_AGAINST,
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "AskUserQuestion",
+                    "id": "toolu_mixed",
+                    "input": {
+                        "questions": [
+                            {"question": "a", "header": "A", "options": []}
+                        ]
+                    },
+                }
+            ]
+        },
+    }
+    answer_record: dict[str, Any] = {
+        "type": "user",
+        "version": VALIDATED_AGAINST,
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_mixed",
+                    "content": "answered",
+                }
+            ],
+        },
+        "toolUseResult": {
+            "answers": {"a": "x", "b": ["y", "z"], "c": 7}
+        },
+    }
+    p = tmp_path / "mixed-answers.jsonl"
+    p.write_text(
+        json.dumps(question_record) + "\n" + json.dumps(answer_record) + "\n"
+    )
+    events = read_cleaned(p)
+    answers = [e for e in events if isinstance(e, AskUserAnswer)]
+    assert len(answers) == 1
+    assert answers[0].answers == {"a": "x", "b": ["y", "z"]}
 
 
 def test_multiselect_absent_defaults_false() -> None:
