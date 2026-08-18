@@ -112,7 +112,7 @@ class ScriptedRun:
         return subprocess.CompletedProcess(list(argv), 0, out, "")
 
     def drive_calls(self) -> list[list[str]]:
-        """Calls that write into the pane (the two-step submits)."""
+        """Calls that write into the pane: the submitting `agent prompt`."""
         return [
             c
             for c in self.calls
@@ -644,7 +644,7 @@ async def test_agent_start_forwards_this_sessions_settings_file(
     assert forwarded[-2:] == ["--settings", harness.cfg.claude_settings_path]
 
 
-async def test_stop_triggers_triage_and_answer_submits_two_step(
+async def test_stop_triggers_triage_and_answer_submits(
     harness: Harness,
 ) -> None:
     await launch(harness)
@@ -658,7 +658,6 @@ async def test_stop_triggers_triage_and_answer_submits_two_step(
     assert budget.payload == {"count": 1}
     assert harness.run.drive_calls() == [
         ["herdr", "agent", "prompt", "s1", "use oauth"],
-        ["herdr", "pane", "send-keys", "w3:p2", "enter"],
     ]
     # Classification input is last_assistant_message, in the LAST content block.
     triage_call = harness.llm.calls[-1]
@@ -765,7 +764,6 @@ async def test_stop_that_resolves_an_escalation_still_triages_its_turn(
     await harness.master.wait_for(T_BUDGET_UPDATE)
     assert harness.run.drive_calls() == [
         ["herdr", "agent", "prompt", "s1", "use oauth"],
-        ["herdr", "pane", "send-keys", "w3:p2", "enter"],
     ]
     triage_call = harness.llm.calls[-1]
     content = cast(list[dict[str, Any]], triage_call["messages"][0]["content"])
@@ -801,7 +799,6 @@ async def test_dispatch_decision_submits_and_resets_budget(
     assert budget.payload == {"count": 0}
     assert harness.run.drive_calls() == [
         ["herdr", "agent", "prompt", "s1", "go with option a"],
-        ["herdr", "pane", "send-keys", "w3:p2", "enter"],
     ]
     assert harness.broker.budget_count == 0
     await wait_state(harness.broker, "driving")
@@ -882,7 +879,6 @@ async def test_adopted_broker_takes_over_without_touching_the_pane(
     assert [c for c in adopted.run.calls if c[1:3] == ["agent", "start"]] == []
     assert adopted.run.drive_calls() == [
         ["herdr", "agent", "prompt", "s1", "THE HANDOVER TASK"],
-        ["herdr", "pane", "send-keys", ADOPTED_PANE, "enter"],
     ]
     resp = await client.request(
         adopted.sock,
@@ -923,7 +919,6 @@ async def test_resume_restores_completed(
         await ground_and_approve(h, count=1, prompt="THE SECOND TASK")
         assert h.run.drive_calls() == [
             ["herdr", "agent", "prompt", "s1", "THE SECOND TASK"],
-            ["herdr", "pane", "send-keys", ADOPTED_PANE, "enter"],
         ]
 
 
@@ -951,7 +946,6 @@ async def test_reactivate_grounds_new_task_and_supersedes_the_old_intent(
     await ground_and_approve(harness, count=2, prompt="THE SECOND TASK")
     assert harness.run.drive_calls() == [
         ["herdr", "agent", "prompt", "s1", "THE SECOND TASK"],
-        ["herdr", "pane", "send-keys", "w3:p2", "enter"],
     ]
     # Developer contact resets the autonomous answer budget.
     assert harness.broker.budget_count == 0

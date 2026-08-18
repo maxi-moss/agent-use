@@ -1,8 +1,8 @@
 """Every herdr CLI call, one module. Thin subprocess wrappers.
 
 Rules encoded here, verified against herdr 0.7.5:
-- `agent prompt` types but does NOT submit; every submit is prompt +
-  `pane send-keys <pane_id> enter`. submit_prompt() is the sanctioned two-step.
+- `agent prompt` submits on its own. Right after `agent start` the auto-submit
+  can occasionally drop — a readiness race in herdr itself.
 - Every wait carries an explicit timeout — no defaults on waits.
 - No public API accepts or emits `--current`.
 - Exit 1 + stderr JSON -> HerdrError(code, message); exit 2 -> RuntimeError (our bug).
@@ -303,9 +303,7 @@ def agent_status(info: dict[str, Any]) -> str:
 
 
 def agent_prompt(target: str, text: str, *, timeout_s: float) -> None:
-    """Type ``text`` into an agent's input box.
-
-    Does not submit; a submit keystroke must follow. See :func:`submit_prompt`.
+    """Type ``text`` into an agent's input box, submitting it.
 
     Args:
         target: Agent name or id.
@@ -334,21 +332,6 @@ def pane_send_keys(pane_id: str, *keys: str, timeout_s: float) -> None:
     for key in keys:
         _check_identifier(key, "key")
     _run([HERDR, "pane", "send-keys", pane_id, *keys], timeout_s)
-
-
-def submit_prompt(
-    target: str, pane_id: str, text: str, *, timeout_s: float
-) -> None:
-    """Type a prompt and submit it: herdr never submits on its own.
-
-    Args:
-        target: Agent name or id to type into.
-        pane_id: Pane that receives the Enter keystroke.
-        text: Prompt text.
-        timeout_s: Wall-clock limit applied to each of the two calls.
-    """
-    agent_prompt(target, text, timeout_s=timeout_s)
-    pane_send_keys(pane_id, "enter", timeout_s=timeout_s)
 
 
 def agent_wait(

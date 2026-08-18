@@ -159,13 +159,12 @@ def test_agent_status_degrades_to_unknown() -> None:
     assert driver.agent_status({"agent": {"agent_status": 3}}) == "unknown"
 
 
-def test_submit_prompt_is_the_two_step(fake: Any) -> None:
-    """agent prompt types only; submit is prompt + pane send-keys enter."""
+def test_agent_prompt_submits_with_no_trailing_enter(fake: Any) -> None:
+    """agent prompt submits on its own, as a single call."""
     run = fake(stdout="{}")
-    driver.submit_prompt("sess-a1", "w3:p2", "do the thing", timeout_s=5.0)
+    driver.agent_prompt("sess-a1", "do the thing", timeout_s=5.0)
     assert run.calls == [
         ["herdr", "agent", "prompt", "sess-a1", "do the thing"],
-        ["herdr", "pane", "send-keys", "w3:p2", "enter"],
     ]
 
 

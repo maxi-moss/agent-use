@@ -8,8 +8,8 @@ Structure:
 - Classification input is `last_assistant_message` from the Stop payload,
   never the transcript tail. The watchdog reconciliation is the
   one sanctioned pure-transcript read.
-- Every pane write is the two-step `agent prompt` + `pane send-keys enter`
-  via driver.submit_prompt with an explicit timeout.
+- Every pane write is a single `agent prompt`, which submits on its own,
+  via driver.agent_prompt with an explicit timeout.
 """
 
 import asyncio
@@ -1083,23 +1083,14 @@ class SessionBroker:
         return read_cleaned(self.transcript_path)
 
     async def _submit(self, text: str) -> None:
-        """Type ``text`` into the pane and press enter, with an explicit timeout.
-
-        Herdr's ``agent prompt`` types without submitting, so this always
-        follows it with an enter keystroke.
+        """Type ``text`` into the session and submit it, with an explicit timeout.
 
         Args:
             text: Prompt text, submitted exactly as given.
-
-        Raises:
-            FatalSessionError: No pane id is bound, so there is nowhere to type.
         """
-        if self.pane_id is None:
-            raise FatalSessionError("pane_unbound", "no pane id")
         await asyncio.to_thread(
-            driver.submit_prompt,
+            driver.agent_prompt,
             self.cfg.name,
-            self.pane_id,
             text,
             timeout_s=SUBMIT_TIMEOUT_S,
         )

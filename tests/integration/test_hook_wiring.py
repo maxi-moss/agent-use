@@ -508,7 +508,6 @@ async def test_full_loop_criteria_3_to_8(
     assert budget.payload == {"count": 1}
     assert h.run.drive_calls() == [
         ["herdr", "agent", "prompt", "s1", "use oauth"],
-        ["herdr", "pane", "send-keys", "w3:p2", "enter"],
     ]
     log_resp = await client.request(
         h.sock,
@@ -557,7 +556,6 @@ async def test_full_loop_criteria_3_to_8(
     await wait_state(h.broker, "driving")
     assert h.run.drive_calls() == [
         ["herdr", "agent", "prompt", "s1", "use option a, keep the old table"],
-        ["herdr", "pane", "send-keys", "w3:p2", "enter"],
     ]
     # Budget was reset by the dispatched decision.
     budget = await h.master.wait_for(T_BUDGET_UPDATE, count=2)
