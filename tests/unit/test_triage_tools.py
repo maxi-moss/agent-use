@@ -4,13 +4,14 @@ import json
 from typing import Any, cast
 
 from broker.protocol.schemas import EscalationPayload
+from broker.session.ask import ASK_TOOLS
 from broker.session.triage import (
     GROUNDING_TOOLS,
     TRIAGE_TOOLS,
     EscalateCall,
 )
 
-ALL_TOOLS = TRIAGE_TOOLS + GROUNDING_TOOLS
+ALL_TOOLS = TRIAGE_TOOLS + GROUNDING_TOOLS + ASK_TOOLS
 
 
 def _walk_objects(node: Any, path: str = "$") -> list[tuple[str, dict[str, Any]]]:
@@ -28,7 +29,7 @@ def _walk_objects(node: Any, path: str = "$") -> list[tuple[str, dict[str, Any]]
 
 
 def test_all_tools_are_strict_and_fully_required() -> None:
-    assert len(ALL_TOOLS) == 5
+    assert len(ALL_TOOLS) == 7
     for tool in ALL_TOOLS:
         assert tool.get("strict") is True, f"{tool['name']} not strict"
         schema = cast(dict[str, Any], tool["input_schema"])
@@ -65,3 +66,10 @@ def test_escalate_tool_fields_match_escalation_payload() -> None:
         "raiser",
     }
     assert tool_fields == payload_fields
+
+
+def test_ask_and_triage_escalate_schemas_identical() -> None:
+    """Both call sites derive escalate from the same EscalateCall. Drift pin."""
+    triage_escalate = next(t for t in TRIAGE_TOOLS if t["name"] == "escalate")
+    ask_escalate = next(t for t in ASK_TOOLS if t["name"] == "escalate")
+    assert ask_escalate["input_schema"] == triage_escalate["input_schema"]

@@ -8,7 +8,7 @@ import pytest
 from broker import prompts
 
 PROMPT_DIR = Path(__file__).parent.parent.parent / "src" / "broker" / "prompts"
-NAMES = ["triage", "master", "grounding", "permission"]
+NAMES = ["triage", "master", "grounding", "permission", "ask"]
 
 
 @pytest.mark.parametrize("name", NAMES)
@@ -24,4 +24,10 @@ def test_prompts_are_static_prefixes(name: str) -> None:
 def test_triage_prompt_names_all_four_tools() -> None:
     text = prompts.load("triage")
     for tool in ("answer", "escalate", "complete", "no_action"):
+        assert f"`{tool}`" in text
+
+
+def test_ask_prompt_names_both_tools() -> None:
+    text = prompts.load("ask")
+    for tool in ("answer_questions", "escalate"):
         assert f"`{tool}`" in text
