@@ -80,5 +80,5 @@ Then `Args:` / `Returns:` / `Raises:` as applicable. Nothing else.
 - **One writer for anything outside the repo** — the master, as read → validate → backup → temp-write → rename. Treat Claude Code's user-level config as shared with other tools.
 - **Diagnostic output goes to a file, never the terminal.** The master's TUI owns the display and session brokers inherit it. No `print`, no stream handler — `logging_setup.configure` is the only wiring.
 - **On Claude Code's hook path:** exit 0 always, stdout carries the decision and nothing else, stdlib imports only. A dead broker degrades a session to stock Claude Code; it never breaks one.
-- **Driving a session takes two steps** — Herdr types a prompt without submitting, so a submit keystroke always follows. Every wait names its target and its timeout explicitly.
+- **Every wait names its target and its timeout explicitly.**
 - **Check Herdr and Claude Code behaviour against the installed binaries, never from memory.** Both move fast; the load-bearing mechanisms are version-sensitive.
