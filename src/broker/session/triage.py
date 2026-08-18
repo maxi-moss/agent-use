@@ -126,11 +126,15 @@ _GROUNDING_PROMPT = prompts.load("grounding")
 
 
 def assemble_context(
-    intent: str, transcript_events: list[TranscriptEvent], working: str
+    system_prompt: str,
+    intent: str,
+    transcript_events: list[TranscriptEvent],
+    working: str,
 ) -> tuple[list[TextBlockParam], list[MessageParam]]:
-    """Assemble the system blocks and messages for one triage call.
+    """Assemble the system blocks and messages for one session-stack call.
 
     Args:
+        system_prompt: Static system prompt text; cached with a 1h TTL.
         intent: Authoritative task intent, taken from the registry.
         transcript_events: Cleaned transcript events; an empty render becomes
             ``(transcript empty)``.
@@ -144,7 +148,7 @@ def assemble_context(
     system: list[TextBlockParam] = [
         {
             "type": "text",
-            "text": _TRIAGE_PROMPT,
+            "text": system_prompt,
             "cache_control": {"type": "ephemeral", "ttl": "1h"},
         }
     ]
@@ -205,7 +209,7 @@ async def triage(
         "# The coding agent's last message (triage THIS)\n"
         + last_assistant_message
     )
-    system, messages = assemble_context(intent, events, working)
+    system, messages = assemble_context(_TRIAGE_PROMPT, intent, events, working)
     call: ToolCall = await llm_call(
         model=cfg.model_id,
         max_tokens=cfg.max_tokens,

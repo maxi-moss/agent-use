@@ -22,6 +22,7 @@ import os
 import sys
 
 from broker.config import BrokerConfig, ClassifierConfig
+from broker import prompts
 from broker.llm import build_client
 from broker.permission.llm import (
     FORCED_ONE as PERMISSION_FORCED_ONE,
@@ -48,7 +49,9 @@ async def probe_triage() -> None:
     """Issue two identical triage calls and report each call's cache usage."""
     cfg = BrokerConfig()
     client = build_client(cfg)
-    system, messages = assemble_triage_context(_INTENT, [], _WORKING)
+    system, messages = assemble_triage_context(
+        prompts.load("triage"), _INTENT, [], _WORKING
+    )
     print(f"triage ({cfg.model_id}): two identical calls")
     for i in (1, 2):
         response = await client.messages.create(

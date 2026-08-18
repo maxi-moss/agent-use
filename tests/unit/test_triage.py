@@ -11,6 +11,7 @@ from anthropic.types import (
     ToolParam,
 )
 
+from broker import prompts
 from broker.config import BrokerConfig
 from broker.llm import LLMCallError, ToolCall
 from broker.session.triage import (
@@ -125,7 +126,7 @@ async def test_forced_single_tool_choice() -> None:
 
 def test_context_order_intent_transcript_working() -> None:
     system, messages = assemble_context(
-        "the intent", list(EVENTS), "the working context"
+        prompts.load("triage"), "the intent", list(EVENTS), "the working context"
     )
     assert len(messages) == 1
     content = cast(list[dict[str, Any]], messages[0]["content"])
@@ -138,7 +139,7 @@ def test_context_order_intent_transcript_working() -> None:
 
 
 def test_exactly_two_cache_breakpoints() -> None:
-    system, messages = assemble_context("i", list(EVENTS), "w")
+    system, messages = assemble_context(prompts.load("triage"), "i", list(EVENTS), "w")
     blocks = cast(list[dict[str, Any]], list(system)) + cast(
         list[dict[str, Any]], messages[0]["content"]
     )
