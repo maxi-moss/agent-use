@@ -40,7 +40,7 @@ from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry
 from broker.master.runtime import FLEET_WIDTH, MasterRuntime
 from broker.master.testmode import load_scenario, run_scenario
-from broker.master.tui.prompt_widget import PromptArea
+from broker.master.tui.prompt_area import PromptArea
 
 
 class BrokerMasterApp(App[None]):
