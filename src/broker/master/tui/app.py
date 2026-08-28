@@ -40,6 +40,7 @@ from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry
 from broker.master.runtime import FLEET_WIDTH, MasterRuntime
 from broker.master.testmode import load_scenario, run_scenario
+from broker.master.tui.chat_log import ChatMessage, ThinkingIndicator
 from broker.master.tui.prompt_area import PromptArea
 
 
@@ -138,10 +139,11 @@ class BrokerMasterApp(App[None]):
         box = self.query_one("#box", PromptArea)
         box.clear()
         box.disabled = True
-        self._chat_block(f"you: {text}")
+        self._chat_block(text, role="user", label="you")
         if self.test_mode and text.startswith("/"):
             self._handle_command(text)
             return
+        self._show_thinking()
         self.run_worker(
             self._master_turn(text),
             group="llm",
@@ -224,6 +226,7 @@ class BrokerMasterApp(App[None]):
             WorkerState.CANCELLED,
         ):
             self.query_one("#box", PromptArea).disabled = False
+            self._remove_thinking()
             if worker.group == "llm":
                 self.runtime.clear_master_activity()
         if event.state is WorkerState.ERROR:
@@ -235,7 +238,7 @@ class BrokerMasterApp(App[None]):
     def on_llmreply(self, message: LLMReply) -> None:
         # Textual's handler-name derivation collapses the acronym:
         # LLMReply → "on_llmreply", not "on_llm_reply".
-        self._chat_block(f"master: {message.text}")
+        self._chat_block(message.text, role="master", label="master")
 
     def on_escalation_arrived(self, message: EscalationArrived) -> None:
         self._chat_block(message.rendered)
@@ -291,11 +294,23 @@ class BrokerMasterApp(App[None]):
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
-    def _chat_block(self, text: str) -> None:
+    def _chat_block(
+        self, text: str, *, role: str = "system", label: str | None = None
+    ) -> None:
         chat = self.query_one("#chat", VerticalScroll)
-        # rich.Text: no markup interpretation — the string renders verbatim.
-        chat.mount(Static(Text(text)))
+        # ChatMessage renders the body as rich.Text — no markup interpretation.
+        chat.mount(ChatMessage(role, text, label))
         chat.anchor()
+
+    def _show_thinking(self) -> None:
+        self._remove_thinking()
+        chat = self.query_one("#chat", VerticalScroll)
+        chat.mount(ThinkingIndicator())
+        chat.anchor()
+
+    def _remove_thinking(self) -> None:
+        for widget in self.query(ThinkingIndicator):
+            widget.remove()
 
     def _event_line(self, text: str) -> None:
         self.query_one("#events", RichLog).write(Text(text))
