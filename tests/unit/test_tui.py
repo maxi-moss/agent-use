@@ -30,7 +30,7 @@ from broker.master.messages import (
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry
 from broker.master.tui.app import BrokerMasterApp
-from broker.master.tui.prompt_widget import PromptArea
+from broker.master.tui.prompt_area import PromptArea
 from broker.protocol import client
 from broker.protocol.schemas import Envelope
 
