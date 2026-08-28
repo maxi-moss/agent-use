@@ -48,8 +48,15 @@ class BrokerMasterApp(App[None]):
     # vertical scrollbar (2 cells).
     CSS = f"#fleet {{ width: {FLEET_WIDTH + 2}; }}" + """
     #chat { height: 1fr; }
-    #queue-depth { height: 1; }
-    #events { height: 10; }
+    #activity {
+        height: 8;
+        border: round $foreground 30%;
+        border-title-color: $text-muted;
+        background: transparent;
+        padding: 0 1;
+    }
+    #queue-depth { height: 1; color: $text-muted; }
+    #events { height: 1fr; background: transparent; }
     #box { height: 5; }
     """
 
@@ -95,8 +102,12 @@ class BrokerMasterApp(App[None]):
                 yield Static(Text("Master — idle"), id="fleet-table")
             with Vertical():
                 yield VerticalScroll(id="chat")
-                yield Static(Text("escalation queue: empty"), id="queue-depth")
-                yield RichLog(id="events", wrap=True)
+                with Vertical(id="activity") as activity:
+                    activity.border_title = "activity"
+                    yield Static(
+                        Text("escalation queue: empty"), id="queue-depth"
+                    )
+                    yield RichLog(id="events", wrap=True)
                 yield PromptArea(
                     placeholder=(
                         "task, decision, or question… (ctrl+j for newline)"
