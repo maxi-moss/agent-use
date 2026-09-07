@@ -5,8 +5,13 @@ description = "Routes decisions between one developer and N headless Claude Code
 requires-python = ">=3.14"
 dependencies = [
     "anthropic>=0.120.0",
+    "openai>=3.8.0",
     "pydantic>=2.13",
     "textual>=8.2.8",
+    "tree-sitter>=0.26.0",
+    "tree-sitter-javascript>=0.25.0",
+    "tree-sitter-python>=0.25.0",
+    "tree-sitter-typescript>=0.23.2",
 ]
 
 [build-system]
@@ -29,6 +34,7 @@ include = ["src", "tests"]
 extraPaths = ["src"]
 venvPath = "."
 venv = ".venv"
+exclude = ["tests/fixtures"]  # sample repos parsed by tests, not code
 
 [tool.pytest.ini_options]
 minversion = "8.0"
@@ -67,6 +73,7 @@ forbidden_modules = [
     "broker.config",
     "broker.logging_setup",
     "broker.paths",
+    "broker.index",
 ]
 ignore_imports = ["broker.hook.** -> broker.protocol.constants"]
 
@@ -107,3 +114,27 @@ protected_modules = [
     "broker.permission.permission_log",
 ]
 allowed_importers = ["broker.permission"]
+
+[[tool.importlinter.contracts]]
+name = "index imports none of the broker's runtime surfaces"
+type = "forbidden"
+source_modules = ["broker.index"]
+forbidden_modules = [
+    "broker.session",
+    "broker.master",
+    "broker.permission",
+    "broker.llm",
+    "broker.llm_timing",
+    "broker.herdr",
+    "broker.claude",
+    "broker.protocol",
+    "broker.transcript",
+    "broker.hook",
+    "broker.prompts",
+]
+
+[[tool.importlinter.contracts]]
+name = "only the session broker consumes the index"
+type = "protected"
+protected_modules = ["broker.index"]
+allowed_importers = ["broker.session"]

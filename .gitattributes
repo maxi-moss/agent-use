@@ -1,0 +1,2 @@
+# Sample repositories parsed by the indexer tests; test input, not project code.
+tests/fixtures/indexer_inputs/** linguist-vendored
