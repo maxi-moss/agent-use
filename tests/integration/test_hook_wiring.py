@@ -24,6 +24,7 @@ import pytest
 import tempfile
 
 from broker.herdr import driver
+from broker.index.schemas import GroundingContext
 from broker.llm import ToolCall
 from broker.permission import PermissionModule
 from broker.permission.llm import ToolCall as PermissionToolCall
@@ -41,7 +42,7 @@ from broker.protocol.constants import (
 from broker.protocol.schemas import Envelope, PermissionSuggestion, Response
 from broker.protocol.server import serve_unix
 from broker.session.broker import SessionBroker
-from broker.config import ClassifierConfig, SessionBrokerConfig
+from broker.config import ClassifierConfig, EmbeddingConfig, SessionBrokerConfig
 from broker.paths import BrokerPaths
 
 FIXTURES = Path(__file__).parent.parent / "fixtures"
@@ -114,6 +115,14 @@ class FakeLLM:
     async def __call__(self, **kwargs: Any) -> ToolCall:
         self.calls.append(kwargs)
         return await self.results.get()
+
+
+class FakeRetriever:
+    """Injected retrieval seam: returns an empty neighbourhood, no network."""
+
+    async def __call__(self, intent: str, cwd: Path) -> GroundingContext:
+        del intent, cwd
+        return GroundingContext(symbols=[], edges=[], imports={})
 
 
 class FakePermissionLLM:
@@ -229,6 +238,7 @@ def make_cfg(home: Path, *, budget_max: int = 8) -> SessionBrokerConfig:
         model_id="test-model",
         max_tokens=1024,
         classifier=ClassifierConfig(model_id="test-classifier"),
+        embedding=EmbeddingConfig(),
         watchdog_seconds=300.0,
         budget_max=budget_max,
         claude_settings_path=str(home / "claude-settings.json"),
@@ -254,6 +264,7 @@ async def start_harness(
     broker = SessionBroker(
         cfg,
         llm_call=llm,
+        retrieve=FakeRetriever(),
         permission=PermissionModule(
             cfg.classifier,
             session_name=cfg.name,

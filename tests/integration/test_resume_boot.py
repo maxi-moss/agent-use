@@ -20,6 +20,7 @@ import pytest
 from broker.config import (
     AdoptedSession,
     ClassifierConfig,
+    EmbeddingConfig,
     ResumedTask,
     SessionBrokerConfig,
 )
@@ -63,6 +64,7 @@ def _resume_config(home: Path) -> SessionBrokerConfig:
         model_id="test-model",
         max_tokens=1024,
         classifier=ClassifierConfig(model_id="test-classifier"),
+        embedding=EmbeddingConfig(),
         watchdog_seconds=3600.0,  # never fires within the test
         budget_max=8,
         claude_settings_path=str(home / "claude-settings.json"),
