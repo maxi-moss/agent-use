@@ -29,6 +29,7 @@ Claude Code ──hook──> session broker ──> master TUI
 - `claude` on `PATH` (Claude Code)
 - `herdr` on `PATH` (developed against 0.7.5)
 - `ANTHROPIC_API_KEY` set
+- `OPENAI_API_KEY` set
 - `HERDR_PANE_ID` set, or pass `--anchor` — the pane new sessions are split from
 
 The master checks all of these at startup and exits non-zero with the reason on the first failure, so you do not need to verify them by hand.
@@ -55,13 +56,25 @@ Configuration is optional. Defaults live in `BrokerConfig` (`src/broker/config.p
 
 Diagnostic logs are written to files, never to the terminal — the master's TUI owns that display. Follow a run with `tail -f "$BROKER_HOME"/logs/master.log`.
 
+## Indexing a repository
+
+```bash
+uv run python -m broker.index /path/to/repo
+```
+
+Builds or refreshes the code index for that repository at `$BROKER_HOME/index/<sha256(path)>.sqlite`: every Python, TypeScript, TSX and JavaScript file is parsed with tree-sitter into symbols — functions, methods, classes and types (a `const` bound to a function counts as a function; a class also records its fields) — and edges (calls, inheritance, imports, type references, ownership). Re-running is incremental — only files whose content changed are re-parsed; edges are always re-resolved for the whole repository. The path must be the root of a git repository. One summary line is printed; details go to `$BROKER_HOME/logs/index.log`.
+
+Every function, method and class is also embedded with OpenAI `text-embedding-3-small` (pinned in `EmbeddingConfig`, `src/broker/config.py`); only symbols whose text changed are re-embedded. Changing the embedding model does not re-embed existing vectors — delete the index file and run the command again.
+
+A session cannot be spawned for a repository without an index: grounding retrieves the intent's code neighbourhood from it and aborts loudly if the index is missing or empty. The proposal shown in the TUI lists the retrieved symbols and their seed scores so you can judge the grounding before approving.
+
 ## Test mode
 
 ```bash
 uv run python -m broker.master --test-mode
 ```
 
-Test mode drives synthetic escalations through the **real** master — the real TUI, socket server, runtime handlers, and persisted queue. Everything above the socket is left out: no LLM, no hooks, no herdr, no Claude Code, no live sessions. So none of the startup requirements above apply — no `ANTHROPIC_API_KEY`, nothing on `PATH` — and it never writes `~/.claude/settings.json`.
+Test mode drives synthetic escalations through the **real** master — the real TUI, socket server, runtime handlers, and persisted queue. Everything above the socket is left out: no LLM, no hooks, no herdr, no Claude Code, no live sessions. So none of the startup requirements above apply — no API keys, nothing on `PATH` — and it never writes `~/.claude/settings.json`.
 
 Inside the TUI, `/inject <scenario>` runs one scenario from `tests/scenarios/*.json` and reports each step, ending in a `PASS`/`FAIL` summary. Run the master from the repo root, since `/inject` resolves scenario files relative to the working directory. `/inject` with an unknown or missing name prints the available scenarios.
 
@@ -86,6 +99,7 @@ src/broker/
   prompts/       Static prompt prefixes
   protocol/      Wire schemas, socket server and client
   hook/          Claude Code hook client
+  index/         Code index: tree-sitter symbols and edges per repo, SQLite
   session/       Session broker: triage, watchdog, decision log
   permission/    Permission triage: own model, client, prompt, log
   master/        Master: runtime, registry, routing LLM, TUI
@@ -99,6 +113,7 @@ tests/
   unit/          Fast, no I/O
   integration/   Real subprocess and IO boundaries
   scenarios/     Test-mode scenarios, run through the real master
+  fixtures/indexer_inputs/  Sample repos the indexer tests parse — the TypeScript/JavaScript in there is test input, not project code
 ```
 
 Each package's `__init__.py` or primary module carries a docstring explaining what
