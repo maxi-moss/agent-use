@@ -1,3 +1,5 @@
 [flake8]
 max-line-length = 88
 ignore = W293, W291, W292, E501, W503
+# tests/fixtures holds sample repos parsed by tests, not code
+exclude = .venv,tests/fixtures
