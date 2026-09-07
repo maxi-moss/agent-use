@@ -94,6 +94,7 @@ from broker.protocol.schemas import (
     ReactivatePayload,
     Response,
     RetractPayload,
+    RetrievedSymbol,
     SendPromptPayload,
     StatusPayload,
 )
@@ -379,7 +380,7 @@ def render_permission_escalation(
 
 
 def render_proposal(p: PromptProposalPayload) -> str:
-    """Render the proposal block, prompt and grounding verbatim.
+    """Render the proposal block: prompt, grounding, and retrieved code, verbatim.
 
     Args:
         p: Validated prompt-proposal payload from a session broker.
@@ -387,17 +388,29 @@ def render_proposal(p: PromptProposalPayload) -> str:
     Returns:
         The rendered block, to be displayed and passed on unchanged.
     """
-    return "\n".join(
-        [
-            f"Prompt proposal {p.proposal_id}",
-            "",
-            "## Proposed prompt",
-            p.proposed_prompt,
-            "",
-            "## Grounding summary",
-            p.grounding_summary,
-        ]
-    )
+    lines = [
+        f"Prompt proposal {p.proposal_id}",
+        "",
+        "## Proposed prompt",
+        p.proposed_prompt,
+        "",
+        "## Grounding summary",
+        p.grounding_summary,
+        "",
+        "## Retrieved code",
+    ]
+    if p.retrieved:
+        lines += [_render_retrieved(s) for s in p.retrieved]
+    else:
+        lines.append("(none)")
+    return "\n".join(lines)
+
+
+def _render_retrieved(s: RetrievedSymbol) -> str:
+    """Render one retrieved symbol as a bullet line."""
+    if s.score is None:
+        return f"- {s.name}"
+    return f"- {s.name} (seed {s.score:.2f})"
 
 
 def _truncate(text: str, width: int) -> str:
@@ -1267,6 +1280,7 @@ class MasterRuntime:
             model_id=self.cfg.model_id,
             max_tokens=self.cfg.max_tokens,
             classifier=self.cfg.classifier,
+            embedding=self.cfg.embedding,
             watchdog_seconds=self.cfg.watchdog_seconds,
             budget_max=self.cfg.budget_max,
             claude_settings_path=str(settings_path),

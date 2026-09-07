@@ -6,9 +6,10 @@ set is pinned against EscalationPayload by a unit test so the wire schema and
 the tool schema cannot drift apart.
 """
 
-import asyncio
-import subprocess
+import logging
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from anthropic.types import (
     MessageParam,
@@ -21,13 +22,14 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from broker import llm_timing
 from broker import prompts
 from broker.config import BrokerConfig
+from broker.index.render import fit_to_budget, render_relevant_code
+from broker.index.schemas import GroundingContext
 from broker.llm import LLMCaller, LLMCallError, ToolCall, strict_tool
 from broker.protocol.schemas import Alternative
 from broker.transcript.adapter import render
 from broker.transcript.schemas import TranscriptEvent
 
-_TRACKED_FILES_TIMEOUT_S = 10.0
-_MAX_TRACKED_FILES = 200
+logger = logging.getLogger(__name__)
 
 
 class AnswerCall(BaseModel):
@@ -227,75 +229,40 @@ async def triage(
         raise LLMCallError(f"invalid {call.name} input: {exc}") from exc
 
 
-def _git_ls_files(cwd: Path) -> str:
-    """List the repository's tracked files, truncated to a fixed maximum.
+class Retriever(Protocol):
+    """The injected retrieval seam: tests pass a fake, production binds the index."""
 
-    Args:
-        cwd: Directory to run ``git ls-files`` in.
+    async def __call__(self, intent: str, cwd: Path) -> GroundingContext:
+        """Return the intent's code neighbourhood for the repository at ``cwd``."""
+        ...
 
-    Returns:
-        Newline-joined paths, with a trailing count line when the listing was
-        truncated; empty when git produced nothing usable.
-    """
-    try:
-        proc = subprocess.run(
-            ["git", "ls-files"],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=_TRACKED_FILES_TIMEOUT_S,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    if proc.returncode != 0:
-        return ""
-    lines = proc.stdout.splitlines()
-    head = lines[:_MAX_TRACKED_FILES]
-    if len(lines) > _MAX_TRACKED_FILES:
-        extra = len(lines) - _MAX_TRACKED_FILES
-        head.append(f"... ({extra} more tracked files)")
-    return "\n".join(head)
+
+@dataclass
+class Grounding:
+    """A proposed prompt with the code neighbourhood it was grounded in."""
+
+    proposal: ProposePromptCall
+    context: GroundingContext
+
+
+@llm_timing.timed("retrieval")
+async def _retrieve(retrieve: Retriever, intent: str, cwd: Path) -> GroundingContext:
+    """Retrieve and trim the neighbourhood so the rendered block fits its budget."""
+    return fit_to_budget(await retrieve(intent, cwd))
 
 
 @llm_timing.timed("grounding")
-async def ground_intent(
-    llm_call: LLMCaller[ToolCall],
-    cfg: BrokerConfig,
-    *,
-    intent: str,
-    cwd: Path,
+async def _propose(
+    llm_call: LLMCaller[ToolCall], cfg: BrokerConfig, parts: list[str]
 ) -> ProposePromptCall:
-    """Propose the initial task prompt for a session from the stated intent.
-
-    Args:
-        llm_call: The injected tool-calling seam.
-        cfg: Supplies the model id and the token cap.
-        intent: The developer's intent, passed verbatim.
-        cwd: Session working directory, read for grounding context.
-
-    Returns:
-        The validated ``propose_prompt`` call, for the developer to review.
+    """Make the one grounding call and validate its forced tool use.
 
     Raises:
         LLMCallError: The LLM called a tool other than ``propose_prompt``, or
             the tool input failed validation.
     """
-    claude_md = ""
-    claude_md_path = cwd / "CLAUDE.md"
-    if claude_md_path.exists():
-        claude_md = claude_md_path.read_text(encoding="utf-8")
-    listing = await asyncio.to_thread(_git_ls_files, cwd)
-    parts = [f"# Developer intent (verbatim)\n{intent}"]
-    if claude_md:
-        parts.append(f"# The codebase's CLAUDE.md\n{claude_md}")
-    if listing:
-        parts.append(f"# Tracked files (head)\n{listing}")
-    system: list[TextBlockParam] = [
-        {"type": "text", "text": _GROUNDING_PROMPT}
-    ]
-    messages: list[MessageParam] = [
-        {"role": "user", "content": "\n\n".join(parts)}
-    ]
+    system: list[TextBlockParam] = [{"type": "text", "text": _GROUNDING_PROMPT}]
+    messages: list[MessageParam] = [{"role": "user", "content": "\n\n".join(parts)}]
     call: ToolCall = await llm_call(
         model=cfg.model_id,
         max_tokens=cfg.max_tokens,
@@ -310,3 +277,43 @@ async def ground_intent(
         return ProposePromptCall.model_validate(call.input)
     except ValidationError as exc:
         raise LLMCallError(f"invalid propose_prompt input: {exc}") from exc
+
+
+async def ground_intent(
+    llm_call: LLMCaller[ToolCall],
+    cfg: BrokerConfig,
+    *,
+    retrieve: Retriever,
+    intent: str,
+    cwd: Path,
+) -> Grounding:
+    """Propose the initial task prompt for a session from the stated intent.
+
+    Args:
+        llm_call: The injected tool-calling seam.
+        cfg: Supplies the model id and the token cap.
+        retrieve: The injected code-retrieval seam.
+        intent: The developer's intent, passed verbatim.
+        cwd: Session working directory: the repository root.
+
+    Returns:
+        The validated ``propose_prompt`` call and the neighbourhood it saw.
+
+    Raises:
+        LLMCallError: The grounding call failed or returned the wrong tool.
+        Exception: Whatever ``retrieve`` raises — retrieval failures abort
+            grounding; there is no degraded path.
+    """
+    context = await _retrieve(retrieve, intent, cwd)
+    relevant_code = render_relevant_code(context)
+    logger.info("relevant code for grounding in %s:\n%s", cwd, relevant_code)
+    claude_md = ""
+    claude_md_path = cwd / "CLAUDE.md"
+    if claude_md_path.exists():
+        claude_md = claude_md_path.read_text(encoding="utf-8")
+    parts = [f"# Developer intent (verbatim)\n{intent}"]
+    if claude_md:
+        parts.append(f"# The codebase's CLAUDE.md\n{claude_md}")
+    parts.append(relevant_code)
+    proposal = await _propose(llm_call, cfg, parts)
+    return Grounding(proposal=proposal, context=context)
