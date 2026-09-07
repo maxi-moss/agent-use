@@ -90,6 +90,8 @@ def main() -> None:
             _fail(f"`herdr status` failed: {exc}")
         if not os.environ.get("ANTHROPIC_API_KEY"):
             _fail("ANTHROPIC_API_KEY is not set")
+        if not os.environ.get("OPENAI_API_KEY"):
+            _fail("OPENAI_API_KEY is not set")
         anchor = args.anchor or os.environ.get("HERDR_PANE_ID")
         if not anchor:
             _fail("HERDR_PANE_ID is not set and --anchor was not given")

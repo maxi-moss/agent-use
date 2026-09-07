@@ -235,6 +235,15 @@ class RetractPayload(BaseModel):
     reason: str
 
 
+class RetrievedSymbol(BaseModel):
+    """One symbol grounding retrieval surfaced, for the developer to judge."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str  # path::Scope.name
+    score: float | None = None  # cosine similarity for seeds; None for expansion nodes
+
+
 class PromptProposalPayload(BaseModel):
     """broker -> master: grounded prompt awaiting developer approval."""
 
@@ -243,6 +252,7 @@ class PromptProposalPayload(BaseModel):
     proposal_id: str
     proposed_prompt: str
     grounding_summary: str
+    retrieved: list[RetrievedSymbol] = Field(default_factory=list[RetrievedSymbol])
 
 
 class ApprovePromptPayload(BaseModel):

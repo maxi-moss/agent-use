@@ -32,10 +32,14 @@ from anthropic.types import (
 from pydantic import ValidationError
 
 from broker import llm as llm_module
-from broker.llm import LLMCaller, ToolCall
+from broker.index.embedding import EmbeddingError, OpenAIEmbedder
+from broker.index.retrieval import RetrievalError, retrieve as retrieve_code
+from broker.index.schemas import GroundingContext
+from broker.llm import LLMCallError, LLMCaller, ToolCall
 from broker.config import (
     AdoptedSession,
     BrokerConfig,
+    EmbeddingConfig,
     ResumedTask,
     SessionBrokerConfig,
 )
@@ -86,9 +90,11 @@ from broker.protocol.schemas import (
     PermissionDecisionPayload,
     PermissionLogPayload,
     PermissionRequestPayload,
+    PromptProposalPayload,
     RaiserIdentity,
     ReactivatePayload,
     Response,
+    RetrievedSymbol,
     SendPromptPayload,
     StatusPayload,
 )
@@ -98,6 +104,7 @@ from broker.session.triage import (
     CompleteCall,
     EscalateCall,
     NoActionCall,
+    Retriever,
     ground_intent,
     triage,
 )
@@ -185,12 +192,39 @@ def _bind_llm(client: AsyncAnthropic) -> LLMCaller[ToolCall]:
     return call
 
 
+def _bind_retrieve(paths: BrokerPaths, embedding: EmbeddingConfig) -> Retriever:
+    """Bind index retrieval to this broker home and the pinned embedding model.
+
+    The embedder is built per call so a missing ``OPENAI_API_KEY`` fails at
+    grounding time, loudly, rather than at broker start.
+
+    Args:
+        paths: Resolves the repository's index file.
+        embedding: The model pinned in ``broker.config``, as sent by the master.
+
+    Returns:
+        A callable matching ``Retriever``.
+    """
+
+    async def call(intent: str, cwd: Path) -> GroundingContext:
+        repo = cwd.resolve()
+        return await retrieve_code(
+            intent,
+            repo,
+            index_path=paths.index_db(repo),
+            embedder=OpenAIEmbedder.from_env(embedding),
+        )
+
+    return call
+
+
 class SessionBroker:
     def __init__(
         self,
         cfg: SessionBrokerConfig,
         *,
         llm_call: LLMCaller[ToolCall] | None = None,
+        retrieve: Retriever | None = None,
         permission: PermissionModule | None = None,
     ) -> None:
         """Build the broker's state without touching the socket or the pane.
@@ -199,6 +233,8 @@ class SessionBroker:
             cfg: Session identity, socket paths, cwd, intent and budget limits.
             llm_call: Injected tool-calling backend. When omitted, ``run()``
                 builds one from an Anthropic client — tests pass a fake.
+            retrieve: Injected code retrieval. When omitted, ``run()`` binds
+                the repository index under the broker home — tests pass a fake.
             permission: Injected permission triage module. When omitted, one is
                 built from ``cfg`` — tests pass a fake or a spy.
         """
@@ -209,8 +245,10 @@ class SessionBroker:
             watchdog_seconds=cfg.watchdog_seconds,
             budget_max=cfg.budget_max,
             broker_home=cfg.broker_home,
+            embedding=cfg.embedding,
         )
         self._llm_call = llm_call
+        self._retrieve = retrieve
         self.state: SessionState = SessionState.SPAWNING
         self.pane_id: str | None = None
         self.claude_session_id: str | None = None
@@ -238,9 +276,9 @@ class SessionBroker:
         self._activity_phrases: set[str] = set()
         self._status_task: asyncio.Task[None] | None = None
 
-        paths = BrokerPaths(cfg.broker_home)
-        self.decision_log_path = paths.session_decisions(cfg.name)
-        self.permission_log_path = paths.session_permissions(cfg.name)
+        self._paths = BrokerPaths(cfg.broker_home)
+        self.decision_log_path = self._paths.session_decisions(cfg.name)
+        self.permission_log_path = self._paths.session_permissions(cfg.name)
         self.permission = permission or PermissionModule(
             cfg.classifier,
             session_name=cfg.name,
@@ -260,6 +298,8 @@ class SessionBroker:
         server = await serve_unix(Path(self.cfg.socket_path), self.handle)
         if self._llm_call is None:
             self._llm_call = _bind_llm(llm_module.build_client(self.broker_cfg))
+        if self._retrieve is None:
+            self._retrieve = _bind_retrieve(self._paths, self.broker_cfg.embedding)
         self.watchdog.start()
         self._status_task = asyncio.create_task(self._status_sender())
         try:
@@ -400,30 +440,41 @@ class SessionBroker:
         Args:
             intent: Raw task intent, superseding whatever this broker was
                 driving before.
+
+        Raises:
+            FatalSessionError: Retrieval, embedding, or the grounding call
+                failed. The spawn aborts; nothing degraded is proposed.
         """
         self.intent = intent
         self.approved_prompt = None  # superseded until the developer approves
         self._set_state(SessionState.GROUNDING)
         assert self._llm_call is not None
+        assert self._retrieve is not None
         with self._activity(PHRASE_GROUNDING):
-            proposal = await ground_intent(
-                self._llm_call,
-                self.broker_cfg,
-                intent=intent,
-                cwd=Path(self.cfg.cwd),
-            )
+            try:
+                grounding = await ground_intent(
+                    self._llm_call,
+                    self.broker_cfg,
+                    retrieve=self._retrieve,
+                    intent=intent,
+                    cwd=Path(self.cfg.cwd),
+                )
+            except (RetrievalError, EmbeddingError, LLMCallError) as exc:
+                raise FatalSessionError(type(exc).__name__, str(exc)) from exc
         self._proposal_id = uuid.uuid4().hex
         loop = asyncio.get_running_loop()
         self._approval = loop.create_future()
         self._set_state(SessionState.AWAITING_APPROVAL)
-        await self._to_master(
-            T_PROMPT_PROPOSAL,
-            {
-                "proposal_id": self._proposal_id,
-                "proposed_prompt": proposal.prompt,
-                "grounding_summary": proposal.reasoning,
-            },
+        payload = PromptProposalPayload(
+            proposal_id=self._proposal_id,
+            proposed_prompt=grounding.proposal.prompt,
+            grounding_summary=grounding.proposal.reasoning,
+            retrieved=[
+                RetrievedSymbol(name=s.qualified_name, score=s.score)
+                for s in grounding.context.symbols
+            ],
         )
+        await self._to_master(T_PROMPT_PROPOSAL, payload.model_dump())
         # Approval is synchronous and blocking — no timeout.
         approved = await self._approval
         self.approved_prompt = approved.prompt
