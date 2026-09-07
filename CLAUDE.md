@@ -1,17 +1,21 @@
-# CLAUDE.md — Broker
+# CLAUDE.md - Broker
+
+This file provides guidance to Claude Code when working with this repository.
+
+## Project Overview
 
 Routes decisions between one developer and N interactive Claude Code sessions driven through Herdr.
 
-## Stack
+## Current Stack
 
 - Python + `uv` for deps and locking — versions live in the root `pyproject.toml` and `uv.lock`
 - pydantic — every socket and config boundary
 - Textual — TUI
 - asyncio unix domain sockets — all IPC
-- `anthropic` SDK — inference
+- `anthropic` SDK — inference; `openai` SDK — embeddings; `tree-sitter` — code parsing
 - pytest, pyright (strict), import-linter
-- Persistence: atomic write-and-rename JSON + append-only NDJSON
-- No database, no daemon manager, no ORM
+- Persistence: atomic write-and-rename JSON + append-only NDJSON; SQLite for the per-repo code index
+- No ORM, no daemon manager
 
 ## Commands
 
@@ -38,7 +42,7 @@ Every session is an interactive Claude Code process in its own terminal pane, wi
 - Use `rg` instead of `grep` for plain-text matches (comments, strings, config). Ripgrep recurses by default and `-r` does `--replace` on the printed output, so run `rg -n "pattern"` instead.
 - Comments should be used conservatively and only when absolutely necessary. Never comment on a previous state of the code or the change that produced it — a comment that only makes sense to someone who saw the diff is noise.
 - Never import inside functions. Import at module top level.
-- The session, permission, and master LLM stacks are duplicated on purpose — tool schemas, clients, timeouts. Never factor them together; a shared helper is how one surface's model gets silently re-pinned to another's.
+- The session, permission, master, and index-embedding stacks are duplicated on purpose — tool schemas, clients, timeouts. Never factor them together, not even across providers; a shared helper is how one surface's model gets silently re-pinned to another's.
 
 ## When writing docs
 
@@ -77,7 +81,7 @@ Then `Args:` / `Returns:` / `Raises:` as applicable. Nothing else.
 - **Under-escalation is the only unrecoverable failure.** Over-escalating wastes effort; deciding for the developer silently does not undo. Never tune the two symmetrically.
 - **Never rewrite or re-summarise text written for the developer.** Wrap it with context, never over it.
 - **Timestamps never enter LLM context.** They belong in the on-disk logs. A prompt must assemble byte-identically across calls or the cache breaks.
-- **One writer for anything outside the repo** — the master, as read → validate → backup → temp-write → rename. Treat Claude Code's user-level config as shared with other tools.
+- **Shared external config has one writer — the master.** Anything shared with other tools, above all Claude Code's user-level config, is written only by the master, and only as read → validate → backup → temp-write → rename. No other process touches it.
 - **Diagnostic output goes to a file, never the terminal.** The master's TUI owns the display and session brokers inherit it. No `print`, no stream handler — `logging_setup.configure` is the only wiring.
 - **On Claude Code's hook path:** exit 0 always, stdout carries the decision and nothing else, stdlib imports only. A dead broker degrades a session to stock Claude Code; it never breaks one.
 - **Every wait names its target and its timeout explicitly.**
