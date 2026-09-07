@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from broker.paths import BrokerPaths
-from broker.config import ClassifierConfig, SessionBrokerConfig
+from broker.config import ClassifierConfig, EmbeddingConfig, SessionBrokerConfig
 
 
 def test_escalation_queue_path() -> None:
@@ -34,6 +34,7 @@ def test_session_paths_follow_the_configured_home_not_the_env(
         model_id="test-model",
         max_tokens=1024,
         classifier=ClassifierConfig(),
+        embedding=EmbeddingConfig(),
         watchdog_seconds=300.0,
         budget_max=8,
         claude_settings_path=str(configured / "claude-settings.json"),
@@ -46,3 +47,15 @@ def test_session_paths_follow_the_configured_home_not_the_env(
     ):
         assert path.is_relative_to(configured)
         assert not path.is_relative_to(tmp_path / "env")
+
+
+def test_index_db_is_deterministic_and_under_the_home() -> None:
+    """Two BrokerPaths for the same home name the same index file for a repo."""
+    home = Path("/private/tmp/broker-home")
+    repo = Path("/private/tmp/some-repo")
+    first = BrokerPaths(home).index_db(repo)
+    second = BrokerPaths(home).index_db(repo)
+    assert first == second
+    assert first.parent == home / "index"
+    assert first.suffix == ".sqlite"
+    assert first != BrokerPaths(home).index_db(Path("/private/tmp/other-repo"))

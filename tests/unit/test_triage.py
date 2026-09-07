@@ -13,13 +13,15 @@ from anthropic.types import (
 
 from broker import prompts
 from broker.config import BrokerConfig
+from broker.index.retrieval import RetrievalError
+from broker.index.schemas import ContextSymbol, GroundingContext, SymbolKind
 from broker.llm import LLMCallError, ToolCall
 from broker.session.triage import (
     AnswerCall,
     CompleteCall,
     EscalateCall,
+    Grounding,
     NoActionCall,
-    ProposePromptCall,
     assemble_context,
     ground_intent,
     triage,
@@ -28,6 +30,29 @@ from broker.transcript.schemas import AssistantText, UserPrompt
 from broker.transcript.adapter import render
 
 CFG = BrokerConfig(broker_home=Path("/private/tmp/unused"))
+
+CONTEXT = GroundingContext(
+    symbols=[
+        ContextSymbol(
+            qualified_name="src/x.py::do_it", path="src/x.py", kind=SymbolKind.FUNCTION,
+            start_line=1, end_line=3, signature="def do_it() -> None:", fields=[], methods=[],
+            score=0.7, rank=0.7,
+        )
+    ],
+    edges=[],
+    imports={},
+)
+
+
+class FakeRetriever:
+    def __init__(self, context: GroundingContext = CONTEXT) -> None:
+        self.context = context
+        self.calls: list[tuple[str, Path]] = []
+
+    async def __call__(self, intent: str, cwd: Path) -> GroundingContext:
+        self.calls.append((intent, cwd))
+        return self.context
+
 
 EVENTS = [
     UserPrompt(kind="user_prompt", text="add a login page"),
@@ -153,25 +178,47 @@ def test_exactly_two_cache_breakpoints() -> None:
     assert "cache_control" in content[1]
 
 
-async def test_ground_intent_passes_codebase_facts(tmp_path: Path) -> None:
+async def test_ground_intent_orders_intent_claude_md_relevant_code(tmp_path: Path) -> None:
     (tmp_path / "CLAUDE.md").write_text("# Rules\nUse uv.\n")
     fake = FakeLLM(
-        ToolCall(
-            name="propose_prompt",
-            input={"reasoning": "r", "prompt": "Add the page."},
-        )
+        ToolCall(name="propose_prompt", input={"reasoning": "r", "prompt": "Add the page."})
     )
+    retriever = FakeRetriever()
     result = await ground_intent(
-        fake, CFG, intent="add a page THE-RAW-INTENT", cwd=tmp_path
+        fake, CFG, retrieve=retriever, intent="add a page THE-RAW-INTENT", cwd=tmp_path
     )
-    assert isinstance(result, ProposePromptCall)
-    assert result.prompt == "Add the page."
+    assert isinstance(result, Grounding)
+    assert result.proposal.prompt == "Add the page."
+    assert result.context == CONTEXT
+    assert retriever.calls == [("add a page THE-RAW-INTENT", tmp_path)]
     sent = cast(str, fake.calls[0]["messages"][0]["content"])
-    assert "THE-RAW-INTENT" in sent  # intent verbatim
-    assert "Use uv." in sent  # CLAUDE.md folded in
+    intent_at = sent.index("# Developer intent (verbatim)\nadd a page THE-RAW-INTENT")
+    claude_at = sent.index("# The codebase's CLAUDE.md\n# Rules\nUse uv.")
+    code_at = sent.index("# Relevant code\n\n## src/x.py\n### do_it (function, seed, lines 1-3)")
+    assert intent_at < claude_at < code_at
+    assert "# Tracked files" not in sent
+
+
+async def test_ground_intent_without_claude_md_still_sends_relevant_code(tmp_path: Path) -> None:
+    fake = FakeLLM(ToolCall(name="propose_prompt", input={"reasoning": "r", "prompt": "p"}))
+    await ground_intent(fake, CFG, retrieve=FakeRetriever(), intent="x", cwd=tmp_path)
+    sent = cast(str, fake.calls[0]["messages"][0]["content"])
+    assert "# The codebase's CLAUDE.md" not in sent
+    assert "def do_it() -> None:" in sent
+
+
+async def test_ground_intent_retrieval_failure_propagates(tmp_path: Path) -> None:
+    class Failing:
+        async def __call__(self, intent: str, cwd: Path) -> GroundingContext:
+            raise RetrievalError("no code index")
+
+    fake = FakeLLM(ToolCall(name="propose_prompt", input={"reasoning": "r", "prompt": "p"}))
+    with pytest.raises(RetrievalError):
+        await ground_intent(fake, CFG, retrieve=Failing(), intent="x", cwd=tmp_path)
+    assert fake.calls == []  # the LLM is never called without retrieval
 
 
 async def test_ground_intent_wrong_tool_raises(tmp_path: Path) -> None:
     fake = FakeLLM(ToolCall(name="answer", input={"reasoning": "r", "answer": "a"}))
     with pytest.raises(LLMCallError):
-        await ground_intent(fake, CFG, intent="x", cwd=tmp_path)
+        await ground_intent(fake, CFG, retrieve=FakeRetriever(), intent="x", cwd=tmp_path)

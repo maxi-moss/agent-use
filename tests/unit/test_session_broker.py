@@ -17,6 +17,8 @@ from typing import Any, cast
 import pytest
 
 from broker.herdr import driver
+from broker.index.retrieval import RetrievalError
+from broker.index.schemas import ContextSymbol, GroundingContext, SymbolKind
 from broker.llm import LLMCallError, ToolCall
 from broker.permission import PermissionModule
 from broker.permission.llm import ToolCall as PermissionToolCall
@@ -51,6 +53,7 @@ from broker.session.broker import (
 from broker.config import (
     AdoptedSession,
     ClassifierConfig,
+    EmbeddingConfig,
     ResumedTask,
     SessionBrokerConfig,
 )
@@ -178,6 +181,34 @@ class FakeLLM:
         return await self.results.get()
 
 
+RETRIEVED_CONTEXT = GroundingContext(
+    symbols=[
+        ContextSymbol(
+            qualified_name="src/x.py::do_it", path="src/x.py", kind=SymbolKind.FUNCTION,
+            start_line=1, end_line=3, signature="def do_it() -> None:", fields=[], methods=[],
+            score=0.7, rank=0.7,
+        )
+    ],
+    edges=[],
+    imports={},
+)
+
+
+class FakeRetriever:
+    """Injected retrieval seam: returns a fixed context, or raises if scripted."""
+
+    def __init__(self, context: GroundingContext = RETRIEVED_CONTEXT) -> None:
+        self.context = context
+        self.calls: list[tuple[str, Path]] = []
+        self.raise_error: Exception | None = None
+
+    async def __call__(self, intent: str, cwd: Path) -> GroundingContext:
+        self.calls.append((intent, cwd))
+        if self.raise_error is not None:
+            raise self.raise_error
+        return self.context
+
+
 class FakePermissionLLM:
     """Scripted classifier: an empty queue models a call still in flight."""
 
@@ -257,6 +288,7 @@ class Harness:
     cfg: SessionBrokerConfig
     master: StubMaster
     llm: FakeLLM
+    retriever: FakeRetriever
     classifier: FakePermissionLLM
     run: ScriptedRun
     sock: Path
@@ -374,6 +406,7 @@ async def _harness(
     # 4 dead seconds per test here.
     monkeypatch.setattr("broker.herdr.driver._PANE_READY_DELAY_S", 0.0)
     llm = FakeLLM()
+    retriever = FakeRetriever()
     classifier = FakePermissionLLM()
     master = StubMaster()
     master_sock = home / "m.sock"
@@ -390,6 +423,7 @@ async def _harness(
         model_id="test-model",
         max_tokens=1024,
         classifier=ClassifierConfig(model_id="test-classifier"),
+        embedding=EmbeddingConfig(),
         watchdog_seconds=300.0,
         budget_max=8,
         claude_settings_path=str(home / "claude-settings.json"),
@@ -407,6 +441,7 @@ async def _harness(
     broker = SessionBroker(
         cfg,
         llm_call=llm,
+        retrieve=retriever,
         permission=PermissionModule(
             cfg.classifier,
             session_name=cfg.name,
@@ -427,6 +462,7 @@ async def _harness(
         cfg=cfg,
         master=master,
         llm=llm,
+        retriever=retriever,
         classifier=classifier,
         run=run,
         sock=sock,
@@ -488,6 +524,7 @@ async def ground_and_approve(h: Harness, *, count: int, prompt: str) -> None:
         )
     )
     proposal = await h.master.wait_for(T_PROMPT_PROPOSAL, count=count)
+    assert proposal.payload["retrieved"] == [{"name": "src/x.py::do_it", "score": 0.7}]
     assert h.broker.state == "awaiting_approval"
     resp = await client.request(
         h.sock,
@@ -1249,6 +1286,22 @@ async def test_transcript_parse_error_sends_fatal_error(
     fatal = await harness.master.wait_for(T_FATAL_ERROR)
     assert fatal.payload["error_class"] == "TranscriptParseError"
     await wait_state(harness.broker, "error")
+
+
+async def test_retrieval_failure_is_fatal_not_a_proposal(harness: Harness) -> None:
+    harness.retriever.raise_error = RetrievalError("no code index for /x; run …")
+    await client.notify(
+        harness.sock,
+        hook_env(
+            "SessionStart",
+            {"session_id": "cc-1", "transcript_path": str(harness.transcript)},
+        ),
+    )
+    fatal = await harness.master.wait_for(T_FATAL_ERROR)
+    assert fatal.payload["error_class"] == "RetrievalError"
+    assert "no code index" in fatal.payload["detail"]
+    assert harness.master.of_type(T_PROMPT_PROPOSAL) == []
+    assert harness.broker.state == "error"
 
 
 async def test_adopted_broker_takes_over_without_touching_the_pane(

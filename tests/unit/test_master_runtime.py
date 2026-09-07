@@ -993,6 +993,10 @@ async def test_proposal_rendered_verbatim_and_tracked(
             "proposal_id": "p1",
             "proposed_prompt": "the exact proposed prompt",
             "grounding_summary": "the exact grounding summary",
+            "retrieved": [
+                {"name": "a.py::f", "score": 0.81},
+                {"name": "a.py::g", "score": None},
+            ],
         },
     )
     assert resp.ok
@@ -1000,6 +1004,7 @@ async def test_proposal_rendered_verbatim_and_tracked(
     assert len(arrived) == 1
     assert "the exact proposed prompt" in arrived[0].rendered
     assert "the exact grounding summary" in arrived[0].rendered
+    assert "## Retrieved code\n- a.py::f (seed 0.81)\n- a.py::g" in arrived[0].rendered
     assert runtime.registry.get("s1").state == "awaiting_approval"
 
 
