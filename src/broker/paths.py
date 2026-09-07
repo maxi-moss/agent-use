@@ -4,6 +4,7 @@ No other module joins a path inside the broker home: moving a file or socket
 on disk means changing this file and nothing else.
 """
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -72,3 +73,23 @@ class BrokerPaths:
     def session_permissions(self, name: str) -> Path:
         """Append-only permission decision log for session ``name``."""
         return self.session_logs(name) / "permissions.ndjson"
+
+    @property
+    def index_dir(self) -> Path:
+        """Root of the per-repository code indexes."""
+        return self.home / "index"
+
+    def index_db(self, repo: Path) -> Path:
+        """The code index for the repository rooted at ``repo``.
+
+        Args:
+            repo: Absolute, resolved repository root. Callers resolve it; the
+                same string must hash identically from the CLI and a spawn.
+        """
+        digest = hashlib.sha256(str(repo).encode("utf-8")).hexdigest()
+        return self.index_dir / f"{digest}.sqlite"
+
+    @property
+    def index_log(self) -> Path:
+        """Diagnostic log for the index CLI."""
+        return self.logs / "index.log"

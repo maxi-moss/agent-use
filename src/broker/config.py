@@ -38,6 +38,14 @@ class ClassifierConfig(BaseModel):
     max_tokens: int = 1024
 
 
+class EmbeddingConfig(BaseModel):
+    """The embedding model behind the code index and grounding retrieval."""
+
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
+
+    model_id: str = "text-embedding-3-small"  # PINNED — nowhere else in the tree
+
+
 # Bare tool names and command patterns only: a `/path`-anchored rule in a
 # settings file resolves against that file's own directory, which is under the
 # broker home rather than the session's working tree.
@@ -105,6 +113,7 @@ class BrokerConfig(BaseModel):
     recent_turns_window: int = 20
     broker_home: Path = Field(default_factory=default_broker_home)
     classifier: ClassifierConfig = ClassifierConfig()
+    embedding: EmbeddingConfig = EmbeddingConfig()
     permission_rules: PermissionRules = PermissionRules()
 
 
@@ -148,6 +157,7 @@ class SessionBrokerConfig(BaseModel):
     model_id: str
     max_tokens: int
     classifier: ClassifierConfig
+    embedding: EmbeddingConfig
     watchdog_seconds: float
     budget_max: int
     claude_settings_path: str  # written by the master; passed to `agent start`
