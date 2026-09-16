@@ -32,6 +32,7 @@ T_RETRACT = "retract"
 T_PROMPT_PROPOSAL = "prompt_proposal"  # broker -> master
 T_BUDGET_UPDATE = "budget_update"  # broker -> master
 T_LIVE_STATUS = "live_status"  # broker -> master
+T_SESSION_ENDED = "session_ended"  # broker -> master: SessionEnd fired, exiting
 
 # Machine-readable refusal reasons carried alongside the human-readable error
 # string on a negative Response. Closed set: a sender that cannot tell a
@@ -69,7 +70,6 @@ class SessionState(StrEnum):
     ERROR = "error"
     STOPPED = "stopped"
     UNMANAGED = "unmanaged"
-    DEAD = "dead"
 
 
 # A session live enough to accept a decision or a prompt.

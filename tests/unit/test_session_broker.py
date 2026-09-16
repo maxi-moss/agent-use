@@ -39,6 +39,7 @@ from broker.protocol.constants import (
     T_PROMPT_PROPOSAL,
     T_REACTIVATE,
     T_RETRACT,
+    T_SESSION_ENDED,
     T_SHUTDOWN,
     T_STATUS,
 )
@@ -684,6 +685,20 @@ async def test_hook_events_reach_module(harness: Harness) -> None:
         "developer_input",
         "session_ended",
     ]
+
+
+async def test_session_end_reports_terminal_and_exits(
+    harness: Harness,
+) -> None:
+    await launch(harness)
+    await client.notify(harness.sock, hook_env("SessionEnd", {}))
+    # The developer ran /exit: the broker reports the terminal end to the
+    # master so the session leaves the fleet...
+    await harness.master.wait_for(T_SESSION_ENDED)
+    # ...and then stops serving on its own — the run task completes without a
+    # cancel, so a finished session's broker never lingers on its socket.
+    async with asyncio.timeout(5.0):
+        await harness.run_task
 
 
 async def test_ground_and_reactivate_call_set_intent(harness: Harness) -> None:

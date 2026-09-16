@@ -131,7 +131,7 @@ async def test_live_pane_marked_unmanaged(
     assert Registry.load(home / "registry.json").get("s1").state == "unmanaged"
 
 
-async def test_dead_pane_marked_dead_and_retracts(
+async def test_dead_pane_removed_and_retracts(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registry = _registry_with_s1(home)
@@ -140,7 +140,10 @@ async def test_dead_pane_marked_dead_and_retracts(
     seeded.accept(_permission_escalation("p1", "s1"))
     _fail_pane_read(monkeypatch, HerdrError("pane_not_found", "no such pane"))
     warnings = await reconcile_registry(registry, seeded)
-    assert Registry.load(home / "registry.json").get("s1").state == "dead"
+    # A session whose pane is gone is finished: removed here and on reload, so
+    # it can never be handed back to the master as a routing candidate.
+    assert "s1" not in registry.records
+    assert "s1" not in Registry.load(home / "registry.json").records
     # Both raiser identities retracted from the PERSISTED queue, so the head
     # the runtime re-announces on startup cannot belong to a dead session.
     assert _queue(home).depth == 0
@@ -148,7 +151,7 @@ async def test_dead_pane_marked_dead_and_retracts(
     assert any("e1" in w for w in retraction_lines)
     assert any("p1" in w for w in retraction_lines)
     assert len(retraction_lines) == 2
-    assert any("marked dead" in w for w in warnings)
+    assert any("gone — removed" in w for w in warnings)
 
 
 async def test_inconclusive_probe_never_marks_dead(

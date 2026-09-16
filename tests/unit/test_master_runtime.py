@@ -53,6 +53,7 @@ from broker.protocol.constants import (
     T_PROMPT_PROPOSAL,
     T_REACTIVATE,
     T_RETRACT,
+    T_SESSION_ENDED,
     T_STATUS,
 )
 from broker.protocol.schemas import (
@@ -925,6 +926,59 @@ async def test_completion_notifies_done(
     assert runtime.registry.get("s1").state == "completed"
 
 
+async def test_session_ended_removes_from_fleet(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, posts = rt
+    # s1 is seeded driving and visible in the summary the master carries.
+    assert "s1" in runtime.render_registry_summary()
+    resp = await send(runtime, T_SESSION_ENDED, {})
+    assert resp.ok
+    # Removed everywhere a router looks: the summary, the fleet, and the
+    # registry itself — so it can never be handed a new task or a decision.
+    assert "s1" not in runtime.registry.records
+    assert runtime.render_registry_summary() == "(no sessions)"
+    last_fleet = [m for m in posts if isinstance(m, FleetChanged)][-1].rendered
+    assert "s1" not in last_fleet
+    # The removal is durable, and a late live-status push cannot resurrect it.
+    assert "s1" not in Registry.load(home / "registry.json").records
+    assert (await send(runtime, T_LIVE_STATUS, {"state": "driving"})).ok
+    assert "s1" not in runtime.registry.records
+
+
+async def test_session_ended_for_unknown_session_is_acked(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    runtime, posts = rt
+    before = len(posts)
+    resp = await send(runtime, T_SESSION_ENDED, {}, session="ghost")
+    # A report for a session already gone (or never known) is ACKed and posts
+    # nothing — the sender never spins re-reporting.
+    assert resp.ok
+    assert len(posts) == before
+
+
+async def test_session_ended_retracts_its_stranded_escalation(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    runtime, posts = rt
+    # s1 is the surfaced FIFO head, waiting on a decision the developer never
+    # gave before running /exit; a bystander waits behind it and must survive.
+    assert (await send(runtime, T_ESCALATION, escalation_dict("e1", "s1"))).ok
+    other = EscalationPayload.model_validate(escalation_dict("e9", "s9"))
+    runtime.queue.accept(other)
+    assert runtime.queue.active is not other
+    resp = await send(runtime, T_SESSION_ENDED, {})
+    assert resp.ok
+    # The broker exits without withdrawing it, so ending must retract it —
+    # otherwise the head wedges the queue forever, undispatchable to a gone
+    # session, and blocks the bystander behind it.
+    assert runtime.queue.depth == 1
+    assert runtime.queue.active is other
+    notices = [m.text for m in posts if isinstance(m, Notice)]
+    assert any("e1" in t and "retracted" in t for t in notices)
+
+
 async def test_thin_escalation_rejected(
     rt: tuple[MasterRuntime, list[Any]]
 ) -> None:
@@ -1257,16 +1311,16 @@ async def test_attach_refuses_without_an_approved_prompt(
     assert spawn.argvs == []
 
 
-async def test_attach_refuses_a_dead_session(
+async def test_attach_refuses_a_gone_session(
     rt: tuple[MasterRuntime, list[Any]], spawn: RecordingSpawn
 ) -> None:
     runtime, _ = rt
-    record = _bind_session(runtime)
-    record.state = SessionState.DEAD
-    runtime.registry.upsert(record)
-    with pytest.raises(ValueError) as exc:
+    _bind_session(runtime)
+    # A session whose pane was found gone is removed, not marked: it is no
+    # longer a routing candidate, so attach cannot even resolve it.
+    runtime.registry.remove("s1")
+    with pytest.raises(KeyError):
         await runtime.attach_session("s1")
-    assert "dead" in str(exc.value)
     assert spawn.argvs == []
 
 

@@ -72,6 +72,7 @@ from broker.protocol.constants import (
     T_REACTIVATE,
     T_RETRACT,
     T_SEND_PROMPT,
+    T_SESSION_ENDED,
     T_SHUTDOWN,
     T_STATUS,
 )
@@ -849,6 +850,7 @@ class SessionBroker:
             self.permission.note_session_ended()
             self._set_state(SessionState.STOPPED)
             self._log("session_end", "", "SessionEnd hook received")
+            self.queue.put_nowait(self._on_session_end)
         elif name in {"PreCompact", "PostCompact"}:
             self._log("compaction", "", name)  # continue normally
         else:
@@ -1468,6 +1470,20 @@ class SessionBroker:
         except Exception:
             # Master unreachable: the pane degrades to stock Claude Code.
             logger.exception("could not report fatal error to master")
+
+    async def _on_session_end(self) -> None:
+        """Report the terminal end to the master, then stop serving and exit.
+
+        If the master is unreachable the failure is logged, not re-raised: the
+        pane is exiting regardless, and the master's own reconciliation removes
+        a session whose pane it later finds gone.
+        """
+        try:
+            await self._to_master(T_SESSION_ENDED, {})
+        except Exception:
+            logger.exception("could not report session end to master")
+        self._shutdown.set()
+        self.queue.put_nowait(None)
 
     def _log(self, kind: str, reasoning: str, detail: str) -> None:
         """Append one entry to this session's decision log."""

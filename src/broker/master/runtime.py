@@ -73,6 +73,7 @@ from broker.protocol.constants import (
     T_REACTIVATE,
     T_RETRACT,
     T_SEND_PROMPT,
+    T_SESSION_ENDED,
     T_SHUTDOWN,
     T_STATUS,
 )
@@ -120,15 +121,16 @@ PANE_UNKNOWN = "(pane unknown)"
 # that cannot be reached must not fail the whole listing.
 PROBE_FAILURES = (OSError, ConnectionError, TimeoutError, ValidationError)
 
-# A session in one of these states is settled or gone: it has no live
-# operating status, so a late-arriving push must not resurrect it. Left only
-# by a master-initiated boundary write (spawn/reassign/attach/reactivate).
+# A session in one of these states is settled: it has no live operating
+# status, so a late-arriving push must not resurrect it. Left only by a
+# master-initiated boundary write (spawn/reassign/attach/reactivate). A
+# session that is gone is not settled here — it is removed from the registry
+# entirely, so no state stands in for "finished".
 _ABSORBING = frozenset(
     {
         SessionState.COMPLETED,
         SessionState.ERROR,
         SessionState.STOPPED,
-        SessionState.DEAD,
         SessionState.UNMANAGED,
     }
 )
@@ -205,14 +207,14 @@ async def reconcile_registry(
 
     Probes are client-side connects and pane reads only — nothing is spawned
     and nothing binds a socket. A session whose pane is definitively gone is
-    marked dead and its queued escalations are retracted; every other outcome
-    leaves the session recoverable. An inconclusive probe never marks a
-    session dead — a wrong ``unmanaged`` costs the developer a glance, a
-    wrong ``dead`` throws away queued decisions.
+    removed and its queued escalations are retracted; every other outcome
+    leaves the session recoverable. An inconclusive probe never removes a
+    session — a wrong ``unmanaged`` costs the developer a glance, a wrong
+    removal throws away queued decisions.
 
     Args:
-        registry: Loaded session registry; states are updated in place and
-            saved once.
+        registry: Loaded session registry; a gone session is removed, every
+            other classification updates its state in place and is saved once.
         queue: Persisted escalation queue; a dead session's queued
             escalations are retracted from it before the TUI re-announces
             the head.
@@ -241,9 +243,8 @@ async def reconcile_registry(
             )
         except HerdrError as exc:
             if exc.code == "pane_not_found":
-                record.state = SessionState.DEAD
                 warnings.append(
-                    f"session {name}: pane {record.pane_id} gone — marked dead"
+                    f"session {name}: pane {record.pane_id} gone — removed"
                 )
                 for component in ("broker", "permission"):
                     cleared = queue.retract_for_raiser(
@@ -255,6 +256,9 @@ async def reconcile_registry(
                             f"{cleared.escalation_id} retracted — the session "
                             "is dead and no decision can reach it"
                         )
+                # A session whose pane is gone is finished: drop it so it can
+                # never be a routing candidate. remove() persists on its own.
+                registry.remove(name)
                 continue
             record.state = SessionState.UNMANAGED
             warnings.append(
@@ -567,6 +571,8 @@ class MasterRuntime:
                 notifier.notify_done, f"Session {name} complete", p.summary
             )
             return self._ack(env, ok=True)
+        if env.type == T_SESSION_ENDED:
+            return await self._on_session_ended(env, name)
         if env.type == T_FATAL_ERROR:
             p = FatalErrorPayload.model_validate(env.payload)
             self._set_state(name, SessionState.ERROR)
@@ -881,17 +887,14 @@ class MasterRuntime:
             A confirmation line naming the session and the new broker's pid.
 
         Raises:
-            ValueError: The session is marked dead, the registry only partly
-                knows it, or no approved prompt was ever persisted for it.
+            KeyError: No such session — a session whose pane was found gone is
+                removed from the registry, so there is nothing left to attach.
+            ValueError: The registry only partly knows the session, or no
+                approved prompt was ever persisted for it.
             RuntimeError: A broker is still answering on the session socket.
         """
-        record = self.registry.get(session_id)
+        record = self.registry.get(session_id)  # KeyError if gone or unknown
         # Every refusal fires before any side effect.
-        if record.state == SessionState.DEAD:
-            raise ValueError(
-                f"session {session_id} is marked dead — its pane is gone, "
-                "so there is nothing left to attach to"
-            )
         adopt = _adoption_fields(record)
         if record.approved_prompt is None:
             raise ValueError(
@@ -1349,6 +1352,37 @@ class MasterRuntime:
         )
         self._publish_queue_state()
         await self._surface_head()
+
+    async def _on_session_ended(self, env: Envelope, name: str) -> Response:
+        """Retire a session whose broker reported its ``SessionEnd``.
+
+        The developer ran ``/exit``: the pane and Claude session are gone, so
+        the session is removed from the registry and can never again be a
+        routing candidate. A report for a session already gone is still ACKed.
+
+        Args:
+            env: Envelope carrying the terminal report.
+            name: Session that ended.
+
+        Returns:
+            The ACK.
+        """
+        if name in self.registry.records:
+            logger.info("session %s: ended (/exit) — removed from the fleet", name)
+            self._activity.pop(name, None)
+            self._permission_prompt_pending.discard(name)
+            self._procs.pop(name, None)
+            self.registry.remove(name)
+            # The broker exits without withdrawing a live escalation of either
+            # kind, so retract both here as the dead path does — a stranded
+            # head would wedge the FIFO queue, undispatchable to a gone session.
+            await self._retract_stranded_escalation(name, "broker")
+            await self._retract_stranded_escalation(name, "permission")
+            self.app_post(
+                Notice(f"session {name} ended (/exit) — removed from the fleet")
+            )
+            self._publish_fleet()
+        return self._ack(env, ok=True)
 
     def _set_state(self, name: str, state: SessionState) -> bool:
         """Record a session's new state and tell the TUI, once per change.
