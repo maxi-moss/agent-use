@@ -103,15 +103,14 @@ class Registry:
         atomic_update_json(self.path, mutate)
 
     def allocate_name(self) -> str:
-        """Allocate the next session name from a strictly monotonic counter.
-
-        The counter never rewinds, so a removed session's name is never handed
-        out again — reusing it would collide with the on-disk logs, socket and
-        transcript still keyed to the finished session.
+        """Allocate the next session name, never reusing a freed one.
 
         Returns:
             The allocated name, guaranteed to match ``NAME_RE``.
         """
+        # Monotonic, never a scan of `records`: a finished session is removed,
+        # so a free-slot scan would rehand its name while its socket and logs
+        # still exist on disk.
         self._name_seq += 1
         name = f"s{self._name_seq}"
         assert NAME_RE.fullmatch(name)
@@ -151,10 +150,6 @@ class Registry:
 
     def remove(self, name: str) -> None:
         """Drop a finished session from the registry and persist the removal.
-
-        The monotonic name counter does not rewind, so the freed name is never
-        reallocated. A finished session that lingered here would be a routing
-        candidate with no pane and no broker behind it.
 
         Args:
             name: Session to forget; a no-op when it is already absent.

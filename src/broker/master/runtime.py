@@ -1356,16 +1356,12 @@ class MasterRuntime:
     async def _on_session_ended(self, env: Envelope, name: str) -> Response:
         """Retire a session whose broker reported its ``SessionEnd``.
 
-        The developer ran ``/exit``: the pane and Claude session are gone, so
-        the session is removed from the registry and can never again be a
-        routing candidate. A report for a session already gone is still ACKed.
-
         Args:
             env: Envelope carrying the terminal report.
             name: Session that ended.
 
         Returns:
-            The ACK.
+            The ACK, sent even when the session is already gone.
         """
         if name in self.registry.records:
             logger.info("session %s: ended (/exit) — removed from the fleet", name)
@@ -1374,8 +1370,8 @@ class MasterRuntime:
             self._procs.pop(name, None)
             self.registry.remove(name)
             # The broker exits without withdrawing a live escalation of either
-            # kind, so retract both here as the dead path does — a stranded
-            # head would wedge the FIFO queue, undispatchable to a gone session.
+            # kind, so retract both — a stranded head would wedge the FIFO
+            # queue, undispatchable to a gone session.
             await self._retract_stranded_escalation(name, "broker")
             await self._retract_stranded_escalation(name, "permission")
             self.app_post(

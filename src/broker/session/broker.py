@@ -1472,12 +1472,7 @@ class SessionBroker:
             logger.exception("could not report fatal error to master")
 
     async def _on_session_end(self) -> None:
-        """Report the terminal end to the master, then stop serving and exit.
-
-        If the master is unreachable the failure is logged, not re-raised: the
-        pane is exiting regardless, and the master's own reconciliation removes
-        a session whose pane it later finds gone.
-        """
+        """Report the terminal end to the master, then stop serving and exit."""
         try:
             await self._to_master(T_SESSION_ENDED, {})
         except Exception:
