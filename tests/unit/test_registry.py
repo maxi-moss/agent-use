@@ -1,4 +1,4 @@
-"""Registry: round-trip, central name allocation, fail-loud lookups."""
+"""Registry: round-trip, reuse-proof name allocation, removal, fail-loud."""
 
 from pathlib import Path
 
@@ -56,6 +56,33 @@ def test_budget_updates_persist(tmp_path: Path) -> None:
     assert Registry.load(path).get("s1").budget_count == 0
 
 
+def test_remove_drops_session_and_persists(tmp_path: Path) -> None:
+    path = tmp_path / "registry.json"
+    registry = Registry.load(path)
+    registry.upsert(record("s1"))
+    registry.upsert(record("s2"))
+    registry.remove("s1")
+    assert registry.records.keys() == {"s2"}
+    # Persisted, so a reload never resurrects the finished session as a
+    # routing candidate.
+    assert Registry.load(path).records.keys() == {"s2"}
+    registry.remove("s1")  # already gone: a no-op, not an error
+
+
+def test_allocate_name_never_reuses_a_removed_name(tmp_path: Path) -> None:
+    path = tmp_path / "registry.json"
+    registry = Registry.load(path)
+    first = registry.allocate_name()
+    registry.upsert(record(first))
+    registry.remove(first)
+    assert first not in registry.records
+    # A freed number would collide with the on-disk logs, socket and transcript
+    # still keyed to the finished session, so the counter never rewinds — even
+    # across a reload that only sees the survivors.
+    assert registry.allocate_name() != first
+    assert Registry.load(path).allocate_name() != first
+
+
 def test_unknown_session_raises_key_error(tmp_path: Path) -> None:
     registry = Registry.load(tmp_path / "registry.json")
     with pytest.raises(KeyError):
@@ -65,5 +92,12 @@ def test_unknown_session_raises_key_error(tmp_path: Path) -> None:
 def test_corrupt_registry_fails_loud(tmp_path: Path) -> None:
     path = tmp_path / "registry.json"
     path.write_text("{broken")
+    with pytest.raises(RegistryError):
+        Registry.load(path)
+
+
+def test_non_integer_name_seq_fails_loud(tmp_path: Path) -> None:
+    path = tmp_path / "registry.json"
+    path.write_text('{"sessions": {}, "name_seq": "oops"}')
     with pytest.raises(RegistryError):
         Registry.load(path)

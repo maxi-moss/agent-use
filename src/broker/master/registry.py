@@ -40,10 +40,13 @@ class RegistryError(Exception):
 
 
 class Registry:
-    def __init__(self, path: Path, records: dict[str, SessionRecord]) -> None:
-        """Hold the registry file path and the records loaded from it."""
+    def __init__(
+        self, path: Path, records: dict[str, SessionRecord], name_seq: int
+    ) -> None:
+        """Hold the registry file path, the records, and the name counter."""
         self.path = path
         self.records = records
+        self._name_seq = name_seq
 
     @classmethod
     def load(cls, path: Path) -> "Registry":
@@ -57,18 +60,19 @@ class Registry:
 
         Raises:
             RegistryError: The file is not valid JSON, is not a JSON object,
-                has a non-object ``sessions`` entry, or holds a session record
-                that fails validation.
+                has a non-object ``sessions`` entry, a non-integer
+                ``name_seq``, or holds a session record that fails validation.
         """
         if not path.exists():
-            return cls(path, {})
+            return cls(path, {}, 0)
         try:
             parsed: Any = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             raise RegistryError(f"{path} is not valid JSON: {exc.msg}") from exc
         if not isinstance(parsed, dict):
             raise RegistryError(f"{path} is not a JSON object")
-        raw_sessions = cast(dict[str, Any], parsed).get("sessions", {})
+        obj = cast(dict[str, Any], parsed)
+        raw_sessions = obj.get("sessions", {})
         if not isinstance(raw_sessions, dict):
             raise RegistryError(f"{path}: 'sessions' is not an object")
         records: dict[str, SessionRecord] = {}
@@ -79,7 +83,10 @@ class Registry:
                 raise RegistryError(
                     f"{path}: invalid session record {name!r}: {exc}"
                 ) from exc
-        return cls(path, records)
+        name_seq = obj.get("name_seq", 0)
+        if not isinstance(name_seq, int) or isinstance(name_seq, bool):
+            raise RegistryError(f"{path}: 'name_seq' is not an integer")
+        return cls(path, records, name_seq)
 
     def save(self) -> None:
         """Write the in-memory records back to the registry file."""
@@ -88,22 +95,25 @@ class Registry:
         }
 
         def mutate(data: dict[str, Any]) -> dict[str, Any]:
-            """Replace ``sessions``, leaving the rest of the file intact."""
+            """Replace ``sessions`` and the counter, leaving the rest intact."""
             data["sessions"] = sessions
+            data["name_seq"] = self._name_seq
             return data
 
         atomic_update_json(self.path, mutate)
 
     def allocate_name(self) -> str:
-        """Allocate the next free session name.
+        """Allocate the next session name from a strictly monotonic counter.
+
+        The counter never rewinds, so a removed session's name is never handed
+        out again — reusing it would collide with the on-disk logs, socket and
+        transcript still keyed to the finished session.
 
         Returns:
             The allocated name, guaranteed to match ``NAME_RE``.
         """
-        i = 1
-        while f"s{i}" in self.records:
-            i += 1
-        name = f"s{i}"
+        self._name_seq += 1
+        name = f"s{self._name_seq}"
         assert NAME_RE.fullmatch(name)
         return name
 
@@ -137,4 +147,18 @@ class Registry:
         if not NAME_RE.fullmatch(record.name):
             raise ValueError(f"invalid session name {record.name!r}")
         self.records[record.name] = record
+        self.save()
+
+    def remove(self, name: str) -> None:
+        """Drop a finished session from the registry and persist the removal.
+
+        The monotonic name counter does not rewind, so the freed name is never
+        reallocated. A finished session that lingered here would be a routing
+        candidate with no pane and no broker behind it.
+
+        Args:
+            name: Session to forget; a no-op when it is already absent.
+        """
+        if self.records.pop(name, None) is None:
+            return
         self.save()
