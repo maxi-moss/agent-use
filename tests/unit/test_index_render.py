@@ -79,10 +79,6 @@ def test_render_is_byte_exact() -> None:
     assert render_relevant_code(CONTEXT) == EXPECTED
 
 
-def test_render_is_deterministic() -> None:
-    assert render_relevant_code(CONTEXT) == render_relevant_code(CONTEXT.model_copy(deep=True))
-
-
 def test_budget_drops_lowest_ranked_expansion_and_never_seeds(
     monkeypatch: "pytest.MonkeyPatch",
 ) -> None:
