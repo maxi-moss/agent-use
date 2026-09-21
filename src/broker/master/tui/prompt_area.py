@@ -26,6 +26,7 @@ class PromptArea(TextArea):
     ]
 
     async def _on_key(self, event: events.Key) -> None:
+        """Submit on Enter; every other key is TextArea's."""
         if event.key == "enter":
             event.stop()
             event.prevent_default()
