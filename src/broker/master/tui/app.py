@@ -32,8 +32,8 @@ from broker.master.testmode import load_scenario, run_scenario
 from broker.master.tui.chat_log import ChatMessage, ThinkingIndicator
 from broker.master.tui.fleet import FLEET_WIDTH, FleetSidebar
 from broker.master.tui.messages import LLMReply, ViewEventMessage
+from broker.master.tui.notice import AttentionNotice
 from broker.master.tui.prompt_area import PromptArea
-from broker.master.tui.surface import FocusedSurface
 from broker.master.viewmodel import (
     Attention,
     CompletionArrived,
@@ -50,6 +50,7 @@ from broker.master.viewmodel import (
 class BrokerMasterApp(App[None]):
     # The fleet pane holds FLEET_WIDTH content cells plus Textual's default
     # vertical scrollbar (2 cells).
+    """The master's Textual app: fleet sidebar, attention notice, chat and composer over one MasterRuntime."""
     CSS = f"#fleet {{ width: {FLEET_WIDTH + 2}; }}" + """
     #chat { height: 1fr; }
     #activity {
@@ -83,9 +84,8 @@ class BrokerMasterApp(App[None]):
         # scenario runner reads its assertions from, while still reaching the
         # widgets.
         self._scenario_posts: list[ViewEvent] = []
-        self._latest_view: FleetView | None = None
-        self._focus_session: str | None = None
-        self._focus_kind: Attention | None = None
+        # Disclosures are held here, off the chat, until /escalation or
+        # /proposal pastes one in; FleetUpdated prunes what is no longer live.
         self._head: EscalationArrived | PermissionEscalationArrived | None = None
         self._proposals: dict[str, str] = {}
         self.runtime = MasterRuntime(
@@ -110,10 +110,10 @@ class BrokerMasterApp(App[None]):
             with VerticalScroll(id="fleet"):
                 yield FleetSidebar(Text("Master — idle"), id="fleet-table")
             with Vertical():
+                notice = AttentionNotice(Text(""), id="notice")
+                notice.display = False
+                yield notice
                 yield VerticalScroll(id="chat")
-                surface = FocusedSurface(id="surface")
-                surface.display = False
-                yield surface
                 with Vertical(id="activity") as activity:
                     activity.border_title = "activity"
                     yield RichLog(id="events", wrap=True)
@@ -141,19 +141,17 @@ class BrokerMasterApp(App[None]):
     # ── developer input → LLM worker ─────────────────────────────────────────
 
     def on_prompt_area_submitted(self, message: PromptArea.Submitted) -> None:
+        """Route a submitted line: paste command, scenario command, or master turn."""
         text = message.text.strip()
         if not text:
             return
         box = self.query_one("#box", PromptArea)
         box.clear()
-        if text == "/main":
-            self._exit_surface()
-            return
         if text == "/escalation":
-            self._enter_escalation()
+            self._show_escalation()
             return
         if text == "/proposal" or text.startswith("/proposal "):
-            self._enter_proposal(text[len("/proposal"):].strip() or None)
+            self._show_proposal(text[len("/proposal"):].strip() or None)
             return
         box.disabled = True
         self._chat_block(text, role="user", label="you")
@@ -231,6 +229,7 @@ class BrokerMasterApp(App[None]):
         self.post_message(LLMReply(reply))
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        """Free the composer when a worker ends and show a failed turn's error."""
         worker = cast(
             "Worker[None]",
             event.worker,  # pyright: ignore[reportUnknownMemberType]
@@ -260,29 +259,26 @@ class BrokerMasterApp(App[None]):
     def on_view_event_message(self, message: ViewEventMessage) -> None:
         event = message.event
         if isinstance(event, FleetUpdated):
-            self._latest_view = event.view
+            self._prune_disclosures(event.view)
             self.query_one("#fleet-table", FleetSidebar).update_view(event.view)
-            self._maybe_exit_surface()
+            self.query_one("#notice", AttentionNotice).update_view(event.view)
         elif isinstance(event, EscalationArrived):
-            self._chat_block(event.rendered)
+            self._head = event
             self._event_line(
                 f"escalation {event.escalation_id} from {event.session_id}"
             )
-            self._head = event
         elif isinstance(event, PermissionEscalationArrived):
-            self._chat_block(event.rendered)
+            self._head = event
             self._event_line(
                 f"permission escalation {event.escalation_id} from "
                 f"{event.session_id}"
             )
-            self._head = event
         elif isinstance(event, ProposalArrived):
-            self._chat_block(event.rendered)
+            self._proposals[event.session_id] = event.rendered
             self._event_line(
                 f"proposal {event.proposal_id} from {event.session_id} "
                 "awaiting approval"
             )
-            self._proposals[event.session_id] = event.rendered
         elif isinstance(event, CompletionArrived):
             self._chat_block(
                 f"Session {event.session_id} completed:\n{event.summary}"
@@ -293,85 +289,40 @@ class BrokerMasterApp(App[None]):
         else:
             self._event_line(f"{event.session_id} → {event.state}")
 
-    # ── focused surfaces (display mode only; the composer stays the master's) ─
+    # ── disclosures on demand (deterministic; no LLM turn) ───────────────────
 
-    def _enter_escalation(self) -> None:
-        """Focus the head escalation's disclosure, if one is waiting."""
-        view = self._latest_view
-        head_id = view.head_escalation_id if view else None
-        if head_id is None:
+    def _prune_disclosures(self, view: FleetView) -> None:
+        """Drop held disclosures that ``view`` no longer lists as live."""
+        head = view.head
+        if self._head is not None and (
+            head is None or head.escalation_id != self._head.escalation_id
+        ):
+            self._head = None
+        proposing = {r.session_id for r in view.rows if Attention.PROPOSAL in r.badges}
+        self._proposals = {
+            sid: text for sid, text in self._proposals.items() if sid in proposing
+        }
+
+    def _show_escalation(self) -> None:
+        """Paste the head escalation's disclosure into the chat, verbatim."""
+        if self._head is None:
             self._event_line("no escalation is waiting")
             return
-        head = self._head
-        if head is None or head.escalation_id != head_id:
-            self._event_line("escalation disclosure not yet received")
-            return
-        if isinstance(head, PermissionEscalationArrived):
-            self._event_line(
-                f"the waiting request is a permission prompt in session "
-                f"{head.session_id} — answer it in its pane"
-            )
-            return
-        self._focus_session, self._focus_kind = head.session_id, Attention.ESCALATION
-        self.query_one("#surface", FocusedSurface).show(
-            f"Session broker · {head.session_id}", head.rendered
-        )
-        self._set_mode(surface=True)
+        self._chat_block(self._head.rendered)
 
-    def _enter_proposal(self, session_id: str | None) -> None:
-        """Focus a pending proposal: ``session_id``'s, or the only one."""
-        view = self._latest_view
-        rows = [
-            r for r in (view.rows if view else ()) if Attention.PROPOSAL in r.badges
-        ]
-        row = (
-            next((r for r in rows if r.session_id == session_id), None)
-            if session_id
-            else (rows[0] if len(rows) == 1 else None)
-        )
-        if row is None:
+    def _show_proposal(self, session_id: str | None) -> None:
+        """Paste a pending proposal into the chat: ``session_id``'s, or the only one."""
+        if session_id is None and len(self._proposals) == 1:
+            session_id = next(iter(self._proposals))
+        rendered = self._proposals.get(session_id) if session_id else None
+        if rendered is None:
             self._event_line(
-                "no single proposal to focus — use /proposal sN"
-                if rows
+                "no single proposal — use /proposal sN"
+                if self._proposals
                 else "no proposal is waiting"
             )
             return
-        rendered = self._proposals.get(row.session_id)
-        if rendered is None:
-            self._event_line("proposal not yet received")
-            return
-        self._focus_session, self._focus_kind = row.session_id, Attention.PROPOSAL
-        self.query_one("#surface", FocusedSurface).show(
-            f"Session broker · {row.session_id}", rendered
-        )
-        self._set_mode(surface=True)
-
-    def _exit_surface(self) -> None:
-        """Return to the master chat."""
-        self._focus_session = self._focus_kind = None
-        self._set_mode(surface=False)
-
-    def _set_mode(self, *, surface: bool) -> None:
-        """Show either the chat or the focused surface, and match the placeholder."""
-        self.query_one("#chat", VerticalScroll).display = not surface
-        self.query_one("#surface", FocusedSurface).display = surface
-        placeholder = "task, decision, or question… (ctrl+j for newline)"
-        if surface and self._focus_kind is Attention.ESCALATION:
-            placeholder = "answer this escalation via the master…"
-        elif surface and self._focus_kind is Attention.PROPOSAL:
-            placeholder = "approve or revise this prompt via the master…"
-        self.query_one("#box", PromptArea).placeholder = placeholder
-
-    def _maybe_exit_surface(self) -> None:
-        """Leave the surface once its badge is gone from the latest fleet view."""
-        if self._focus_session is None or self._latest_view is None:
-            return
-        row = next(
-            (r for r in self._latest_view.rows if r.session_id == self._focus_session),
-            None,
-        )
-        if row is None or self._focus_kind not in row.badges:
-            self._exit_surface()
+        self._chat_block(rendered)
 
     # ── helpers ──────────────────────────────────────────────────────────────
 

@@ -44,6 +44,7 @@ from broker.master.viewmodel import (
     EventSink,
     FleetUpdated,
     FleetView,
+    HeadRequest,
     Notice,
     PermissionEscalationArrived,
     ProposalArrived,
@@ -1403,13 +1404,30 @@ class MasterRuntime:
                     pane_id=r.pane_id,
                 )
             )
-        head = self.queue.active
         return FleetView(
             master_activity=self._master_activity,
             rows=tuple(rows),
             queue_depth=self.queue.depth,
             waiting=self.queue.waiting,
-            head_escalation_id=head.escalation_id if head else None,
+            head=self._head_request(),
+        )
+
+    def _head_request(self) -> HeadRequest | None:
+        head = self.queue.active
+        if head is None:
+            return None
+        if isinstance(head, PermissionEscalationPayload):
+            return HeadRequest(
+                head.session_id,
+                head.escalation_id,
+                Attention.PERMISSION,
+                head.tool_name,
+            )
+        return HeadRequest(
+            head.session_id,
+            head.escalation_id,
+            Attention.ESCALATION,
+            head.what_was_asked,
         )
 
     def _badges_by_session(self) -> dict[str, tuple[Attention, ...]]:
