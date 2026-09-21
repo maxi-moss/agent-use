@@ -122,6 +122,11 @@ class EscalationQueue:
         """Return the session ids of the entries behind the head, in order."""
         return tuple(p.session_id for p in self._entries[1:])
 
+    @property
+    def entries(self) -> tuple[QueuePayload, ...]:
+        """Return every live entry, head first, as a read-only snapshot."""
+        return tuple(self._entries)
+
     def accept(self, payload: QueuePayload) -> None:
         """Append ``payload`` to the queue and persist it.
 

@@ -15,10 +15,10 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from broker.master.messages import (
+from broker.master.viewmodel import (
     EscalationArrived,
+    FleetUpdated,
     PermissionEscalationArrived,
-    QueueDepthChanged,
 )
 from broker.master.registry import SessionRecord
 from broker.master.runtime import MasterRuntime
@@ -360,19 +360,20 @@ async def _run_step(
         want = step.waiting
 
         def depth_matches() -> bool:
-            latest = _latest(posts, QueueDepthChanged)
+            latest = _latest(posts, FleetUpdated)
             return (
                 latest is not None
-                and latest.depth == step.depth
-                and list(latest.waiting) == want
+                and latest.view.queue_depth == step.depth
+                and list(latest.view.waiting) == want
             )
 
         passed = await _poll_until(depth_matches, timeout_s)
-        latest = _latest(posts, QueueDepthChanged)
+        latest = _latest(posts, FleetUpdated)
         seen = (
-            f"depth={latest.depth} waiting={list(latest.waiting)}"
+            f"depth={latest.view.queue_depth} "
+            f"waiting={list(latest.view.waiting)}"
             if latest is not None
-            else "no queue depth posted"
+            else "no fleet view posted"
         )
         detail = (
             seen

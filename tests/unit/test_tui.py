@@ -18,20 +18,27 @@ from anthropic.types import (
 )
 from rich.text import Text
 from textual import events
-from textual.widgets import Static
+from textual.containers import VerticalScroll
+from textual.widgets import RichLog, Static
 
 from broker.config import BrokerConfig
 from broker.llm import TurnResult
-from broker.master.messages import (
-    EscalationArrived,
-    PermissionEscalationArrived,
-    QueueDepthChanged,
-)
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry
 from broker.master.tui.app import BrokerMasterApp
 from broker.master.tui.prompt_area import PromptArea
+from broker.master.tui.surface import FocusedSurface
+from broker.master.viewmodel import (
+    Attention,
+    EscalationArrived,
+    FleetUpdated,
+    FleetView,
+    PermissionEscalationArrived,
+    ProposalArrived,
+    SessionRow,
+)
 from broker.protocol import client
+from broker.protocol.constants import SessionState
 from broker.protocol.schemas import Envelope
 
 
@@ -84,6 +91,60 @@ def chat_texts(app: BrokerMasterApp) -> list[str]:
         if isinstance(content, Text):
             texts.append(content.plain)
     return texts
+
+
+def _fleet_text(app: BrokerMasterApp) -> str:
+    content = app.query_one("#fleet-table", Static).content
+    assert isinstance(content, Text)
+    return content.plain
+
+
+def _surface_heading(app: BrokerMasterApp) -> str:
+    content = app.query_one(".surface-heading", Static).content
+    assert isinstance(content, Text)
+    return content.plain
+
+
+def _surface_body(app: BrokerMasterApp) -> str:
+    content = app.query_one(".surface-body", Static).content
+    assert isinstance(content, Text)
+    return content.plain
+
+
+def _events_text(app: BrokerMasterApp) -> str:
+    return "\n".join(strip.text for strip in app.query_one("#events", RichLog).lines)
+
+
+def _session_row(session_id: str, badges: tuple[Attention, ...]) -> SessionRow:
+    if Attention.ESCALATION in badges:
+        state = SessionState.ESCALATED
+    elif Attention.PROPOSAL in badges:
+        state = SessionState.AWAITING_APPROVAL
+    else:
+        state = SessionState.DRIVING
+    return SessionRow(
+        session_id=session_id,
+        state=state,
+        title="",
+        task_activity="",
+        broker_activity="",
+        budget_count=0,
+        budget_max=8,
+        badges=badges,
+        pane_id=None,
+    )
+
+
+def _fleet_view(rows: tuple[SessionRow, ...], *, queue_depth: int = 1) -> FleetView:
+    return FleetView(
+        master_activity=None, rows=rows, queue_depth=queue_depth, waiting=()
+    )
+
+
+def _escalation_row_view(
+    badges: tuple[Attention, ...], *, queue_depth: int = 1
+) -> FleetView:
+    return _fleet_view((_session_row("s1", badges),), queue_depth=queue_depth)
 
 
 async def test_submit_disables_input_and_worker_reenables(home: Path) -> None:
@@ -142,7 +203,9 @@ async def test_escalation_arrived_renders_exact_string(home: Path) -> None:
     app = make_app(home, GatedLLM())
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
-        app.post_message(EscalationArrived("s1", "e1", rendered))
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            EscalationArrived("s1", "e1", rendered)
+        )
         await pilot.pause()
         assert rendered in chat_texts(app)  # the exact string, unreflowed
 
@@ -156,7 +219,9 @@ async def test_permission_escalation_arrived_renders_exact_string(
     app = make_app(home, GatedLLM())
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
-        app.post_message(PermissionEscalationArrived("s1", "p1", rendered))
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            PermissionEscalationArrived("s1", "p1", rendered)
+        )
         await pilot.pause()
         assert rendered in chat_texts(app)  # the exact string, unreflowed
 
@@ -180,18 +245,291 @@ async def test_llm_worker_error_reenables_input_and_surfaces(
         assert any("master error" in t for t in chat_texts(app))
 
 
-async def test_queue_depth_surface_updates_and_carries_no_payload(
+async def test_fleet_sidebar_renders_badges_and_waiting_count(home: Path) -> None:
+    app = make_app(home, GatedLLM())
+    view = FleetView(
+        master_activity=None,
+        rows=(
+            SessionRow(
+                session_id="s1",
+                state=SessionState.ESCALATED,
+                title="fix the checkout bug",
+                task_activity="",
+                broker_activity="",
+                budget_count=0,
+                budget_max=8,
+                badges=(Attention.ESCALATION,),
+                pane_id=None,
+            ),
+            SessionRow(
+                session_id="s2",
+                state=SessionState.DRIVING,
+                title="migrate the users table",
+                task_activity="",
+                broker_activity="",
+                budget_count=1,
+                budget_max=8,
+                badges=(Attention.PERMISSION,),
+                pane_id="w3:p2",
+            ),
+        ),
+        queue_depth=1,
+        waiting=(),
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause(0.05)
+        app._emit(FleetUpdated(view))  # pyright: ignore[reportPrivateUsage]
+        await pilot.pause()
+        text = _fleet_text(app)
+        assert "s1" in text
+        assert "s2" in text
+        assert "needs decision" in text
+        assert "permission · w3:p2" in text
+        assert "1 request waiting" in text
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            FleetUpdated(FleetView(None, (), 0, ()))
+        )
+        await pilot.pause()
+        assert "all clear" in _fleet_text(app)
+
+
+ESCALATION_RENDERED = "Escalation e1 — session s1\n\n## Situation\nverbatim [text]"
+DEFAULT_PLACEHOLDER = "task, decision, or question… (ctrl+j for newline)"
+
+
+async def test_slash_escalation_focuses_and_slash_main_restores(
     home: Path,
 ) -> None:
     app = make_app(home, GatedLLM())
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
-        app.post_message(QueueDepthChanged(2, ("s1",)))
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            EscalationArrived("s1", "e1", ESCALATION_RENDERED)
+        )
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            FleetUpdated(_escalation_row_view((Attention.ESCALATION,)))
+        )
         await pilot.pause()
-        content = app.query_one("#queue-depth", Static).content
-        assert isinstance(content, Text)
-        # A count and session ids only — never escalation text.
-        assert content.plain == "escalation queue: 2 (waiting: s1)"
+        box = app.query_one("#box", PromptArea)
+        box.focus()
+        box.text = "/escalation"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.query_one("#chat", VerticalScroll).display is False
+        assert app.query_one("#surface", FocusedSurface).display is True
+        assert _surface_heading(app) == "Session broker · s1"
+        assert _surface_body(app) == ESCALATION_RENDERED
+        assert box.placeholder == "answer this escalation via the master…"
+        assert box.disabled is False  # no worker ran for a slash command
+        box.focus()
+        box.text = "/main"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.query_one("#chat", VerticalScroll).display is True
+        assert app.query_one("#surface", FocusedSurface).display is False
+        assert box.placeholder == DEFAULT_PLACEHOLDER
+
+
+async def test_typing_in_the_surface_still_runs_the_llm_worker(home: Path) -> None:
+    llm = GatedLLM(reply="dispatched", gated=True)
+    app = make_app(home, llm)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.05)
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            EscalationArrived("s1", "e1", ESCALATION_RENDERED)
+        )
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            FleetUpdated(_escalation_row_view((Attention.ESCALATION,)))
+        )
+        await pilot.pause()
+        box = app.query_one("#box", PromptArea)
+        box.focus()
+        box.text = "/escalation"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.query_one("#surface", FocusedSurface).display is True
+        await pilot.click("#box")
+        await pilot.press(*"use option B")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert box.disabled is True  # locked while the LLM worker runs
+        llm.release.set()
+        await pilot.pause(0.1)
+        await pilot.pause()  # drain the posted LLMReply
+        assert box.disabled is False
+        assert llm.calls == 1  # same routing as a plain chat submission
+
+
+async def test_fleet_updated_auto_exits_the_surface_when_the_badge_clears(
+    home: Path,
+) -> None:
+    app = make_app(home, GatedLLM())
+    async with app.run_test() as pilot:
+        await pilot.pause(0.05)
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            EscalationArrived("s1", "e1", ESCALATION_RENDERED)
+        )
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            FleetUpdated(_escalation_row_view((Attention.ESCALATION,)))
+        )
+        await pilot.pause()
+        box = app.query_one("#box", PromptArea)
+        box.focus()
+        box.text = "/escalation"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.query_one("#surface", FocusedSurface).display is True
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            FleetUpdated(_escalation_row_view((), queue_depth=0))
+        )
+        await pilot.pause()
+        assert app.query_one("#chat", VerticalScroll).display is True
+        assert app.query_one("#surface", FocusedSurface).display is False
+
+
+async def test_slash_escalation_with_nothing_waiting_stays_on_chat(
+    home: Path,
+) -> None:
+    app = make_app(home, GatedLLM())
+    async with app.run_test() as pilot:
+        await pilot.pause(0.05)
+        box = app.query_one("#box", PromptArea)
+        box.focus()
+        box.text = "/escalation"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.query_one("#surface", FocusedSurface).display is False
+        assert app.query_one("#chat", VerticalScroll).display is True
+        assert "no escalation is waiting" in _events_text(app)
+
+
+PROPOSAL_RENDERED = "Prompt proposal p1 — session s1\n\n## Proposed prompt\nverbatim [text]"
+
+
+async def test_slash_approve_focuses_the_single_proposal(home: Path) -> None:
+    app = make_app(home, GatedLLM())
+    async with app.run_test() as pilot:
+        await pilot.pause(0.05)
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            ProposalArrived("s1", "p1", PROPOSAL_RENDERED)
+        )
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            FleetUpdated(_fleet_view((_session_row("s1", (Attention.PROPOSAL,)),)))
+        )
+        await pilot.pause()
+        box = app.query_one("#box", PromptArea)
+        box.focus()
+        box.text = "/approve"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.query_one("#chat", VerticalScroll).display is False
+        assert app.query_one("#surface", FocusedSurface).display is True
+        assert _surface_heading(app) == "Session broker · s1"
+        assert _surface_body(app) == PROPOSAL_RENDERED
+        assert box.placeholder == "approve or revise this prompt via the master…"
+        assert box.disabled is False  # no worker ran for a slash command
+
+
+async def test_slash_approve_disambiguates_between_multiple_proposals(
+    home: Path,
+) -> None:
+    app = make_app(home, GatedLLM())
+    s1_rendered = "Prompt proposal p1 — session s1\nverbatim [text one]"
+    s2_rendered = "Prompt proposal p2 — session s2\nverbatim [text two]"
+    async with app.run_test() as pilot:
+        await pilot.pause(0.05)
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            ProposalArrived("s1", "p1", s1_rendered)
+        )
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            ProposalArrived("s2", "p2", s2_rendered)
+        )
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            FleetUpdated(
+                _fleet_view(
+                    (
+                        _session_row("s1", (Attention.PROPOSAL,)),
+                        _session_row("s2", (Attention.PROPOSAL,)),
+                    )
+                )
+            )
+        )
+        await pilot.pause()
+        box = app.query_one("#box", PromptArea)
+        box.focus()
+        box.text = "/approve"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.query_one("#surface", FocusedSurface).display is False
+        assert (
+            "no single proposal to approve — use /approve sN" in _events_text(app)
+        )
+        box.focus()
+        box.text = "/approve s2"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.query_one("#surface", FocusedSurface).display is True
+        assert _surface_heading(app) == "Session broker · s2"
+        assert _surface_body(app) == s2_rendered
+
+
+async def test_typing_approve_in_the_proposal_surface_runs_the_llm_worker(
+    home: Path,
+) -> None:
+    llm = GatedLLM(reply="approved", gated=True)
+    app = make_app(home, llm)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.05)
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            ProposalArrived("s1", "p1", PROPOSAL_RENDERED)
+        )
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            FleetUpdated(_fleet_view((_session_row("s1", (Attention.PROPOSAL,)),)))
+        )
+        await pilot.pause()
+        box = app.query_one("#box", PromptArea)
+        box.focus()
+        box.text = "/approve"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.query_one("#surface", FocusedSurface).display is True
+        await pilot.click("#box")
+        await pilot.press(*"approve")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert box.disabled is True  # locked while the LLM worker runs
+        llm.release.set()
+        await pilot.pause(0.1)
+        await pilot.pause()  # drain the posted LLMReply
+        assert box.disabled is False
+        assert llm.calls == 1  # same routing as a plain chat submission
+
+
+async def test_fleet_updated_auto_exits_the_proposal_surface_when_badge_clears(
+    home: Path,
+) -> None:
+    app = make_app(home, GatedLLM())
+    async with app.run_test() as pilot:
+        await pilot.pause(0.05)
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            ProposalArrived("s1", "p1", PROPOSAL_RENDERED)
+        )
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            FleetUpdated(_fleet_view((_session_row("s1", (Attention.PROPOSAL,)),)))
+        )
+        await pilot.pause()
+        box = app.query_one("#box", PromptArea)
+        box.focus()
+        box.text = "/approve"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.query_one("#surface", FocusedSurface).display is True
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            FleetUpdated(_fleet_view((_session_row("s1", ()),), queue_depth=0))
+        )
+        await pilot.pause()
+        assert app.query_one("#chat", VerticalScroll).display is True
+        assert app.query_one("#surface", FocusedSurface).display is False
 
 
 async def test_inject_runs_a_scenario_end_to_end(home: Path) -> None:
@@ -248,12 +586,6 @@ async def test_inject_runs_a_scenario_end_to_end(home: Path) -> None:
         # The escalation itself surfaced into the chat, one block, verbatim.
         assert any("Escalation e1 — session s1" in t for t in chat_texts(app))
         assert app.query_one("#box", PromptArea).disabled is False
-
-
-def _fleet_text(app: BrokerMasterApp) -> str:
-    content = app.query_one("#fleet-table", Static).content
-    assert isinstance(content, Text)
-    return content.plain
 
 
 async def test_fleet_panel_updates_and_worker_clears_master_activity(

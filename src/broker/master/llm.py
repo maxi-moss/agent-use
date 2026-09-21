@@ -57,6 +57,7 @@ class ApprovePromptArgs(BaseModel):
 
     proposal_id: str
     prompt: str
+    title: str
 
 
 class DispatchDecisionArgs(BaseModel):
@@ -140,9 +141,10 @@ _REGISTRY = (
     MasterTool(
         "approve_prompt",
         "Approve (or relay the developer's revision of) a proposed initial "
-        "prompt. The final text passes through verbatim.",
+        "prompt. The final text passes through verbatim. `title` is a short "
+        "label naming the task.",
         ApprovePromptArgs,
-        lambda rt, a: rt.approve_prompt(a.proposal_id, a.prompt),
+        lambda rt, a: rt.approve_prompt(a.proposal_id, a.prompt, a.title),
         "approving a prompt…",
     ),
     MasterTool(

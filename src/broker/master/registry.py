@@ -31,6 +31,7 @@ class SessionRecord(BaseModel):
     transcript_path: str | None = None
     intent: str = ""  # raw intent at spawn
     approved_prompt: str | None = None  # the AUTHORITATIVE intent record
+    title: str = ""  # short task label set at approval; shown in the fleet
     budget_count: int = 0  # persisted; survives broker death
     pid: int | None = None
 
