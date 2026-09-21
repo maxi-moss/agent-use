@@ -374,7 +374,7 @@ def test_master_tools_are_strict_and_complete() -> None:
         "approve_prompt",
         "dispatch_decision",
         "list_sessions",
-        "send_to_session",
+        "send_prompt_to_session",
         "get_decision_log",
         "get_permission_log",
         "stop_session",

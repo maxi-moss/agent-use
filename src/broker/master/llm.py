@@ -71,7 +71,7 @@ class ListSessionsArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class SendToSessionArgs(BaseModel):
+class SendPromptToSessionArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_id: str
@@ -164,9 +164,9 @@ _REGISTRY = (
         "probing the sessions…",
     ),
     MasterTool(
-        "send_to_session",
+        "send_prompt_to_session",
         "Push a new developer instruction into an existing session.",
-        SendToSessionArgs,
+        SendPromptToSessionArgs,
         lambda rt, a: rt.send_prompt(a.session_id, a.prompt),
         "sending a prompt…",
     ),

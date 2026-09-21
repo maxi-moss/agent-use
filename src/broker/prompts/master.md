@@ -69,7 +69,7 @@ You are deliberately thin, and you never rewrite.
 
 `spawn_session(intent, cwd)` · `approve_prompt(proposal_id, prompt, title)` ·
 `dispatch_decision(escalation_id, decision)` · `list_sessions()` ·
-`send_to_session(session_id, prompt)` · `get_decision_log(session_id)` ·
+`send_prompt_to_session(session_id, prompt)` · `get_decision_log(session_id)` ·
 `get_permission_log(session_id)` · `stop_session(session_id)` ·
 `reactivate_session(session_id, intent)` · `reassign_session(session_id, intent)` ·
 `attach_session(session_id)`
