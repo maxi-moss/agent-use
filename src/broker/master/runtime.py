@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import sys
 import uuid
 from collections.abc import Awaitable, Callable
@@ -23,7 +24,6 @@ from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import ValidationError
-from textual.message import Message
 
 from broker.claude.settings import write_session_permissions
 from broker.claude.trust import seed_trust
@@ -37,14 +37,17 @@ from broker.herdr import driver
 from broker.herdr.driver import HerdrError
 from broker.paths import BrokerPaths
 from broker.master import notifier
-from broker.master.messages import (
+from broker.master.viewmodel import (
+    Attention,
     CompletionArrived,
     EscalationArrived,
-    FleetChanged,
+    EventSink,
+    FleetUpdated,
+    FleetView,
     Notice,
     PermissionEscalationArrived,
     ProposalArrived,
-    QueueDepthChanged,
+    SessionRow,
     SessionStatusChanged,
 )
 from broker.master.queue import (
@@ -103,9 +106,14 @@ from broker.protocol.server import serve_unix
 
 logger = logging.getLogger(__name__)
 
-# object, not None: App.post_message returns bool, and the bound method is
-# passed here directly.
-AppPost = Callable[[Message], object]
+_SESSION_NUM = re.compile(r"s(\d+)\Z")
+
+
+def session_sort_key(name: str) -> tuple[int, str]:
+    """Order sessions by numeric id (s2 before s10); any non-'sN' name last."""
+    m = _SESSION_NUM.match(name)
+    return (int(m.group(1)), "") if m else (10**9, name)
+
 
 REQUEST_TIMEOUT_S = 10.0
 STOP_WAIT_S = 10.0
@@ -134,10 +142,6 @@ _ABSORBING = frozenset(
         SessionState.UNMANAGED,
     }
 )
-
-# Content cells every rendered fleet line must fit in; the TUI sizes the
-# pane as this plus its scrollbar.
-FLEET_WIDTH = 54
 
 
 async def _broker_is_listening(path: Path) -> bool:
@@ -223,7 +227,7 @@ async def reconcile_registry(
         One classification line per session, plus one line per retraction.
     """
     warnings: list[str] = []
-    for name in sorted(registry.records):
+    for name in sorted(registry.records, key=session_sort_key):
         record = registry.records[name]
         if await _broker_is_listening(Path(record.socket_path)):
             warnings.append(
@@ -417,65 +421,6 @@ def _render_retrieved(s: RetrievedSymbol) -> str:
     return f"- {s.name} (seed {s.score:.2f})"
 
 
-def _truncate(text: str, width: int) -> str:
-    """Cut ``text`` to ``width`` characters, marking the cut with an ellipsis."""
-    if len(text) <= width:
-        return text
-    return text[: width - 1] + "…"
-
-
-def render_fleet(
-    records: dict[str, SessionRecord],
-    activity: dict[str, str],
-    permission_prompt_pending: set[str],
-    master_activity: str | None,
-    budget_max: int,
-) -> str:
-    """Render the fleet dashboard: master activity line plus a block per session.
-
-    Every line fits in ``FLEET_WIDTH`` cells: a name/state/⚠/budget head line,
-    then indented intent and (when present) live-activity lines.
-
-    Args:
-        records: Registry records, rendered one block each.
-        activity: Pushed live-activity phrase per session; absent means idle.
-        permission_prompt_pending: Sessions currently sitting on a native permission prompt.
-        master_activity: What the master itself is doing, or ``None`` for idle.
-        budget_max: Budget ceiling every session's counter is shown against.
-
-    Returns:
-        The dashboard string, displayed verbatim.
-    """
-    header = _truncate(f"Master — {master_activity or 'idle'}", FLEET_WIDTH)
-    if not records:
-        return f"{header}\n\n(no sessions)"
-    names = sorted(records)
-    w_name = max(len(n) for n in names)
-    w_state = max(len(str(records[n].state)) for n in names)
-    indent = "    "
-    sub_width = FLEET_WIDTH - len(indent)
-    blocks: list[str] = []
-    for name in names:
-        r = records[name]
-        head = "  ".join(
-            (
-                name.ljust(w_name),
-                str(r.state).ljust(w_state),
-                ("⚠" if name in permission_prompt_pending else "").ljust(1),
-                f"{r.budget_count}/{budget_max}",
-            )
-        )
-        lines = [_truncate(head, FLEET_WIDTH)]
-        intent = r.approved_prompt or r.intent
-        if intent:
-            lines.append(indent + _truncate(intent, sub_width))
-        phrase = activity.get(name, "")
-        if phrase:
-            lines.append(indent + _truncate(phrase, sub_width))
-        blocks.append("\n".join(lines))
-    return "\n\n".join([header, *blocks])
-
-
 @dataclass(frozen=True, slots=True)
 class PendingProposal:
     """A prompt proposal awaiting the developer's approval."""
@@ -487,23 +432,23 @@ class PendingProposal:
 class MasterRuntime:
     def __init__(
         self,
-        app_post: AppPost,
+        emit: EventSink,
         registry: Registry,
         queue: EscalationQueue,
         cfg: BrokerConfig,
         *,
         anchor_pane: str,
     ) -> None:
-        """Wire the runtime to the TUI, the registry, the queue and the config.
+        """Wire the runtime to its frontend sink, the registry, the queue and the config.
 
         Args:
-            app_post: Posts a Textual message to the app.
+            emit: Receives every renderer-neutral view event the runtime produces.
             registry: Loaded session registry.
             queue: Loaded escalation queue.
             cfg: Broker configuration.
             anchor_pane: Herdr pane every spawned session is anchored to.
         """
-        self.app_post = app_post
+        self.emit = emit
         self.registry = registry
         self.cfg = cfg
         self.anchor_pane = anchor_pane
@@ -516,6 +461,7 @@ class MasterRuntime:
         # Dashboard-only, never persisted: pushed live status per session and
         # the master's own current activity.
         self._activity: dict[str, str] = {}
+        self._task_activity: dict[str, str] = {}
         self._permission_prompt_pending: set[str] = set()
         self._master_activity: str | None = None
 
@@ -525,12 +471,23 @@ class MasterRuntime:
         """Bind the master socket and serve until cancelled."""
         # A head loaded from disk has never been announced in this process, so
         # it surfaces here, exactly once.
-        self._publish_queue_state()
         self._publish_fleet()
         await self._surface_head()
         server = await serve_unix(self.master_socket_path, self.handle)
+        await self._repopulate_from_brokers()
         async with server:
             await server.serve_forever()
+
+    async def _repopulate_from_brokers(self) -> None:
+        """Fill task-activity (and refresh state) from each surviving broker."""
+        for name in sorted(self.registry.records, key=session_sort_key):
+            if self.registry.records[name].state in _ABSORBING:
+                continue
+            try:
+                await self.probe_status(name)
+            except PROBE_FAILURES:
+                continue
+        self._publish_fleet()
 
     async def handle(self, env: Envelope) -> Response | None:
         """Handle one inbound envelope, turning any failure into a NACK.
@@ -544,7 +501,7 @@ class MasterRuntime:
         try:
             return await self._handle(env)
         except Exception as exc:  # fail loud to the developer, never crash serve
-            self.app_post(
+            self.emit(
                 Notice(f"master handler error on {env.type!r}: {exc!r}")
             )
             return self._ack(env, ok=False)
@@ -566,7 +523,7 @@ class MasterRuntime:
         if env.type == T_COMPLETION:
             p = CompletionPayload.model_validate(env.payload)
             self._set_state(name, SessionState.COMPLETED)
-            self.app_post(CompletionArrived(name, p.summary))
+            self.emit(CompletionArrived(name, p.summary))
             await self._notify(
                 notifier.notify_done, f"Session {name} complete", p.summary
             )
@@ -576,7 +533,7 @@ class MasterRuntime:
         if env.type == T_FATAL_ERROR:
             p = FatalErrorPayload.model_validate(env.payload)
             self._set_state(name, SessionState.ERROR)
-            self.app_post(
+            self.emit(
                 Notice(f"session {name} FATAL [{p.error_class}]: {p.detail}")
             )
             await self._notify(
@@ -600,20 +557,20 @@ class MasterRuntime:
                 # longer live; a waiting entry they never saw retracts
                 # silently.
                 self._surfaced_id = None
-                self.app_post(
+                self.emit(
                     Notice(
                         f"escalation {p.escalation_id} from session {name} "
                         f"retracted: {p.reason}"
                     )
                 )
-            self._publish_queue_state()
+            self._publish_fleet()
             await self._surface_head()
             return self._ack(env, ok=True)
         if env.type == T_PROMPT_PROPOSAL:
             p = PromptProposalPayload.model_validate(env.payload)
             self.proposals[p.proposal_id] = PendingProposal(name, p)
             self._set_state(name, SessionState.AWAITING_APPROVAL)
-            self.app_post(
+            self.emit(
                 ProposalArrived(name, p.proposal_id, render_proposal(p))
             )
             return self._ack(env, ok=True)
@@ -636,6 +593,7 @@ class MasterRuntime:
                     self._activity[name] = p.activity
                 else:
                     self._activity.pop(name, None)
+                self._note_task_activity(name, p.task_activity)
                 if p.permission_prompt:
                     self._permission_prompt_pending.add(name)
                 else:
@@ -646,7 +604,7 @@ class MasterRuntime:
             # ACK every push, absorbing/unknown included, so the sender never
             # spins re-sending a snapshot the master refuses to apply.
             return self._ack(env, ok=True)
-        self.app_post(Notice(f"unknown message type {env.type!r} from {name!r}"))
+        self.emit(Notice(f"unknown message type {env.type!r} from {name!r}"))
         return self._ack(env, ok=False)
 
     async def _on_escalation(self, env: Envelope, name: str) -> Response:
@@ -664,7 +622,7 @@ class MasterRuntime:
             p = EscalationPayload.model_validate(env.payload)
         except ValidationError as exc:
             # Never render a thin escalation as if complete.
-            self.app_post(
+            self.emit(
                 Notice(
                     f"MALFORMED escalation from session {name!r} — NOT "
                     f"surfaced.\nvalidation: {exc}\nraw payload: {env.payload!r}"
@@ -678,7 +636,7 @@ class MasterRuntime:
         if refused is not None:
             return refused
         self._set_state(p.session_id, SessionState.ESCALATED)
-        self._publish_queue_state()
+        self._publish_fleet()
         await self._surface_head()
         return self._ack(env, ok=True)
 
@@ -701,7 +659,7 @@ class MasterRuntime:
         except ValidationError as exc:
             # A permission escalation missing the tool, the reason or the
             # session is not something the developer could act on.
-            self.app_post(
+            self.emit(
                 Notice(
                     f"MALFORMED permission escalation from session {name!r} — "
                     f"NOT surfaced.\nvalidation: {exc}\n"
@@ -719,7 +677,7 @@ class MasterRuntime:
         refused = self._accept_into_queue(env, p)
         if refused is not None:
             return refused
-        self._publish_queue_state()
+        self._publish_fleet()
         await self._surface_head()
         return self._ack(env, ok=True)
 
@@ -739,7 +697,7 @@ class MasterRuntime:
         if session_id in self.registry.records:
             return None
         msg = f"{kind} from unknown session {session_id!r} — NOT surfaced"
-        self.app_post(Notice(msg))
+        self.emit(Notice(msg))
         return self._nack(env, msg, NACK_UNKNOWN_SESSION)
 
     def _accept_into_queue(
@@ -757,13 +715,9 @@ class MasterRuntime:
         try:
             self.queue.accept(payload)
         except ProtocolViolation as exc:
-            self.app_post(Notice(f"PROTOCOL VIOLATION: {exc}"))
+            self.emit(Notice(f"PROTOCOL VIOLATION: {exc}"))
             return self._nack(env, str(exc), NACK_PROTOCOL_VIOLATION)
         return None
-
-    def _publish_queue_state(self) -> None:
-        """Tell the TUI the queue's depth and which sessions are waiting."""
-        self.app_post(QueueDepthChanged(self.queue.depth, self.queue.waiting))
 
     async def _surface_head(self) -> None:
         """Render, announce and notify the queue's head, exactly once."""
@@ -773,7 +727,7 @@ class MasterRuntime:
         self._surfaced_id = head.escalation_id
         if isinstance(head, PermissionEscalationPayload):
             pane_id = self.pane_of(head.session_id)
-            self.app_post(
+            self.emit(
                 PermissionEscalationArrived(
                     head.session_id,
                     head.escalation_id,
@@ -786,7 +740,7 @@ class MasterRuntime:
                 f"{head.tool_name} — answer it in pane {pane_id}",
             )
             return
-        self.app_post(
+        self.emit(
             EscalationArrived(
                 head.session_id, head.escalation_id, render_escalation(head)
             )
@@ -829,7 +783,7 @@ class MasterRuntime:
         record.pid = proc.pid
         self._procs[name] = proc
         self.registry.upsert(record)
-        self.app_post(SessionStatusChanged(name, record.state))
+        self.emit(SessionStatusChanged(name, record.state))
         self._publish_fleet()
         return f"spawned session {name} (pid {proc.pid}) in {cwd_path}"
 
@@ -861,6 +815,7 @@ class MasterRuntime:
         await self._require_socket_free(record)
         record.intent = intent
         record.approved_prompt = None  # superseded; set again on approval
+        record.title = ""
         record.budget_count = 0
         proc = await self._spawn_broker(record, adopt=adopt)
         record.pid = proc.pid
@@ -949,22 +904,26 @@ class MasterRuntime:
             rejection=f"session {session_id} refused reactivation",
         )
         if rejected is not None:
-            self.app_post(Notice(rejected))
+            self.emit(Notice(rejected))
             return rejected
         record.intent = intent
         record.approved_prompt = None  # superseded; set again on approval
+        record.title = ""
         record.budget_count = 0
         self.registry.upsert(record)
         self._set_state(session_id, SessionState.GROUNDING)
         return f"session {session_id} reactivated — grounding the new task"
 
-    async def approve_prompt(self, proposal_id: str, prompt: str) -> str:
+    async def approve_prompt(
+        self, proposal_id: str, prompt: str, title: str
+    ) -> str:
         """Approve a pending prompt proposal and send it to its session.
 
         Args:
             proposal_id: Identifier of the proposal being answered.
             prompt: Prompt text to send — the developer's edit of the
                 proposal, or the proposal verbatim.
+            title: Short task label shown next to the session in the fleet.
 
         Returns:
             An outcome line: approved, unknown proposal, or rejected as stale.
@@ -972,7 +931,7 @@ class MasterRuntime:
         pending = self.proposals.get(proposal_id)
         if pending is None:
             msg = f"unknown proposal {proposal_id!r} — nothing approved"
-            self.app_post(Notice(msg))
+            self.emit(Notice(msg))
             return msg
         name = pending.session_name
         record = self.registry.get(name)
@@ -991,10 +950,11 @@ class MasterRuntime:
             ),
         )
         if rejected is not None:
-            self.app_post(Notice(rejected))
+            self.emit(Notice(rejected))
             return rejected
         del self.proposals[proposal_id]
         record.approved_prompt = prompt  # the AUTHORITATIVE intent
+        record.title = title
         self.registry.upsert(record)
         self._publish_fleet()
         return f"prompt approved for session {name}"
@@ -1021,7 +981,7 @@ class MasterRuntime:
                 f"decision NOT dispatched — escalation {escalation_id} is "
                 "no longer live"
             )
-            self.app_post(Notice(msg))
+            self.emit(Notice(msg))
             return msg
         if isinstance(active, PermissionEscalationPayload):
             # The native prompt is the only thing that can answer it, and it is
@@ -1032,7 +992,7 @@ class MasterRuntime:
                 f"permission prompt in session {active.session_id}. The "
                 f"developer answers it in pane {pane_id}."
             )
-            self.app_post(Notice(msg))
+            self.emit(Notice(msg))
             return msg
         record = self.registry.get(active.session_id)
         env = self._env(
@@ -1050,13 +1010,13 @@ class MasterRuntime:
             ),
         )
         if rejected is not None:
-            self.app_post(Notice(rejected))
+            self.emit(Notice(rejected))
             return rejected
         self.queue.resolve(escalation_id)
         self._surfaced_id = None
         # No state write: DRIVING is the broker's transition to report, and
         # its push carries it — the master never invents an operating state.
-        self._publish_queue_state()
+        self._publish_fleet()
         await self._surface_head()
         return f"decision dispatched to session {record.name}"
 
@@ -1079,7 +1039,7 @@ class MasterRuntime:
             rejection=f"session {session_id} rejected the prompt (stale)",
         )
         if rejected is not None:
-            self.app_post(Notice(rejected))
+            self.emit(Notice(rejected))
             return rejected
         record.budget_count = 0  # developer prompt resets the budget
         self.registry.upsert(record)
@@ -1095,19 +1055,19 @@ class MasterRuntime:
         Returns:
             The status as reported by the session broker.
         """
-        record = self.registry.get(session_id)
+        socket_path = Path(self.registry.get(session_id).socket_path)
         env = self._env(T_STATUS, {})
-        resp = await client.request(
-            Path(record.socket_path), env, timeout_s=REQUEST_TIMEOUT_S
-        )
+        resp = await client.request(socket_path, env, timeout_s=REQUEST_TIMEOUT_S)
         status = StatusPayload.model_validate(resp.payload)
-        record.state = status.state
+        record = self.registry.get(session_id)
         record.pane_id = status.pane_id or record.pane_id
         record.claude_session_id = (
             status.claude_session_id or record.claude_session_id
         )
         record.transcript_path = status.transcript_path or record.transcript_path
         self.registry.upsert(record)
+        self._set_state(session_id, status.state)
+        self._note_task_activity(session_id, status.task_activity)
         return status
 
     async def get_decision_log(self, session_id: str) -> str:
@@ -1203,7 +1163,7 @@ class MasterRuntime:
         if not self.registry.records:
             return "(no sessions)"
         lines: list[str] = []
-        for name in sorted(self.registry.records):
+        for name in sorted(self.registry.records, key=session_sort_key):
             r = self.registry.records[name]
             intent = r.approved_prompt or r.intent
             lines.append(
@@ -1225,7 +1185,7 @@ class MasterRuntime:
             could not be reached.
         """
         lines = [self.render_registry_summary()]
-        for name in sorted(self.registry.records):
+        for name in sorted(self.registry.records, key=session_sort_key):
             try:
                 status = await self.probe_status(name)
             except PROBE_FAILURES as exc:
@@ -1344,13 +1304,13 @@ class MasterRuntime:
             return
         if cleared.escalation_id == self._surfaced_id:
             self._surfaced_id = None
-        self.app_post(
+        self.emit(
             Notice(
                 f"escalation {cleared.escalation_id} from session "
                 f"{session_id} retracted: its broker is gone"
             )
         )
-        self._publish_queue_state()
+        self._publish_fleet()
         await self._surface_head()
 
     async def _on_session_ended(self, env: Envelope, name: str) -> Response:
@@ -1366,7 +1326,9 @@ class MasterRuntime:
         if name in self.registry.records:
             logger.info("session %s: ended (/exit) — removed from the fleet", name)
             self._activity.pop(name, None)
+            self._task_activity.pop(name, None)
             self._permission_prompt_pending.discard(name)
+            self._discard_proposals(name)
             self._procs.pop(name, None)
             self.registry.remove(name)
             # The broker exits without withdrawing a live escalation of either
@@ -1374,7 +1336,7 @@ class MasterRuntime:
             # queue, undispatchable to a gone session.
             await self._retract_stranded_escalation(name, "broker")
             await self._retract_stranded_escalation(name, "permission")
-            self.app_post(
+            self.emit(
                 Notice(f"session {name} ended (/exit) — removed from the fleet")
             )
             self._publish_fleet()
@@ -1397,7 +1359,7 @@ class MasterRuntime:
         try:
             record = self.registry.get(name)
         except KeyError:
-            self.app_post(Notice(f"message from unknown session {name!r}"))
+            self.emit(Notice(f"message from unknown session {name!r}"))
             return False
         if record.state == state:
             return False
@@ -1408,24 +1370,77 @@ class MasterRuntime:
             # A settled session shows no live status, and the absorbing
             # guard blocks the pushes that would otherwise clear these.
             self._activity.pop(name, None)
+            self._task_activity.pop(name, None)
             self._permission_prompt_pending.discard(name)
-        self.app_post(SessionStatusChanged(name, state))
+            self._discard_proposals(name)
+        self.emit(SessionStatusChanged(name, state))
         self._publish_fleet()
         return True
 
-    def _publish_fleet(self) -> None:
-        """Post a freshly rendered fleet snapshot to the TUI."""
-        self.app_post(
-            FleetChanged(
-                render_fleet(
-                    self.registry.records,
-                    self._activity,
-                    self._permission_prompt_pending,
-                    self._master_activity,
-                    self.cfg.budget_max,
+    def _note_task_activity(self, name: str, text: str) -> None:
+        """Show ``text`` as a live session's task activity; a settled session shows none."""
+        if not text or self.registry.get(name).state in _ABSORBING:
+            self._task_activity.pop(name, None)
+        else:
+            self._task_activity[name] = text
+
+    def build_fleet_view(self) -> FleetView:
+        """Assemble the structured sidebar view from current runtime state."""
+        badges = self._badges_by_session()
+        rows: list[SessionRow] = []
+        for name in sorted(self.registry.records, key=session_sort_key):
+            r = self.registry.records[name]
+            rows.append(
+                SessionRow(
+                    session_id=name,
+                    state=r.state,
+                    title=r.title,
+                    task_activity=self._task_activity.get(name, ""),
+                    broker_activity=self._activity.get(name, ""),
+                    budget_count=r.budget_count,
+                    budget_max=self.cfg.budget_max,
+                    badges=badges.get(name, ()),
+                    pane_id=r.pane_id,
                 )
             )
+        head = self.queue.active
+        return FleetView(
+            master_activity=self._master_activity,
+            rows=tuple(rows),
+            queue_depth=self.queue.depth,
+            waiting=self.queue.waiting,
+            head_escalation_id=head.escalation_id if head else None,
         )
+
+    def _badges_by_session(self) -> dict[str, tuple[Attention, ...]]:
+        """Distinct attention badges per session, from the three live stores."""
+        acc: dict[str, set[Attention]] = {}
+        for entry in self.queue.entries:
+            kind = (
+                Attention.PERMISSION
+                if entry.raiser.component == "permission"
+                else Attention.ESCALATION
+            )
+            acc.setdefault(entry.session_id, set()).add(kind)
+        for pending in self.proposals.values():
+            acc.setdefault(pending.session_name, set()).add(Attention.PROPOSAL)
+        for name in self._permission_prompt_pending:
+            acc.setdefault(name, set()).add(Attention.PERMISSION)
+        return {
+            name: tuple(sorted(kinds, key=lambda a: a.value))
+            for name, kinds in acc.items()
+        }
+
+    def _discard_proposals(self, name: str) -> None:
+        """Drop any pending proposal a session left behind on settling or exit."""
+        for pid in [
+            pid for pid, p in self.proposals.items() if p.session_name == name
+        ]:
+            del self.proposals[pid]
+
+    def _publish_fleet(self) -> None:
+        """Emit the current structured sidebar snapshot."""
+        self.emit(FleetUpdated(self.build_fleet_view()))
 
     def note_master_activity(self, text: str) -> None:
         """Show what the master itself is doing on the dashboard header."""
@@ -1454,7 +1469,7 @@ class MasterRuntime:
             await fn(title, body)
         except Exception as exc:
             # A dead notifier must not lose the escalation it announces.
-            self.app_post(Notice(f"notification failed: {exc}"))
+            self.emit(Notice(f"notification failed: {exc}"))
 
     async def _deliver(
         self, socket_path: str, env: Envelope, *, rejection: str

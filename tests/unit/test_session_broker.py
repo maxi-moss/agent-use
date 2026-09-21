@@ -77,7 +77,12 @@ ADOPTED_SESSION = "cc-adopted"
 RESUMED_PROMPT = "the approved first task"
 
 ANSWER_RESULT = ToolCall(
-    name="answer", input={"reasoning": "grounded", "answer": "use oauth"}
+    name="answer",
+    input={
+        "reasoning": "grounded",
+        "answer": "use oauth",
+        "task_activity": "wiring up oauth",
+    },
 )
 COLOR_TOOL_INPUT: dict[str, Any] = {
     "questions": [
@@ -564,7 +569,11 @@ async def complete(h: Harness) -> None:
     await h.llm.results.put(
         ToolCall(
             name="complete",
-            input={"reasoning": "task finished", "summary": "shipped it"},
+            input={
+                "reasoning": "task finished",
+                "summary": "shipped it",
+                "task_activity": "wrapping up",
+            },
         )
     )
     await h.master.wait_for(T_COMPLETION)
@@ -736,6 +745,35 @@ async def test_permission_prompt_notification_shows_up_on_status(
         timeout_s=5.0,
     )
     assert resp.payload["permission_prompt"] is False
+
+
+async def test_task_activity_persists_across_pushes_and_status_probe(
+    harness: Harness,
+) -> None:
+    await launch(harness)
+    await client.notify(
+        harness.sock,
+        hook_env("Stop", {"last_assistant_message": "Which auth provider?"}),
+    )
+    await harness.llm.results.put(ANSWER_RESULT)
+    idx, _ = await wait_live(
+        harness.master, lambda p: p.get("task_activity") == "wiring up oauth"
+    )
+    resp = await client.request(
+        harness.sock,
+        Envelope(id=uuid.uuid4().hex, type=T_STATUS, session_id="s1"),
+        timeout_s=5.0,
+    )
+    assert resp.payload["task_activity"] == "wiring up oauth"
+    # A later, unrelated push still carries the same task description.
+    await client.notify(
+        harness.sock,
+        hook_env("Notification", {"notification_type": "permission_prompt"}),
+    )
+    _, later = await wait_live(
+        harness.master, lambda p: p["permission_prompt"] is True, after=idx + 1
+    )
+    assert later["task_activity"] == "wiring up oauth"
 
 
 async def test_agent_start_forwards_this_sessions_settings_file(

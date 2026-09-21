@@ -142,6 +142,7 @@ class StatusPayload(BaseModel):
     claude_session_id: str | None = None
     transcript_path: str | None = None
     permission_prompt: bool = False
+    task_activity: str = ""
 
 
 class RaiserIdentity(BaseModel):
@@ -288,3 +289,4 @@ class LiveStatusPayload(BaseModel):
     state: SessionState
     activity: str = ""  # active gerund phrases joined, "" when idle
     permission_prompt: bool = False
+    task_activity: str = ""  # last per-turn task description; persists across turns

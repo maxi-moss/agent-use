@@ -6,42 +6,45 @@ Structural rules encoded here:
 - The LLM turn runs under a worker with an explicit group ("llm"),
   exclusive=True, exit_on_error=False; the prompt box is re-enabled in
   on_worker_state_changed, never at the worker body's end.
-- Widgets receive pre-rendered STRINGS from the runtime via post_message —
-  never a payload they could re-render (thin-master rule).
+- The runtime emits renderer-neutral view events through ``_emit``; the app
+  wraps each in a ViewEventMessage and dispatches it to widgets. Prose fields
+  are displayed verbatim (thin-master rule).
 """
 
 import asyncio
 import contextlib
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.message import Message
-from textual.widgets import RichLog, Static
+from textual.widgets import RichLog
 from textual.worker import Worker, WorkerState
 
 from broker.config import BrokerConfig
 from broker.llm import LLMCaller, TurnResult
 from broker.master.llm import MasterLLM
-from broker.master.messages import (
+from broker.master.queue import EscalationQueue
+from broker.master.registry import Registry
+from broker.master.runtime import MasterRuntime
+from broker.master.testmode import load_scenario, run_scenario
+from broker.master.tui.chat_log import ChatMessage, ThinkingIndicator
+from broker.master.tui.fleet import FLEET_WIDTH, FleetSidebar
+from broker.master.tui.messages import LLMReply, ViewEventMessage
+from broker.master.tui.prompt_area import PromptArea
+from broker.master.tui.surface import FocusedSurface
+from broker.master.viewmodel import (
+    Attention,
     CompletionArrived,
     EscalationArrived,
-    FleetChanged,
-    LLMReply,
+    FleetUpdated,
+    FleetView,
     Notice,
     PermissionEscalationArrived,
     ProposalArrived,
-    QueueDepthChanged,
-    SessionStatusChanged,
+    ViewEvent,
 )
-from broker.master.queue import EscalationQueue
-from broker.master.registry import Registry
-from broker.master.runtime import FLEET_WIDTH, MasterRuntime
-from broker.master.testmode import load_scenario, run_scenario
-from broker.master.tui.chat_log import ChatMessage, ThinkingIndicator
-from broker.master.tui.prompt_area import PromptArea
 
 
 class BrokerMasterApp(App[None]):
@@ -56,7 +59,6 @@ class BrokerMasterApp(App[None]):
         background: transparent;
         padding: 0 1;
     }
-    #queue-depth { height: 1; color: $text-muted; }
     #events { height: 1fr; background: transparent; }
     #box { height: 5; }
     """
@@ -77,12 +79,17 @@ class BrokerMasterApp(App[None]):
         self.registry = registry
         self.startup_warnings = list(startup_warnings or [])
         self.scenarios_dir = scenarios_dir
-        # In test mode the runtime's posts are teed into a capture the scenario
-        # runner reads its assertions from, while still reaching the widgets.
-        self._scenario_posts: list[Any] = []
-        post = self._tee_post if self.test_mode else self.post_message
+        # In test mode the runtime's events are teed into a capture the
+        # scenario runner reads its assertions from, while still reaching the
+        # widgets.
+        self._scenario_posts: list[ViewEvent] = []
+        self._latest_view: FleetView | None = None
+        self._focus_session: str | None = None
+        self._focus_kind: Attention | None = None
+        self._head: EscalationArrived | PermissionEscalationArrived | None = None
+        self._proposals: dict[str, str] = {}
         self.runtime = MasterRuntime(
-            post, registry, queue, cfg, anchor_pane=anchor_pane
+            self._emit, registry, queue, cfg, anchor_pane=anchor_pane
         )
         self.master_llm = MasterLLM(llm_call, self.runtime, cfg)
         self._server_task: asyncio.Task[None] | None = None
@@ -92,22 +99,23 @@ class BrokerMasterApp(App[None]):
         """True when the app was given scenarios to drive instead of an LLM."""
         return self.scenarios_dir is not None
 
-    def _tee_post(self, message: Message) -> object:
-        """Capture a runtime message for the scenario runner, then post it."""
-        self._scenario_posts.append(message)
-        return self.post_message(message)
+    def _emit(self, event: ViewEvent) -> None:
+        """Neutral sink handed to the runtime; pump the event through Textual."""
+        if self.test_mode:
+            self._scenario_posts.append(event)
+        self.post_message(ViewEventMessage(event))
 
     def compose(self) -> ComposeResult:
         with Horizontal():
             with VerticalScroll(id="fleet"):
-                yield Static(Text("Master — idle"), id="fleet-table")
+                yield FleetSidebar(Text("Master — idle"), id="fleet-table")
             with Vertical():
                 yield VerticalScroll(id="chat")
+                surface = FocusedSurface(id="surface")
+                surface.display = False
+                yield surface
                 with Vertical(id="activity") as activity:
                     activity.border_title = "activity"
-                    yield Static(
-                        Text("escalation queue: empty"), id="queue-depth"
-                    )
                     yield RichLog(id="events", wrap=True)
                 yield PromptArea(
                     placeholder=(
@@ -138,6 +146,15 @@ class BrokerMasterApp(App[None]):
             return
         box = self.query_one("#box", PromptArea)
         box.clear()
+        if text == "/main":
+            self._exit_surface()
+            return
+        if text == "/escalation":
+            self._enter_escalation()
+            return
+        if text == "/approve" or text.startswith("/approve "):
+            self._enter_proposal(text[len("/approve"):].strip() or None)
+            return
         box.disabled = True
         self._chat_block(text, role="user", label="you")
         if self.test_mode and text.startswith("/"):
@@ -233,64 +250,128 @@ class BrokerMasterApp(App[None]):
             # Fail loud; the app (and its socket server) survives.
             self._chat_block(f"[master error] {worker.error!r}")
 
-    # ── runtime → UI (pre-rendered strings, displayed verbatim) ──────────────
+    # ── view events → UI (structured view + verbatim prose) ──────────────────
 
     def on_llmreply(self, message: LLMReply) -> None:
         # Textual's handler-name derivation collapses the acronym:
         # LLMReply → "on_llmreply", not "on_llm_reply".
         self._chat_block(message.text, role="master", label="master")
 
-    def on_escalation_arrived(self, message: EscalationArrived) -> None:
-        self._chat_block(message.rendered)
-        self._event_line(
-            f"escalation {message.escalation_id} from {message.session_id}"
-        )
-
-    def on_permission_escalation_arrived(
-        self, message: PermissionEscalationArrived
-    ) -> None:
-        self._chat_block(message.rendered)
-        self._event_line(
-            f"permission escalation {message.escalation_id} from "
-            f"{message.session_id}"
-        )
-
-    def on_proposal_arrived(self, message: ProposalArrived) -> None:
-        self._chat_block(message.rendered)
-        self._event_line(
-            f"proposal {message.proposal_id} from {message.session_id} "
-            "awaiting approval"
-        )
-
-    def on_completion_arrived(self, message: CompletionArrived) -> None:
-        # Wrap with context; the summary itself passes through untouched.
-        self._chat_block(
-            f"Session {message.session_id} completed:\n{message.summary}"
-        )
-        self._event_line(f"{message.session_id} completed")
-
-    def on_notice(self, message: Notice) -> None:
-        self._event_line(message.text)
-
-    def on_session_status_changed(self, message: SessionStatusChanged) -> None:
-        self._event_line(f"{message.session_id} → {message.state}")
-
-    def on_fleet_changed(self, message: FleetChanged) -> None:
-        # One in-place table ("now"); #events stays the scrolling history.
-        self.query_one("#fleet-table", Static).update(Text(message.rendered))
-
-    def on_queue_depth_changed(self, message: QueueDepthChanged) -> None:
-        # Ids and a count only — payloads live in the chat, when surfaced.
-        if message.depth == 0:
-            text = "escalation queue: empty"
-        elif message.waiting:
-            text = (
-                f"escalation queue: {message.depth} "
-                f"(waiting: {', '.join(message.waiting)})"
+    def on_view_event_message(self, message: ViewEventMessage) -> None:
+        event = message.event
+        if isinstance(event, FleetUpdated):
+            self._latest_view = event.view
+            self.query_one("#fleet-table", FleetSidebar).update_view(event.view)
+            self._maybe_exit_surface()
+        elif isinstance(event, EscalationArrived):
+            self._chat_block(event.rendered)
+            self._event_line(
+                f"escalation {event.escalation_id} from {event.session_id}"
             )
+            self._head = event
+        elif isinstance(event, PermissionEscalationArrived):
+            self._chat_block(event.rendered)
+            self._event_line(
+                f"permission escalation {event.escalation_id} from "
+                f"{event.session_id}"
+            )
+            self._head = event
+        elif isinstance(event, ProposalArrived):
+            self._chat_block(event.rendered)
+            self._event_line(
+                f"proposal {event.proposal_id} from {event.session_id} "
+                "awaiting approval"
+            )
+            self._proposals[event.session_id] = event.rendered
+        elif isinstance(event, CompletionArrived):
+            self._chat_block(
+                f"Session {event.session_id} completed:\n{event.summary}"
+            )
+            self._event_line(f"{event.session_id} completed")
+        elif isinstance(event, Notice):
+            self._event_line(event.text)
         else:
-            text = f"escalation queue: {message.depth}"
-        self.query_one("#queue-depth", Static).update(Text(text))
+            self._event_line(f"{event.session_id} → {event.state}")
+
+    # ── focused surfaces (display mode only; the composer stays the master's) ─
+
+    def _enter_escalation(self) -> None:
+        """Focus the head escalation's disclosure, if one is waiting."""
+        view = self._latest_view
+        head_id = view.head_escalation_id if view else None
+        if head_id is None:
+            self._event_line("no escalation is waiting")
+            return
+        head = self._head
+        if head is None or head.escalation_id != head_id:
+            self._event_line("escalation disclosure not yet received")
+            return
+        if isinstance(head, PermissionEscalationArrived):
+            self._event_line(
+                f"the waiting request is a permission prompt in session "
+                f"{head.session_id} — answer it in its pane"
+            )
+            return
+        self._focus_session, self._focus_kind = head.session_id, Attention.ESCALATION
+        self.query_one("#surface", FocusedSurface).show(
+            f"Session broker · {head.session_id}", head.rendered
+        )
+        self._set_mode(surface=True)
+
+    def _enter_proposal(self, session_id: str | None) -> None:
+        """Focus a pending proposal: ``session_id``'s, or the only one."""
+        view = self._latest_view
+        rows = [
+            r for r in (view.rows if view else ()) if Attention.PROPOSAL in r.badges
+        ]
+        row = (
+            next((r for r in rows if r.session_id == session_id), None)
+            if session_id
+            else (rows[0] if len(rows) == 1 else None)
+        )
+        if row is None:
+            self._event_line(
+                "no single proposal to approve — use /approve sN"
+                if rows
+                else "no proposal is waiting"
+            )
+            return
+        rendered = self._proposals.get(row.session_id)
+        if rendered is None:
+            self._event_line("proposal not yet received")
+            return
+        self._focus_session, self._focus_kind = row.session_id, Attention.PROPOSAL
+        self.query_one("#surface", FocusedSurface).show(
+            f"Session broker · {row.session_id}", rendered
+        )
+        self._set_mode(surface=True)
+
+    def _exit_surface(self) -> None:
+        """Return to the master chat."""
+        self._focus_session = self._focus_kind = None
+        self._set_mode(surface=False)
+
+    def _set_mode(self, *, surface: bool) -> None:
+        """Show either the chat or the focused surface, and match the placeholder."""
+        self.query_one("#chat", VerticalScroll).display = not surface
+        self.query_one("#surface", FocusedSurface).display = surface
+        placeholder = "task, decision, or question… (ctrl+j for newline)"
+        if surface and self._focus_kind is Attention.ESCALATION:
+            placeholder = "answer this escalation via the master…"
+        elif surface and self._focus_kind is Attention.PROPOSAL:
+            placeholder = "approve or revise this prompt via the master…"
+        self.query_one("#box", PromptArea).placeholder = placeholder
+
+    def _maybe_exit_surface(self) -> None:
+        """Leave the surface once its badge is gone from the latest fleet view."""
+        if self._focus_session is None or self._latest_view is None:
+            return
+        row = next(
+            (r for r in self._latest_view.rows if r.session_id == self._focus_session),
+            None,
+        )
+        if row is None or self._focus_kind not in row.badges:
+            self._exit_surface()
 
     # ── helpers ──────────────────────────────────────────────────────────────
 

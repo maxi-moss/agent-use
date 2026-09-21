@@ -113,10 +113,26 @@ async def run_triage(fake: FakeLLM) -> Any:
 @pytest.mark.parametrize(
     "name,tool_input,expected_type",
     [
-        ("answer", {"reasoning": "r", "answer": "use oauth"}, AnswerCall),
+        (
+            "answer",
+            {
+                "reasoning": "r",
+                "answer": "use oauth",
+                "task_activity": "wiring up oauth",
+            },
+            AnswerCall,
+        ),
         ("escalate", ESCALATE_INPUT, EscalateCall),
-        ("complete", {"reasoning": "r", "summary": "done"}, CompleteCall),
-        ("no_action", {"reasoning": "r"}, NoActionCall),
+        (
+            "complete",
+            {"reasoning": "r", "summary": "done", "task_activity": "wrapping up"},
+            CompleteCall,
+        ),
+        (
+            "no_action",
+            {"reasoning": "r", "task_activity": "watching for input"},
+            NoActionCall,
+        ),
     ],
 )
 async def test_each_tool_maps_to_its_model(
@@ -125,6 +141,8 @@ async def test_each_tool_maps_to_its_model(
     fake = FakeLLM(ToolCall(name=name, input=tool_input))
     result = await run_triage(fake)
     assert isinstance(result, expected_type)
+    if "task_activity" in tool_input:
+        assert result.task_activity == tool_input["task_activity"]
 
 
 async def test_unknown_tool_name_raises() -> None:
@@ -140,7 +158,9 @@ async def test_invalid_tool_input_raises() -> None:
 
 
 async def test_forced_single_tool_choice() -> None:
-    fake = FakeLLM(ToolCall(name="no_action", input={"reasoning": "r"}))
+    fake = FakeLLM(
+        ToolCall(name="no_action", input={"reasoning": "r", "task_activity": "idle"})
+    )
     await run_triage(fake)
     assert fake.calls[0]["tool_choice"] == {
         "type": "any",

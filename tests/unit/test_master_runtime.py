@@ -1,5 +1,5 @@
 """MasterRuntime harness: fake broker = protocol.client against the real
-runtime server; driver.subprocess.run monkeypatched; app_post = recording list."""
+runtime server; driver.subprocess.run monkeypatched; emit = recording list."""
 
 import asyncio
 import contextlib
@@ -16,25 +16,23 @@ from pydantic import ValidationError
 
 from broker.config import BrokerConfig
 from broker.herdr import driver
-from broker.master.messages import (
-    CompletionArrived,
-    EscalationArrived,
-    FleetChanged,
-    Notice,
-    PermissionEscalationArrived,
-    ProposalArrived,
-    QueueDepthChanged,
-    SessionStatusChanged,
-)
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry, SessionRecord
 from broker.master.runtime import (
-    FLEET_WIDTH,
     PANE_UNKNOWN,
     MasterRuntime,
     render_escalation,
-    render_fleet,
     render_permission_escalation,
+)
+from broker.master.viewmodel import (
+    Attention,
+    CompletionArrived,
+    EscalationArrived,
+    FleetUpdated,
+    Notice,
+    PermissionEscalationArrived,
+    ProposalArrived,
+    SessionStatusChanged,
 )
 from broker.protocol import client
 from broker.protocol.constants import (
@@ -42,6 +40,7 @@ from broker.protocol.constants import (
     NACK_PROTOCOL_VIOLATION,
     NACK_UNKNOWN_SESSION,
     SessionState,
+    T_APPROVE_PROMPT,
     T_BUDGET_UPDATE,
     T_COMPLETION,
     T_DISPATCH_DECISION,
@@ -166,8 +165,16 @@ class PermissionLogSession:
 class StatusSession:
     """Session-socket handler answering status with a scripted payload."""
 
-    def __init__(self, *, permission_prompt: bool) -> None:
+    def __init__(
+        self,
+        *,
+        permission_prompt: bool,
+        task_activity: str = "",
+        state: str = "driving",
+    ) -> None:
         self.permission_prompt = permission_prompt
+        self.task_activity = task_activity
+        self.state = state
 
     async def handler(self, env: Envelope) -> Response:
         if env.type != T_STATUS:
@@ -176,9 +183,10 @@ class StatusSession:
             id=env.id,
             ok=True,
             payload={
-                "state": "driving",
+                "state": self.state,
                 "pane_id": "w3:p2",
                 "permission_prompt": self.permission_prompt,
+                "task_activity": self.task_activity,
             },
         )
 
@@ -407,9 +415,9 @@ async def test_cross_raiser_escalation_queues_behind_the_active_one(
     assert runtime.queue.active.escalation_id == "e1"
     # Not surfaced yet: the developer sees the head and a depth line only.
     assert [m for m in posts if isinstance(m, PermissionEscalationArrived)] == []
-    depths = [m for m in posts if isinstance(m, QueueDepthChanged)]
-    assert depths[-1].depth == 2
-    assert depths[-1].waiting == ("s1",)
+    fleets = [m for m in posts if isinstance(m, FleetUpdated)]
+    assert fleets[-1].view.queue_depth == 2
+    assert fleets[-1].view.waiting == ("s1",)
 
 
 async def test_malformed_permission_escalation_nacked_never_surfaced(
@@ -781,11 +789,101 @@ async def test_startup_resurfaces_the_persisted_head(
     assert arrived[0].rendered == render_escalation(
         EscalationPayload.model_validate(escalation_dict("e1"))
     )
-    # The waiting entry stays unannounced; the depth line carries it.
+    # The waiting entry stays unannounced; the fleet view carries it.
     assert [m for m in posts if isinstance(m, PermissionEscalationArrived)] == []
-    depths = [m for m in posts if isinstance(m, QueueDepthChanged)]
-    assert depths[0].depth == 2
-    assert depths[0].waiting == ("s1",)
+    fleets = [m for m in posts if isinstance(m, FleetUpdated)]
+    assert fleets[0].view.queue_depth == 2
+    assert fleets[0].view.waiting == ("s1",)
+
+
+async def test_probe_of_a_settled_session_keeps_it_settled(home: Path) -> None:
+    cfg = BrokerConfig(model_id="test-model", broker_home=home)
+    registry = Registry.load(home / "registry.json")
+    registry.upsert(
+        SessionRecord(
+            name="s1",
+            socket_path=str(home / "s" / "s1.sock"),
+            cwd="/private/tmp",
+            anchor_pane="%1",
+            state=SessionState.DRIVING,
+        )
+    )
+    # A completed broker keeps serving and still reports its last turn's
+    # task activity.
+    stub = StatusSession(
+        permission_prompt=False, task_activity="wrapping up", state="completed"
+    )
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    posts: list[Any] = []
+    runtime = MasterRuntime(
+        posts.append,
+        registry,
+        EscalationQueue.load(home / "escalation-queue.json"),
+        cfg,
+        anchor_pane="%1",
+    )
+    try:
+        await runtime.probe_status("s1")
+    finally:
+        server.close()
+    assert registry.get("s1").state is SessionState.COMPLETED
+    assert [
+        (m.session_id, m.state) for m in posts if isinstance(m, SessionStatusChanged)
+    ] == [("s1", SessionState.COMPLETED)]
+    row = runtime.build_fleet_view().rows[0]
+    assert row.task_activity == ""
+
+
+async def test_repopulate_from_brokers_fills_task_activity_at_startup(
+    home: Path,
+) -> None:
+    cfg = BrokerConfig(model_id="test-model", broker_home=home)
+    registry = Registry.load(home / "registry.json")
+    registry.upsert(
+        SessionRecord(
+            name="s1",
+            socket_path=str(home / "s" / "s1.sock"),
+            cwd="/private/tmp",
+            anchor_pane="%1",
+            state=SessionState.DRIVING,
+        )
+    )
+    stub = StatusSession(
+        permission_prompt=False, task_activity="reviewing the login flow"
+    )
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    posts: list[Any] = []
+    runtime = MasterRuntime(
+        posts.append,
+        registry,
+        EscalationQueue.load(home / "escalation-queue.json"),
+        cfg,
+        anchor_pane="%1",
+    )
+    try:
+        task = asyncio.create_task(runtime.serve())
+
+        def repopulated() -> bool:
+            fleets = [m for m in posts if isinstance(m, FleetUpdated)]
+            return bool(fleets) and any(
+                row.task_activity == "reviewing the login flow"
+                for row in fleets[-1].view.rows
+            )
+
+        for _ in range(200):
+            if repopulated():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError(
+                "startup never repopulated task_activity from the broker"
+            )
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 async def test_stop_session_retracts_a_queued_permission_escalation(
@@ -809,39 +907,35 @@ async def test_stop_session_retracts_a_queued_permission_escalation(
     assert [m for m in posts if isinstance(m, PermissionEscalationArrived)] == []
 
 
-async def test_queue_depth_posted_on_every_mutation(
+async def test_queue_depth_reflects_every_mutation(
     rt: tuple[MasterRuntime, list[Any]], home: Path
 ) -> None:
     runtime, posts = rt
     stub = StubSession()
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
 
-    def depths() -> list[tuple[int, tuple[str, ...]]]:
-        return [
-            (m.depth, m.waiting)
-            for m in posts
-            if isinstance(m, QueueDepthChanged)
-        ]
+    def depth() -> tuple[int, tuple[str, ...]]:
+        fleets = [m for m in posts if isinstance(m, FleetUpdated)]
+        return (fleets[-1].view.queue_depth, fleets[-1].view.waiting)
 
     try:
-        assert depths() == [(0, ())]  # serve() announces the loaded queue
+        assert depth() == (0, ())  # serve() announces the loaded queue
         assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-        assert depths()[-1] == (1, ())
+        assert depth() == (1, ())
         assert (
             await send(
                 runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
             )
         ).ok
-        assert depths()[-1] == (2, ("s1",))
+        assert depth() == (2, ("s1",))
         await runtime.dispatch("e1", "use option B")
-        assert depths()[-1] == (1, ())
+        assert depth() == (1, ())
         assert (
             await send(
                 runtime, T_RETRACT, {"escalation_id": "p1", "reason": "answered"}
             )
         ).ok
-        assert depths()[-1] == (0, ())
-        assert len(depths()) == 5
+        assert depth() == (0, ())
     finally:
         server.close()
         await server.wait_closed()
@@ -938,8 +1032,8 @@ async def test_session_ended_removes_from_fleet(
     # registry itself — so it can never be handed a new task or a decision.
     assert "s1" not in runtime.registry.records
     assert runtime.render_registry_summary() == "(no sessions)"
-    last_fleet = [m for m in posts if isinstance(m, FleetChanged)][-1].rendered
-    assert "s1" not in last_fleet
+    last_view = [m for m in posts if isinstance(m, FleetUpdated)][-1].view
+    assert not any(row.session_id == "s1" for row in last_view.rows)
     # The removal is durable, and a late live-status push cannot resurrect it.
     assert "s1" not in Registry.load(home / "registry.json").records
     assert (await send(runtime, T_LIVE_STATUS, {"state": "driving"})).ok
@@ -1060,6 +1154,42 @@ async def test_proposal_rendered_verbatim_and_tracked(
     assert "the exact grounding summary" in arrived[0].rendered
     assert "## Retrieved code\n- a.py::f (seed 0.81)\n- a.py::g" in arrived[0].rendered
     assert runtime.registry.get("s1").state == "awaiting_approval"
+
+
+async def test_approve_prompt_stores_the_title_and_it_reaches_the_fleet_row(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, posts = rt
+    assert (
+        await send(
+            runtime,
+            T_PROMPT_PROPOSAL,
+            {
+                "proposal_id": "p1",
+                "proposed_prompt": "the proposed prompt",
+                "grounding_summary": "grounding",
+            },
+        )
+    ).ok
+    stub = StubSession()
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        result = await runtime.approve_prompt(
+            "p1", "the approved prompt", "fix the login bug"
+        )
+        assert "approved" in result
+        assert len(stub.envelopes) == 1
+        assert stub.envelopes[0].type == T_APPROVE_PROMPT
+        assert stub.envelopes[0].payload == {
+            "proposal_id": "p1",
+            "prompt": "the approved prompt",
+        }
+        assert runtime.registry.get("s1").title == "fix the login bug"
+        row = [m for m in posts if isinstance(m, FleetUpdated)][-1].view.rows[0]
+        assert row.title == "fix the login bug"
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 async def test_dispatch_reports_rejection_when_session_nacks(
@@ -1370,56 +1500,148 @@ async def test_attach_retracts_stranded_escalations(
     assert any("p1" in t and "retracted" in t for t in notices)
 
 
-def test_render_fleet_blocks_show_state_perm_activity_budget_intent() -> None:
-    records = {
-        "s1": SessionRecord(
-            name="s1",
-            socket_path="/private/tmp/s1.sock",
+async def test_build_fleet_view_orders_rows_numerically_with_budgets_and_titles(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    runtime, _ = rt
+    runtime.registry.upsert(
+        SessionRecord(
+            name="s10",
+            socket_path="/private/tmp/s10.sock",
             cwd="/private/tmp",
             anchor_pane="%1",
             state=SessionState.DRIVING,
             intent="Fix the auth bug in the checkout flow before the demo",
-        ),
-        "s2": SessionRecord(
+            title="fix auth bug",
+        )
+    )
+    runtime.registry.upsert(
+        SessionRecord(
             name="s2",
             socket_path="/private/tmp/s2.sock",
             cwd="/private/tmp",
             anchor_pane="%1",
             state=SessionState.ESCALATED,
             approved_prompt="Migrate the users table",
+            title="migrate users table",
             budget_count=5,
-        ),
-    }
-    rendered = render_fleet(
-        records,
-        {"s1": "reviewing the latest turn…"},
-        {"s2"},
-        "thinking…",
-        8,
+        )
     )
-    lines = rendered.splitlines()
-    assert lines[0] == "Master — thinking…"
-    # Every line fits the fleet pane; nothing wraps and breaks alignment.
-    assert all(len(line) <= FLEET_WIDTH for line in lines)
-    s1_head, s1_intent, s1_act = lines[2], lines[3], lines[4]
-    # State text is the live SessionState VALUE, not the enum name.
-    assert "driving" in s1_head
-    assert "0/8" in s1_head
-    assert "⚠" not in s1_head  # perm cell blank when no prompt is pending
-    assert s1_intent.startswith("    Fix the auth bug")
-    assert s1_intent.endswith("…")  # the long intent is truncated
-    assert s1_act.strip() == "reviewing the latest turn…"
-    s2_head, s2_intent = lines[6], lines[7]
-    assert "escalated" in s2_head
-    assert "⚠" in s2_head
-    assert "5/8" in s2_head
-    assert "Migrate the users table" in s2_intent  # approved prompt wins
+    view = runtime.build_fleet_view()
+    # Numeric order (s2 before s10), not lexical.
+    assert [row.session_id for row in view.rows] == ["s1", "s2", "s10"]
+    # s1 was never approved: no title is set on it, and the row shows none —
+    # title no longer falls back to approved_prompt or intent.
+    assert view.rows[0].title == ""
+    s2 = view.rows[1]
+    assert s2.state == SessionState.ESCALATED
+    assert s2.title == "migrate users table"
+    assert s2.budget_count == 5
+    assert s2.budget_max == runtime.cfg.budget_max
+    s10 = view.rows[2]
+    assert s10.title == "fix auth bug"
 
 
-def test_render_fleet_idle_master_and_empty_registry() -> None:
-    rendered = render_fleet({}, {}, set(), None, 8)
-    assert rendered.splitlines()[0] == "Master — idle"
-    assert "(no sessions)" in rendered
+async def test_build_fleet_view_idle_master_and_no_sessions(home: Path) -> None:
+    cfg = BrokerConfig(model_id="test-model", broker_home=home)
+    registry = Registry.load(home / "registry.json")
+    queue = EscalationQueue.load(home / "escalation-queue.json")
+    runtime = MasterRuntime(
+        lambda _event: None, registry, queue, cfg, anchor_pane="%1"
+    )
+    view = runtime.build_fleet_view()
+    assert view.master_activity is None
+    assert view.rows == ()
+    assert view.queue_depth == 0
+
+
+async def test_build_fleet_view_reports_master_activity_and_queue_state(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    runtime, _ = rt
+    runtime.registry.upsert(
+        SessionRecord(
+            name="s2",
+            socket_path="/private/tmp/s2.sock",
+            cwd="/private/tmp",
+            anchor_pane="%1",
+            state=SessionState.DRIVING,
+        )
+    )
+    runtime.note_master_activity("thinking…")
+    assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
+    assert (
+        await send(
+            runtime,
+            T_PERMISSION_ESCALATION,
+            permission_escalation_dict("p1", "s2"),
+            session="s2",
+        )
+    ).ok
+    view = runtime.build_fleet_view()
+    assert view.master_activity == "thinking…"
+    assert view.queue_depth == 2
+    assert view.waiting == ("s2",)
+
+
+async def test_build_fleet_view_badges_reflect_queue_proposals_and_prompts(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    runtime, _ = rt
+    runtime.registry.upsert(
+        SessionRecord(
+            name="s2",
+            socket_path="/private/tmp/s2.sock",
+            cwd="/private/tmp",
+            anchor_pane="%1",
+            state=SessionState.DRIVING,
+        )
+    )
+    runtime.registry.upsert(
+        SessionRecord(
+            name="s3",
+            socket_path="/private/tmp/s3.sock",
+            cwd="/private/tmp",
+            anchor_pane="%1",
+            state=SessionState.DRIVING,
+            pane_id="w3:p2",
+        )
+    )
+    # s1: a queued broker escalation AND a queued permission escalation from
+    # the same session — distinct raiser identities, so both badges carry.
+    assert (await send(runtime, T_ESCALATION, escalation_dict("e1", "s1"))).ok
+    assert (
+        await send(
+            runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1", "s1")
+        )
+    ).ok
+    # s2: a pending prompt proposal.
+    assert (
+        await send(
+            runtime,
+            T_PROMPT_PROPOSAL,
+            {
+                "proposal_id": "prop-1",
+                "proposed_prompt": "do it",
+                "grounding_summary": "facts",
+            },
+            session="s2",
+        )
+    ).ok
+    # s3: sitting on a native permission prompt.
+    assert (
+        await send(
+            runtime,
+            T_LIVE_STATUS,
+            {"state": "driving", "permission_prompt": True},
+            session="s3",
+        )
+    ).ok
+    rows = {row.session_id: row for row in runtime.build_fleet_view().rows}
+    assert rows["s1"].badges == (Attention.ESCALATION, Attention.PERMISSION)
+    assert rows["s2"].badges == (Attention.PROPOSAL,)
+    assert rows["s3"].badges == (Attention.PERMISSION,)
+    assert rows["s3"].pane_id == "w3:p2"
 
 
 async def test_live_status_updates_state_activity_and_perm(
@@ -1433,27 +1655,31 @@ async def test_live_status_updates_state_activity_and_perm(
             "state": "escalated",
             "activity": "reviewing a permission request…",
             "permission_prompt": True,
+            "task_activity": "reviewing the login flow",
         },
     )
     assert resp.ok  # every push is ACKed so the sender never spins
     assert runtime.registry.get("s1").state == "escalated"
-    fleets = [m for m in posts if isinstance(m, FleetChanged)]
+    fleets = [m for m in posts if isinstance(m, FleetUpdated)]
     assert fleets  # the push published a fresh snapshot
-    last = fleets[-1].rendered
-    assert "escalated" in last
-    assert "⚠" in last
-    assert "reviewing a permission request…" in last
-    # A follow-up clearing push empties activity and the PERM column.
+    row = fleets[-1].view.rows[0]
+    assert row.state == SessionState.ESCALATED
+    assert Attention.PERMISSION in row.badges
+    assert row.broker_activity == "reviewing a permission request…"
+    assert row.task_activity == "reviewing the login flow"
+    # A follow-up clearing push empties activity, task activity, and the
+    # PERMISSION badge.
     resp = await send(
         runtime,
         T_LIVE_STATUS,
         {"state": "driving", "activity": "", "permission_prompt": False},
     )
     assert resp.ok
-    last = [m for m in posts if isinstance(m, FleetChanged)][-1].rendered
-    assert "driving" in last
-    assert "⚠" not in last
-    assert "reviewing a permission request…" not in last
+    row = [m for m in posts if isinstance(m, FleetUpdated)][-1].view.rows[0]
+    assert row.state == SessionState.DRIVING
+    assert row.task_activity == ""
+    assert Attention.PERMISSION not in row.badges
+    assert row.broker_activity == ""
     # A push from an unknown session is still ACKed.
     resp = await send(
         runtime, T_LIVE_STATUS, {"state": "driving"}, session="ghost"
@@ -1477,7 +1703,7 @@ async def test_set_state_is_idempotent(
     changed = [m for m in posts if isinstance(m, SessionStatusChanged)]
     assert len(changed) == 1
     assert len(saves) == 1
-    fleet_count = len([m for m in posts if isinstance(m, FleetChanged)])
+    fleet_count = len([m for m in posts if isinstance(m, FleetUpdated)])
     # The same state again: no second announcement, no second save — but the
     # snapshot still publishes for the activity/perm side of the push.
     assert (await send(runtime, T_LIVE_STATUS, {"state": "escalated"})).ok
@@ -1485,7 +1711,7 @@ async def test_set_state_is_idempotent(
     assert len(changed) == 1
     assert len(saves) == 1
     assert (
-        len([m for m in posts if isinstance(m, FleetChanged)])
+        len([m for m in posts if isinstance(m, FleetUpdated)])
         == fleet_count + 1
     )
 
@@ -1532,6 +1758,7 @@ async def test_absorbing_transition_clears_live_status(
                 "state": "driving",
                 "activity": "reviewing a permission request…",
                 "permission_prompt": True,
+                "task_activity": "reviewing the login flow",
             },
         )
     ).ok
@@ -1539,10 +1766,11 @@ async def test_absorbing_transition_clears_live_status(
     # clearing push is coming and the guard would refuse it anyway — the
     # boundary write itself must retire the phrase and the ⚠.
     await runtime.stop_session("s1")
-    last = [m for m in posts if isinstance(m, FleetChanged)][-1].rendered
-    assert "stopped" in last
-    assert "reviewing a permission request…" not in last
-    assert "⚠" not in last
+    row = [m for m in posts if isinstance(m, FleetUpdated)][-1].view.rows[0]
+    assert row.state == SessionState.STOPPED
+    assert row.broker_activity == ""
+    assert row.task_activity == ""
+    assert row.badges == ()
 
 
 async def test_list_sessions_probes_rather_than_reading_the_pushed_map(
@@ -1577,6 +1805,7 @@ async def test_reactivate_relays_the_intent_and_supersedes_the_old_one(
     record = runtime.registry.get("s1")
     record.state = SessionState.COMPLETED
     record.approved_prompt = "the first task"
+    record.title = "the first task title"
     record.budget_count = 4
     runtime.registry.upsert(record)
     stub = StubSession()
@@ -1590,6 +1819,7 @@ async def test_reactivate_relays_the_intent_and_supersedes_the_old_one(
         reloaded = Registry.load(home / "registry.json").get("s1")
         assert reloaded.intent == "now write the docs"
         assert reloaded.approved_prompt is None  # superseded until re-approved
+        assert reloaded.title == ""  # cleared alongside the approved prompt
         assert reloaded.budget_count == 0
         assert reloaded.state == "grounding"
     finally:

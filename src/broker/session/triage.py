@@ -32,7 +32,11 @@ from broker.transcript.schemas import TranscriptEvent
 logger = logging.getLogger(__name__)
 
 
-class AnswerCall(BaseModel):
+class _HasTaskActivity(BaseModel):
+    task_activity: str
+
+
+class AnswerCall(_HasTaskActivity):
     model_config = ConfigDict(extra="forbid")
 
     reasoning: str
@@ -52,14 +56,14 @@ class EscalateCall(BaseModel):
     what_would_change_my_mind: str
 
 
-class CompleteCall(BaseModel):
+class CompleteCall(_HasTaskActivity):
     model_config = ConfigDict(extra="forbid")
 
     reasoning: str
     summary: str
 
 
-class NoActionCall(BaseModel):
+class NoActionCall(_HasTaskActivity):
     model_config = ConfigDict(extra="forbid")
 
     reasoning: str
