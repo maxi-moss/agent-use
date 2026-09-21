@@ -6,7 +6,7 @@ This file provides guidance to Claude Code when working with this repository.
 
 Routes decisions between one developer and N interactive Claude Code sessions driven through Herdr.
 
-## Current Stack
+## Stack
 
 - Python + `uv` for deps and locking — versions live in the root `pyproject.toml` and `uv.lock`
 - pydantic — every socket and config boundary
@@ -41,12 +41,13 @@ Every session is an interactive Claude Code process in its own terminal pane, wi
 
 - Use `rg` instead of `grep` for plain-text matches (comments, strings, config). Ripgrep recurses by default and `-r` does `--replace` on the printed output, so run `rg -n "pattern"` instead.
 - Comments should be used conservatively and only when absolutely necessary. Never comment on a previous state of the code or the change that produced it — a comment that only makes sense to someone who saw the diff is noise.
+- Do not design code for backwards compatibility. When a change replaces how something works, migrate every call site and delete the old path in the same change — don't leave both live. Only keep the old path when the developer asks for it by name.
 - Never import inside functions. Import at module top level.
 - The session, permission, master, and index-embedding stacks are duplicated on purpose — tool schemas, clients, timeouts. Never factor them together, not even across providers; a shared helper is how one surface's model gets silently re-pinned to another's.
 
 ## When writing docs
 
-Never manually word-wrap markdown documents using line breaks.
+- Never manually word-wrap markdown documents using line breaks.
 
 ## Subagent models
 
