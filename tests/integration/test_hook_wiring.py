@@ -52,7 +52,12 @@ TRANSCRIPT_FIXTURE = (
 )
 
 ANSWER_RESULT = ToolCall(
-    name="answer", input={"reasoning": "grounded", "answer": "use oauth"}
+    name="answer",
+    input={
+        "reasoning": "grounded",
+        "answer": "use oauth",
+        "task_activity": "wiring up oauth",
+    },
 )
 ESCALATE_RESULT = ToolCall(
     name="escalate",
@@ -69,7 +74,11 @@ ESCALATE_RESULT = ToolCall(
 )
 COMPLETE_RESULT = ToolCall(
     name="complete",
-    input={"reasoning": "all done", "summary": "task finished cleanly"},
+    input={
+        "reasoning": "all done",
+        "summary": "task finished cleanly",
+        "task_activity": "wrapping up",
+    },
 )
 
 

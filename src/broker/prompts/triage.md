@@ -104,3 +104,8 @@ outside a tool call is discarded unread. Put your reasoning in the tool's
 - `complete` — the task is finished; summarise what was done for the developer.
 - `no_action` — nothing needs doing at this boundary (for example, the agent
   is mid-task and its last message needs no reply).
+
+On `answer`, `complete`, and `no_action`, also set `task_activity`: one terse,
+plain-language line describing what the coding agent is doing right now or has
+just done (for example "wiring the retry backoff into the client") — a concrete
+activity, not a sentence of reasoning and not a restatement of the intent.

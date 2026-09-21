@@ -257,6 +257,7 @@ class SessionBroker:
         self.budget_count = cfg.budget_count
         self.intent = cfg.intent  # replaced outright on reactivation
         self.approved_prompt: str | None = None
+        self.task_activity: str = ""
 
         self.session_bound = asyncio.Event()
         self._approval: asyncio.Future[ApprovePromptPayload] | None = None
@@ -448,6 +449,7 @@ class SessionBroker:
         """
         self.intent = intent
         self.approved_prompt = None  # superseded until the developer approves
+        self.task_activity = ""
         self._set_state(SessionState.GROUNDING)
         assert self._llm_call is not None
         assert self._retrieve is not None
@@ -492,6 +494,7 @@ class SessionBroker:
                 state=self.state,
                 activity=" · ".join(sorted(self._activity_phrases)),
                 permission_prompt=self._permission_prompt_pending,
+                task_activity=self.task_activity,
             )
             try:
                 await self._to_master(T_LIVE_STATUS, payload.model_dump())
@@ -776,6 +779,7 @@ class SessionBroker:
                         str(self.transcript_path) if self.transcript_path else None
                     ),
                     permission_prompt=self._permission_prompt_pending,
+                    task_activity=self.task_activity,
                 ).model_dump(),
             )
 
@@ -914,6 +918,9 @@ class SessionBroker:
                 event_name="Stop",
                 last_assistant_message=last_assistant_message,
             )
+        if not isinstance(result, EscalateCall):
+            self.task_activity = result.task_activity
+            self._status_dirty.set()
         if isinstance(result, AnswerCall):
             if self.budget_count >= self.cfg.budget_max:
                 await self._escalate_handover(result, last_assistant_message, events)

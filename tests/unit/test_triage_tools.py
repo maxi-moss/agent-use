@@ -68,6 +68,16 @@ def test_escalate_tool_fields_match_escalation_payload() -> None:
     assert tool_fields == payload_fields
 
 
+def test_task_activity_on_non_escalate_triage_tools_only() -> None:
+    for tool in TRIAGE_TOOLS:
+        schema = cast(dict[str, Any], tool["input_schema"])
+        props = cast(dict[str, Any], schema.get("properties", {}))
+        if tool["name"] == "escalate":
+            assert "task_activity" not in props
+        else:
+            assert "task_activity" in props
+
+
 def test_ask_and_triage_escalate_schemas_identical() -> None:
     """Both call sites derive escalate from the same EscalateCall. Drift pin."""
     triage_escalate = next(t for t in TRIAGE_TOOLS if t["name"] == "escalate")
