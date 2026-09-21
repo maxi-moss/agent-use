@@ -165,9 +165,16 @@ class PermissionLogSession:
 class StatusSession:
     """Session-socket handler answering status with a scripted payload."""
 
-    def __init__(self, *, permission_prompt: bool, task_activity: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        permission_prompt: bool,
+        task_activity: str = "",
+        state: str = "driving",
+    ) -> None:
         self.permission_prompt = permission_prompt
         self.task_activity = task_activity
+        self.state = state
 
     async def handler(self, env: Envelope) -> Response:
         if env.type != T_STATUS:
@@ -176,7 +183,7 @@ class StatusSession:
             id=env.id,
             ok=True,
             payload={
-                "state": "driving",
+                "state": self.state,
                 "pane_id": "w3:p2",
                 "permission_prompt": self.permission_prompt,
                 "task_activity": self.task_activity,
@@ -787,6 +794,44 @@ async def test_startup_resurfaces_the_persisted_head(
     fleets = [m for m in posts if isinstance(m, FleetUpdated)]
     assert fleets[0].view.queue_depth == 2
     assert fleets[0].view.waiting == ("s1",)
+
+
+async def test_probe_of_a_settled_session_keeps_it_settled(home: Path) -> None:
+    cfg = BrokerConfig(model_id="test-model", broker_home=home)
+    registry = Registry.load(home / "registry.json")
+    registry.upsert(
+        SessionRecord(
+            name="s1",
+            socket_path=str(home / "s" / "s1.sock"),
+            cwd="/private/tmp",
+            anchor_pane="%1",
+            state=SessionState.DRIVING,
+        )
+    )
+    # A completed broker keeps serving and still reports its last turn's
+    # task activity.
+    stub = StatusSession(
+        permission_prompt=False, task_activity="wrapping up", state="completed"
+    )
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    posts: list[Any] = []
+    runtime = MasterRuntime(
+        posts.append,
+        registry,
+        EscalationQueue.load(home / "escalation-queue.json"),
+        cfg,
+        anchor_pane="%1",
+    )
+    try:
+        await runtime.probe_status("s1")
+    finally:
+        server.close()
+    assert registry.get("s1").state is SessionState.COMPLETED
+    assert [
+        (m.session_id, m.state) for m in posts if isinstance(m, SessionStatusChanged)
+    ] == [("s1", SessionState.COMPLETED)]
+    row = runtime.build_fleet_view().rows[0]
+    assert row.task_activity == ""
 
 
 async def test_repopulate_from_brokers_fills_task_activity_at_startup(

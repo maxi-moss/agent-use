@@ -593,10 +593,7 @@ class MasterRuntime:
                     self._activity[name] = p.activity
                 else:
                     self._activity.pop(name, None)
-                if p.task_activity:
-                    self._task_activity[name] = p.task_activity
-                else:
-                    self._task_activity.pop(name, None)
+                self._note_task_activity(name, p.task_activity)
                 if p.permission_prompt:
                     self._permission_prompt_pending.add(name)
                 else:
@@ -1058,21 +1055,19 @@ class MasterRuntime:
         Returns:
             The status as reported by the session broker.
         """
-        record = self.registry.get(session_id)
+        socket_path = Path(self.registry.get(session_id).socket_path)
         env = self._env(T_STATUS, {})
-        resp = await client.request(
-            Path(record.socket_path), env, timeout_s=REQUEST_TIMEOUT_S
-        )
+        resp = await client.request(socket_path, env, timeout_s=REQUEST_TIMEOUT_S)
         status = StatusPayload.model_validate(resp.payload)
-        record.state = status.state
+        record = self.registry.get(session_id)
         record.pane_id = status.pane_id or record.pane_id
         record.claude_session_id = (
             status.claude_session_id or record.claude_session_id
         )
         record.transcript_path = status.transcript_path or record.transcript_path
         self.registry.upsert(record)
-        if status.task_activity:
-            self._task_activity[session_id] = status.task_activity
+        self._set_state(session_id, status.state)
+        self._note_task_activity(session_id, status.task_activity)
         return status
 
     async def get_decision_log(self, session_id: str) -> str:
@@ -1381,6 +1376,13 @@ class MasterRuntime:
         self.emit(SessionStatusChanged(name, state))
         self._publish_fleet()
         return True
+
+    def _note_task_activity(self, name: str, text: str) -> None:
+        """Show ``text`` as a live session's task activity; a settled session shows none."""
+        if not text or self.registry.get(name).state in _ABSORBING:
+            self._task_activity.pop(name, None)
+        else:
+            self._task_activity[name] = text
 
     def build_fleet_view(self) -> FleetView:
         """Assemble the structured sidebar view from current runtime state."""
