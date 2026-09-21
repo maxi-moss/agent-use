@@ -46,6 +46,7 @@ class FleetView:
     rows: tuple[SessionRow, ...]
     queue_depth: int
     waiting: tuple[str, ...]
+    head_escalation_id: str | None
 
 
 @dataclass(frozen=True, slots=True)

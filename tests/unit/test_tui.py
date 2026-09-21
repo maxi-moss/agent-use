@@ -135,16 +135,29 @@ def _session_row(session_id: str, badges: tuple[Attention, ...]) -> SessionRow:
     )
 
 
-def _fleet_view(rows: tuple[SessionRow, ...], *, queue_depth: int = 1) -> FleetView:
+def _fleet_view(
+    rows: tuple[SessionRow, ...],
+    *,
+    queue_depth: int = 1,
+    head_escalation_id: str | None = None,
+) -> FleetView:
     return FleetView(
-        master_activity=None, rows=rows, queue_depth=queue_depth, waiting=()
+        master_activity=None,
+        rows=rows,
+        queue_depth=queue_depth,
+        waiting=(),
+        head_escalation_id=head_escalation_id,
     )
 
 
 def _escalation_row_view(
     badges: tuple[Attention, ...], *, queue_depth: int = 1
 ) -> FleetView:
-    return _fleet_view((_session_row("s1", badges),), queue_depth=queue_depth)
+    return _fleet_view(
+        (_session_row("s1", badges),),
+        queue_depth=queue_depth,
+        head_escalation_id="e1" if queue_depth else None,
+    )
 
 
 async def test_submit_disables_input_and_worker_reenables(home: Path) -> None:
@@ -275,6 +288,7 @@ async def test_fleet_sidebar_renders_badges_and_waiting_count(home: Path) -> Non
         ),
         queue_depth=1,
         waiting=(),
+        head_escalation_id="e1",
     )
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
@@ -287,7 +301,7 @@ async def test_fleet_sidebar_renders_badges_and_waiting_count(home: Path) -> Non
         assert "permission · w3:p2" in text
         assert "1 request waiting" in text
         app._emit(  # pyright: ignore[reportPrivateUsage]
-            FleetUpdated(FleetView(None, (), 0, ()))
+            FleetUpdated(FleetView(None, (), 0, (), None))
         )
         await pilot.pause()
         assert "all clear" in _fleet_text(app)
@@ -385,6 +399,40 @@ async def test_fleet_updated_auto_exits_the_surface_when_the_badge_clears(
         await pilot.pause()
         assert app.query_one("#chat", VerticalScroll).display is True
         assert app.query_one("#surface", FocusedSurface).display is False
+
+
+async def test_slash_escalation_opens_the_head_not_the_lowest_badged_row(
+    home: Path,
+) -> None:
+    app = make_app(home, GatedLLM())
+    async with app.run_test() as pilot:
+        await pilot.pause(0.05)
+        # s3 escalated first and is the announced head; s1 is queued behind it
+        # and carries the badge without a disclosure of its own.
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            EscalationArrived("s3", "e3", ESCALATION_RENDERED)
+        )
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            FleetUpdated(
+                _fleet_view(
+                    (
+                        _session_row("s1", (Attention.ESCALATION,)),
+                        _session_row("s3", (Attention.ESCALATION,)),
+                    ),
+                    queue_depth=2,
+                    head_escalation_id="e3",
+                )
+            )
+        )
+        await pilot.pause()
+        box = app.query_one("#box", PromptArea)
+        box.focus()
+        box.text = "/escalation"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.query_one("#surface", FocusedSurface).display is True
+        assert _surface_heading(app) == "Session broker · s3"
+        assert _surface_body(app) == ESCALATION_RENDERED
 
 
 async def test_slash_escalation_with_nothing_waiting_stays_on_chat(

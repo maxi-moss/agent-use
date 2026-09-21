@@ -1401,11 +1401,13 @@ class MasterRuntime:
                     pane_id=r.pane_id,
                 )
             )
+        head = self.queue.active
         return FleetView(
             master_activity=self._master_activity,
             rows=tuple(rows),
             queue_depth=self.queue.depth,
             waiting=self.queue.waiting,
+            head_escalation_id=head.escalation_id if head else None,
         )
 
     def _badges_by_session(self) -> dict[str, tuple[Attention, ...]]:

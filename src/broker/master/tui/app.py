@@ -86,7 +86,7 @@ class BrokerMasterApp(App[None]):
         self._latest_view: FleetView | None = None
         self._focus_session: str | None = None
         self._focus_kind: Attention | None = None
-        self._escalations: dict[str, str] = {}
+        self._head: EscalationArrived | PermissionEscalationArrived | None = None
         self._proposals: dict[str, str] = {}
         self.runtime = MasterRuntime(
             self._emit, registry, queue, cfg, anchor_pane=anchor_pane
@@ -268,13 +268,14 @@ class BrokerMasterApp(App[None]):
             self._event_line(
                 f"escalation {event.escalation_id} from {event.session_id}"
             )
-            self._escalations[event.session_id] = event.rendered
+            self._head = event
         elif isinstance(event, PermissionEscalationArrived):
             self._chat_block(event.rendered)
             self._event_line(
                 f"permission escalation {event.escalation_id} from "
                 f"{event.session_id}"
             )
+            self._head = event
         elif isinstance(event, ProposalArrived):
             self._chat_block(event.rendered)
             self._event_line(
@@ -297,21 +298,23 @@ class BrokerMasterApp(App[None]):
     def _enter_escalation(self) -> None:
         """Focus the head escalation's disclosure, if one is waiting."""
         view = self._latest_view
-        row = (
-            next((r for r in view.rows if Attention.ESCALATION in r.badges), None)
-            if view
-            else None
-        )
-        if row is None:
+        head_id = view.head_escalation_id if view else None
+        if head_id is None:
             self._event_line("no escalation is waiting")
             return
-        rendered = self._escalations.get(row.session_id)
-        if rendered is None:
+        head = self._head
+        if head is None or head.escalation_id != head_id:
             self._event_line("escalation disclosure not yet received")
             return
-        self._focus_session, self._focus_kind = row.session_id, Attention.ESCALATION
+        if isinstance(head, PermissionEscalationArrived):
+            self._event_line(
+                f"the waiting request is a permission prompt in session "
+                f"{head.session_id} — answer it in its pane"
+            )
+            return
+        self._focus_session, self._focus_kind = head.session_id, Attention.ESCALATION
         self.query_one("#surface", FocusedSurface).show(
-            f"Session broker · {row.session_id}", rendered
+            f"Session broker · {head.session_id}", head.rendered
         )
         self._set_mode(surface=True)
 
