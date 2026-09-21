@@ -454,7 +454,7 @@ async def test_slash_escalation_with_nothing_waiting_stays_on_chat(
 PROPOSAL_RENDERED = "Prompt proposal p1 — session s1\n\n## Proposed prompt\nverbatim [text]"
 
 
-async def test_slash_approve_focuses_the_single_proposal(home: Path) -> None:
+async def test_slash_proposal_focuses_the_single_proposal(home: Path) -> None:
     app = make_app(home, GatedLLM())
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
@@ -467,7 +467,7 @@ async def test_slash_approve_focuses_the_single_proposal(home: Path) -> None:
         await pilot.pause()
         box = app.query_one("#box", PromptArea)
         box.focus()
-        box.text = "/approve"
+        box.text = "/proposal"
         await pilot.press("enter")
         await pilot.pause()
         assert app.query_one("#chat", VerticalScroll).display is False
@@ -478,7 +478,7 @@ async def test_slash_approve_focuses_the_single_proposal(home: Path) -> None:
         assert box.disabled is False  # no worker ran for a slash command
 
 
-async def test_slash_approve_disambiguates_between_multiple_proposals(
+async def test_slash_proposal_disambiguates_between_multiple_proposals(
     home: Path,
 ) -> None:
     app = make_app(home, GatedLLM())
@@ -505,15 +505,15 @@ async def test_slash_approve_disambiguates_between_multiple_proposals(
         await pilot.pause()
         box = app.query_one("#box", PromptArea)
         box.focus()
-        box.text = "/approve"
+        box.text = "/proposal"
         await pilot.press("enter")
         await pilot.pause()
         assert app.query_one("#surface", FocusedSurface).display is False
         assert (
-            "no single proposal to approve — use /approve sN" in _events_text(app)
+            "no single proposal to focus — use /proposal sN" in _events_text(app)
         )
         box.focus()
-        box.text = "/approve s2"
+        box.text = "/proposal s2"
         await pilot.press("enter")
         await pilot.pause()
         assert app.query_one("#surface", FocusedSurface).display is True
@@ -537,7 +537,7 @@ async def test_typing_approve_in_the_proposal_surface_runs_the_llm_worker(
         await pilot.pause()
         box = app.query_one("#box", PromptArea)
         box.focus()
-        box.text = "/approve"
+        box.text = "/proposal"
         await pilot.press("enter")
         await pilot.pause()
         assert app.query_one("#surface", FocusedSurface).display is True
@@ -568,7 +568,7 @@ async def test_fleet_updated_auto_exits_the_proposal_surface_when_badge_clears(
         await pilot.pause()
         box = app.query_one("#box", PromptArea)
         box.focus()
-        box.text = "/approve"
+        box.text = "/proposal"
         await pilot.press("enter")
         await pilot.pause()
         assert app.query_one("#surface", FocusedSurface).display is True

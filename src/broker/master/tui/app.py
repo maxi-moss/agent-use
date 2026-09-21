@@ -152,8 +152,8 @@ class BrokerMasterApp(App[None]):
         if text == "/escalation":
             self._enter_escalation()
             return
-        if text == "/approve" or text.startswith("/approve "):
-            self._enter_proposal(text[len("/approve"):].strip() or None)
+        if text == "/proposal" or text.startswith("/proposal "):
+            self._enter_proposal(text[len("/proposal"):].strip() or None)
             return
         box.disabled = True
         self._chat_block(text, role="user", label="you")
@@ -331,7 +331,7 @@ class BrokerMasterApp(App[None]):
         )
         if row is None:
             self._event_line(
-                "no single proposal to approve — use /approve sN"
+                "no single proposal to focus — use /proposal sN"
                 if rows
                 else "no proposal is waiting"
             )
