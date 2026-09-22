@@ -1301,11 +1301,16 @@ async def test_completion_notifies_done(
     rt: tuple[MasterRuntime, list[Any]], recording_run: RecordingRun
 ) -> None:
     runtime, posts = rt
-    resp = await send(runtime, T_COMPLETION, {"summary": "did the thing"})
+    resp = await send(
+        runtime,
+        T_COMPLETION,
+        {"headline": "Recovered the session", "supporting": "budget survived"},
+    )
     assert resp.ok
     arrived = [m for m in posts if isinstance(m, CompletionArrived)]
     assert len(arrived) == 1
-    assert arrived[0].summary == "did the thing"  # verbatim
+    assert arrived[0].headline == "Recovered the session"  # verbatim
+    assert arrived[0].supporting == "budget survived"
     notify_calls = [
         c for c in recording_run.calls if c[1:3] == ["notification", "show"]
     ]
@@ -1417,7 +1422,9 @@ async def test_every_broker_message_type_is_acked(
         )
     ).ok
     assert (await send(runtime, T_BUDGET_UPDATE, {"count": 1})).ok
-    assert (await send(runtime, T_COMPLETION, {"summary": "s"})).ok
+    assert (
+        await send(runtime, T_COMPLETION, {"headline": "h", "supporting": "s"})
+    ).ok
     assert (
         await send(
             runtime, T_FATAL_ERROR, {"error_class": "X", "detail": "d"}
@@ -2015,7 +2022,9 @@ async def test_absorbing_state_ignores_late_pushes(
     rt: tuple[MasterRuntime, list[Any]], home: Path
 ) -> None:
     runtime, _ = rt
-    assert (await send(runtime, T_COMPLETION, {"summary": "done"})).ok
+    assert (
+        await send(runtime, T_COMPLETION, {"headline": "done", "supporting": "s"})
+    ).ok
     assert runtime.registry.get("s1").state == "completed"
     # A stale in-flight push carrying an older state arrives late: it must
     # not resurrect the settled session — but it is still ACKed.

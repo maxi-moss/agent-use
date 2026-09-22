@@ -281,7 +281,8 @@ class BrokerMasterApp(App[None]):
             )
         elif isinstance(event, CompletionArrived):
             self._chat_block(
-                f"Session {event.session_id} completed:\n{event.summary}"
+                f"Session {event.session_id} completed:\n"
+                f"{event.headline}\n{event.supporting}"
             )
             self._event_line(f"{event.session_id} completed")
         elif isinstance(event, Notice):

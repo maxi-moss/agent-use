@@ -534,9 +534,9 @@ class MasterRuntime:
         if env.type == T_COMPLETION:
             p = CompletionPayload.model_validate(env.payload)
             self._set_state(name, SessionState.COMPLETED)
-            self.emit(CompletionArrived(name, p.summary))
+            self.emit(CompletionArrived(name, p.headline, p.supporting))
             await self._notify(
-                notifier.notify_done, f"Session {name} complete", p.summary
+                notifier.notify_done, f"Session {name} complete", p.headline
             )
             return self._ack(env, ok=True)
         if env.type == T_SESSION_ENDED:
