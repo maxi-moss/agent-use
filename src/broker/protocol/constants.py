@@ -21,7 +21,8 @@ T_SHUTDOWN = "shutdown"
 T_APPROVE_PROMPT = "approve_prompt"  # master -> broker
 T_REACTIVATE = "reactivate"  # master -> broker
 T_ASK_QUESTION = "ask_question"
-T_CLARIFY_ESCALATION = "clarify_escalation"  # master -> broker: read-only question about a live escalation
+# master -> broker: read-only question about a live escalation
+T_CLARIFY_ESCALATION = "clarify_escalation"
 
 # Master-socket message types
 T_ESCALATION = "escalation"
@@ -29,7 +30,8 @@ T_PERMISSION_ESCALATION = "permission_escalation"
 T_COMPLETION = "completion"
 T_FATAL_ERROR = "fatal_error"
 T_ESCALATION_RETRACT = "escalation_retract"  # broker -> master: resolved out of band
-T_PERMISSION_RETRACT = "permission_retract"  # permission module -> master: prompt is gone
+# permission module -> master: prompt is gone
+T_PERMISSION_RETRACT = "permission_retract"
 T_PROMPT_PROPOSAL = "prompt_proposal"  # broker -> master
 T_BUDGET_UPDATE = "budget_update"  # broker -> master
 T_DECISION_DELIVERED = "decision_delivered"  # broker -> master

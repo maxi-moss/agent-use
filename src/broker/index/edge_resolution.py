@@ -90,17 +90,23 @@ class _Resolver:
         # Bases first: self/this resolution walks the class hierarchy.
         for ref in ordered:
             if ref.kind is RefKind.BASE:
-                target = self._resolve(ref.source, ref.target, _TYPE_TARGETS, hierarchy=False)
+                target = self._resolve(
+                    ref.source, ref.target, _TYPE_TARGETS, hierarchy=False
+                )
                 if target is not None:
                     found.add((ref.source, target, EdgeKind.INHERITS))
                     self._bases[ref.source].append(target)
         for ref in ordered:
             if ref.kind is RefKind.CALL:
-                target = self._resolve(ref.source, ref.target, _CALL_TARGETS, hierarchy=True)
+                target = self._resolve(
+                    ref.source, ref.target, _CALL_TARGETS, hierarchy=True
+                )
                 if target is not None:
                     found.add((ref.source, target, EdgeKind.CALLS))
             elif ref.kind is RefKind.TYPE:
-                target = self._resolve(ref.source, ref.target, _TYPE_TARGETS, hierarchy=False)
+                target = self._resolve(
+                    ref.source, ref.target, _TYPE_TARGETS, hierarchy=False
+                )
                 if target is not None:
                     found.add((ref.source, target, EdgeKind.REFERENCES_TYPE))
         for imp in self._imports.values():
@@ -110,7 +116,11 @@ class _Resolver:
         for symbol in self._by_qname.values():
             if symbol.scope:
                 found.add(
-                    (f"{symbol.path}::{symbol.scope}", symbol.qualified_name, EdgeKind.DEFINES)
+                    (
+                        f"{symbol.path}::{symbol.scope}",
+                        symbol.qualified_name,
+                        EdgeKind.DEFINES,
+                    )
                 )
         return [Edge(source=s, target=t, kind=k) for s, t, k in sorted(found)]
 
@@ -166,7 +176,11 @@ class _Resolver:
     def _via_import(self, imp: Import, rest: list[str]) -> str | None:
         """Resolve an import binding plus a trailing member-access chain to a symbol or module."""
         if self._languages.get(imp.path) == _PYTHON:
-            dotted = imp.module.split(".") + ([imp.imported_name] if imp.imported_name else []) + rest
+            dotted = (
+                imp.module.split(".")
+                + ([imp.imported_name] if imp.imported_name else [])
+                + rest
+            )
             for cut in range(len(dotted), 0, -1):
                 paths = self._modules.get(".".join(dotted[:cut]), [])
                 if len(paths) != 1:
@@ -180,7 +194,9 @@ class _Resolver:
         module_path = self._ecma_module_path(imp.module)
         if module_path is None:
             return None
-        chain = ([imp.imported_name] if imp.imported_name not in ("", "default") else []) + rest
+        chain = (
+            [imp.imported_name] if imp.imported_name not in ("", "default") else []
+        ) + rest
         if not chain:
             return module_path
         candidate = f"{module_path}::{'.'.join(chain)}"

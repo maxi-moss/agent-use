@@ -512,6 +512,7 @@ class MasterRuntime:
 
     async def _repopulate_from_brokers(self) -> None:
         """Refresh state, task-activity and any pending proposal from each surviving broker."""
+
         for name in sorted(self.registry.records, key=session_sort_key):
             if self.registry.records[name].state in _ABSORBING:
                 continue

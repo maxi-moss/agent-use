@@ -216,7 +216,8 @@ async def call_tool(
         raise PermissionCallError(f"{type(exc).__name__}: {exc}") from exc
     if response.stop_reason == "refusal":
         raise PermissionCallError(
-            f"model refused (stop_reason=refusal, request={response._request_id})"  # pyright: ignore[reportPrivateUsage]
+            "model refused (stop_reason=refusal, "
+            f"request={response._request_id})"  # pyright: ignore[reportPrivateUsage]
         )
     if response.stop_reason != "tool_use":
         raise PermissionCallError(

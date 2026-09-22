@@ -34,9 +34,16 @@ CFG = BrokerConfig(broker_home=Path("/private/tmp/unused"))
 CONTEXT = GroundingContext(
     symbols=[
         ContextSymbol(
-            qualified_name="src/x.py::do_it", path="src/x.py", kind=SymbolKind.FUNCTION,
-            start_line=1, end_line=3, signature="def do_it() -> None:", fields=[], methods=[],
-            score=0.7, rank=0.7,
+            qualified_name="src/x.py::do_it",
+            path="src/x.py",
+            kind=SymbolKind.FUNCTION,
+            start_line=1,
+            end_line=3,
+            signature="def do_it() -> None:",
+            fields=[],
+            methods=[],
+            score=0.7,
+            rank=0.7,
         )
     ],
     edges=[],
@@ -206,10 +213,14 @@ def test_exactly_two_cache_breakpoints() -> None:
     assert "cache_control" in content[1]
 
 
-async def test_ground_intent_orders_intent_claude_md_relevant_code(tmp_path: Path) -> None:
+async def test_ground_intent_orders_intent_claude_md_relevant_code(
+    tmp_path: Path,
+) -> None:
     (tmp_path / "CLAUDE.md").write_text("# Rules\nUse uv.\n")
     fake = FakeLLM(
-        ToolCall(name="propose_prompt", input={"reasoning": "r", "prompt": "Add the page."})
+        ToolCall(
+            name="propose_prompt", input={"reasoning": "r", "prompt": "Add the page."}
+        )
     )
     retriever = FakeRetriever()
     result = await ground_intent(
@@ -222,13 +233,19 @@ async def test_ground_intent_orders_intent_claude_md_relevant_code(tmp_path: Pat
     sent = cast(str, fake.calls[0]["messages"][0]["content"])
     intent_at = sent.index("# Developer intent (verbatim)\nadd a page THE-RAW-INTENT")
     claude_at = sent.index("# The codebase's CLAUDE.md\n# Rules\nUse uv.")
-    code_at = sent.index("# Relevant code\n\n## src/x.py\n### do_it (function, seed, lines 1-3)")
+    code_at = sent.index(
+        "# Relevant code\n\n## src/x.py\n### do_it (function, seed, lines 1-3)"
+    )
     assert intent_at < claude_at < code_at
     assert "# Tracked files" not in sent
 
 
-async def test_ground_intent_without_claude_md_still_sends_relevant_code(tmp_path: Path) -> None:
-    fake = FakeLLM(ToolCall(name="propose_prompt", input={"reasoning": "r", "prompt": "p"}))
+async def test_ground_intent_without_claude_md_still_sends_relevant_code(
+    tmp_path: Path,
+) -> None:
+    fake = FakeLLM(
+        ToolCall(name="propose_prompt", input={"reasoning": "r", "prompt": "p"})
+    )
     await ground_intent(fake, CFG, retrieve=FakeRetriever(), intent="x", cwd=tmp_path)
     sent = cast(str, fake.calls[0]["messages"][0]["content"])
     assert "# The codebase's CLAUDE.md" not in sent
@@ -240,7 +257,9 @@ async def test_ground_intent_retrieval_failure_propagates(tmp_path: Path) -> Non
         async def __call__(self, intent: str, cwd: Path) -> GroundingContext:
             raise RetrievalError("no code index")
 
-    fake = FakeLLM(ToolCall(name="propose_prompt", input={"reasoning": "r", "prompt": "p"}))
+    fake = FakeLLM(
+        ToolCall(name="propose_prompt", input={"reasoning": "r", "prompt": "p"})
+    )
     with pytest.raises(RetrievalError):
         await ground_intent(fake, CFG, retrieve=Failing(), intent="x", cwd=tmp_path)
     assert fake.calls == []  # the LLM is never called without retrieval
@@ -249,4 +268,6 @@ async def test_ground_intent_retrieval_failure_propagates(tmp_path: Path) -> Non
 async def test_ground_intent_wrong_tool_raises(tmp_path: Path) -> None:
     fake = FakeLLM(ToolCall(name="answer", input={"reasoning": "r", "answer": "a"}))
     with pytest.raises(LLMCallError):
-        await ground_intent(fake, CFG, retrieve=FakeRetriever(), intent="x", cwd=tmp_path)
+        await ground_intent(
+            fake, CFG, retrieve=FakeRetriever(), intent="x", cwd=tmp_path
+        )

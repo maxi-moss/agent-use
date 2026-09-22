@@ -29,7 +29,13 @@ class FixedEmbedder:
 
 def sym(path: str, scope: str, name: str, kind: SymbolKind, sig: str) -> Symbol:
     return Symbol(
-        path=path, scope=scope, name=name, kind=kind, start_line=1, end_line=2, signature=sig
+        path=path,
+        scope=scope,
+        name=name,
+        kind=kind,
+        start_line=1,
+        end_line=2,
+        signature=sig,
     )
 
 
@@ -41,8 +47,20 @@ def build_index(db: Path) -> None:
             path="a.py",
             symbols=[
                 sym("a.py", "", "Service", SymbolKind.CLASS, "class Service(Base):"),
-                sym("a.py", "Service", "send", SymbolKind.METHOD, "def send(self) -> None:"),
-                sym("a.py", "Service", "other", SymbolKind.METHOD, "def other(self) -> None:"),
+                sym(
+                    "a.py",
+                    "Service",
+                    "send",
+                    SymbolKind.METHOD,
+                    "def send(self) -> None:",
+                ),
+                sym(
+                    "a.py",
+                    "Service",
+                    "other",
+                    SymbolKind.METHOD,
+                    "def other(self) -> None:",
+                ),
                 sym("a.py", "", "Base", SymbolKind.CLASS, "class Base:"),
             ],
             references=[],
@@ -56,7 +74,13 @@ def build_index(db: Path) -> None:
             path="b.py",
             symbols=[
                 sym("b.py", "", "make", SymbolKind.FUNCTION, "def make() -> Service:"),
-                sym("b.py", "", "unrelated", SymbolKind.FUNCTION, "def unrelated() -> None:"),
+                sym(
+                    "b.py",
+                    "",
+                    "unrelated",
+                    SymbolKind.FUNCTION,
+                    "def unrelated() -> None:",
+                ),
             ],
             references=[],
             imports=[],
@@ -66,12 +90,28 @@ def build_index(db: Path) -> None:
     )
     store.replace_edges(
         [
-            Edge(source="a.py::Service", target="a.py::Service.send", kind=EdgeKind.DEFINES),
-            Edge(source="a.py::Service", target="a.py::Service.other", kind=EdgeKind.DEFINES),
+            Edge(
+                source="a.py::Service",
+                target="a.py::Service.send",
+                kind=EdgeKind.DEFINES,
+            ),
+            Edge(
+                source="a.py::Service",
+                target="a.py::Service.other",
+                kind=EdgeKind.DEFINES,
+            ),
             Edge(source="a.py::Service", target="a.py::Base", kind=EdgeKind.INHERITS),
             Edge(source="b.py::make", target="a.py::Service", kind=EdgeKind.CALLS),
-            Edge(source="b.py::make", target="a.py::Service", kind=EdgeKind.REFERENCES_TYPE),
-            Edge(source="a.py::Service.send", target="b.py::unrelated", kind=EdgeKind.CALLS),
+            Edge(
+                source="b.py::make",
+                target="a.py::Service",
+                kind=EdgeKind.REFERENCES_TYPE,
+            ),
+            Edge(
+                source="a.py::Service.send",
+                target="b.py::unrelated",
+                kind=EdgeKind.CALLS,
+            ),
             Edge(source="a.py", target="b.py::make", kind=EdgeKind.IMPORTS),
         ]
     )
@@ -88,11 +128,16 @@ def build_index(db: Path) -> None:
     store.close()
 
 
-async def test_seeds_are_pure_top_k_and_expansion_follows_hop_rules(tmp_path: Path) -> None:
+async def test_seeds_are_pure_top_k_and_expansion_follows_hop_rules(
+    tmp_path: Path,
+) -> None:
     db = tmp_path / "index.sqlite"
     build_index(db)
     ctx = await retrieve(
-        "send a message", Path("/repo"), index_path=db, embedder=FixedEmbedder([1.0, 0.0, 0.0])
+        "send a message",
+        Path("/repo"),
+        index_path=db,
+        embedder=FixedEmbedder([1.0, 0.0, 0.0]),
     )
     seeds = [s for s in ctx.symbols if s.score is not None]
     assert [s.qualified_name for s in seeds] == [

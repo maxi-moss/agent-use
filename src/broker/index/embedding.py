@@ -82,5 +82,6 @@ class OpenAIEmbedder:
                 f"expected {len(texts)} embeddings, got {len(response.data)}"
             )
         return [
-            item.embedding for item in sorted(response.data, key=lambda item: item.index)
+            item.embedding
+            for item in sorted(response.data, key=lambda item: item.index)
         ]

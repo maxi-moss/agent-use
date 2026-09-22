@@ -8,8 +8,18 @@ from broker.decision_log import DecisionKind, append, read_rows, render_log
 
 def test_append_render_round_trip(tmp_path: Path) -> None:
     log = tmp_path / "sessions" / "s1" / "decisions.ndjson"
-    append(log, kind=DecisionKind.ANSWERED, reasoning="grounded in CLAUDE.md", detail="use uv")
-    append(log, kind=DecisionKind.ESCALATION_RAISED, reasoning="irreversible", detail="drop col")
+    append(
+        log,
+        kind=DecisionKind.ANSWERED,
+        reasoning="grounded in CLAUDE.md",
+        detail="use uv",
+    )
+    append(
+        log,
+        kind=DecisionKind.ESCALATION_RAISED,
+        reasoning="irreversible",
+        detail="drop col",
+    )
     lines = log.read_text().splitlines()
     assert len(lines) == 2
     first = json.loads(lines[0])

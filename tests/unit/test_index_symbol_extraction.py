@@ -181,9 +181,12 @@ def test_typescript_types_and_abstract_members() -> None:
     assert refs(anthropic, "src/providers/anthropic.ts::AnthropicProvider") == {
         (RefKind.BASE, "Provider"),
     }
-    assert refs(anthropic, "src/providers/anthropic.ts::AnthropicProvider.complete") == {
+    assert refs(
+        anthropic, "src/providers/anthropic.ts::AnthropicProvider.complete"
+    ) == {
         (RefKind.CALL, "this.call"),
-        (RefKind.TYPE, "Promise"),  # generic_type → type_identifier; `string` is predefined_type
+        # generic_type → type_identifier; `string` is predefined_type
+        (RefKind.TYPE, "Promise"),
     }
     factory = extract(TS_REPO, "src/providers/factory.ts", TYPESCRIPT)
     assert (RefKind.CALL, "AnthropicProvider") in refs(

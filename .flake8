@@ -3,3 +3,9 @@ max-line-length = 88
 ignore = W293, W291, W292, E501, W503
 # tests/fixtures holds sample repos parsed by tests, not code
 exclude = .venv,tests/fixtures
+
+# BLL501 is E501 with docstring lines exempt
+[flake8:local-plugins]
+extension =
+    BLL = line_length:LineLength
+paths = ./scripts/flake8

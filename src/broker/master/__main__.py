@@ -27,7 +27,10 @@ from broker.herdr import driver
 from broker.paths import BrokerPaths
 from broker.llm import build_client
 from broker.master.llm import bind_call_turn
-from broker.master.permission_escalations import PermissionEscalations, PermissionStoreError
+from broker.master.permission_escalations import (
+    PermissionEscalations,
+    PermissionStoreError,
+)
 from broker.master.queue import EscalationQueue, QueueError
 from broker.master.registry import Registry
 from broker.master.runtime import reconcile_registry

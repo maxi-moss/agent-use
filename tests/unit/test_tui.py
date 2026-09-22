@@ -629,7 +629,11 @@ async def test_slash_outcome_opens_modal_from_the_decision_log(home: Path) -> No
     )
     log = app.runtime.paths.session_decisions("s1")
     decision_log.append(
-        log, kind=DecisionKind.ANSWERED, reasoning="r", detail="use uv", task_summary="Chose uv"
+        log,
+        kind=DecisionKind.ANSWERED,
+        reasoning="r",
+        detail="use uv",
+        task_summary="Chose uv",
     )
     decision_log.append(
         log,
@@ -641,10 +645,18 @@ async def test_slash_outcome_opens_modal_from_the_decision_log(home: Path) -> No
         what_was_asked="drop users.legacy?",
     )
     decision_log.append(
-        log, kind=DecisionKind.DISPATCHED, reasoning="d", detail="yes, drop it", escalation_id="e1"
+        log,
+        kind=DecisionKind.DISPATCHED,
+        reasoning="d",
+        detail="yes, drop it",
+        escalation_id="e1",
     )
     decision_log.append(
-        log, kind=DecisionKind.ANSWERED, reasoning="r", detail="dropped", task_summary="Dropped it"
+        log,
+        kind=DecisionKind.ANSWERED,
+        reasoning="r",
+        detail="dropped",
+        task_summary="Dropped it",
     )
     decision_log.append(
         log,
