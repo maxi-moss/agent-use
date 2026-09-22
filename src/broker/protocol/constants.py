@@ -18,7 +18,6 @@ T_STATUS = "status"
 T_GET_DECISION_LOG = "get_decision_log"
 T_GET_PERMISSION_LOG = "get_permission_log"
 T_SHUTDOWN = "shutdown"
-T_RESPONSE = "response"
 T_APPROVE_PROMPT = "approve_prompt"  # master -> broker
 T_REACTIVATE = "reactivate"  # master -> broker
 T_ASK_QUESTION = "ask_question"
