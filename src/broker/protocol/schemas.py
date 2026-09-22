@@ -132,6 +132,26 @@ class DecisionLogPayload(BaseModel):
     text: str
 
 
+class RetrievedSymbol(BaseModel):
+    """One symbol grounding retrieval surfaced, for the developer to judge."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str  # path::Scope.name
+    score: float | None = None  # cosine similarity for seeds; None for expansion nodes
+
+
+class PromptProposalPayload(BaseModel):
+    """broker -> master: grounded prompt awaiting developer approval."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    proposal_id: str
+    proposed_prompt: str
+    grounding_summary: str
+    retrieved: list[RetrievedSymbol] = Field(default_factory=list[RetrievedSymbol])
+
+
 class StatusPayload(BaseModel):
     """broker -> master reply payload for the attach/liveness probe."""
 
@@ -143,6 +163,7 @@ class StatusPayload(BaseModel):
     transcript_path: str | None = None
     permission_prompt: bool = False
     task_activity: str = ""
+    pending_proposal: PromptProposalPayload | None = None
 
 
 class ClarifyEscalationRequestPayload(BaseModel):
@@ -251,26 +272,6 @@ class RetractPayload(BaseModel):
 
     escalation_id: str
     reason: str
-
-
-class RetrievedSymbol(BaseModel):
-    """One symbol grounding retrieval surfaced, for the developer to judge."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    name: str  # path::Scope.name
-    score: float | None = None  # cosine similarity for seeds; None for expansion nodes
-
-
-class PromptProposalPayload(BaseModel):
-    """broker -> master: grounded prompt awaiting developer approval."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    proposal_id: str
-    proposed_prompt: str
-    grounding_summary: str
-    retrieved: list[RetrievedSymbol] = Field(default_factory=list[RetrievedSymbol])
 
 
 class ApprovePromptPayload(BaseModel):
