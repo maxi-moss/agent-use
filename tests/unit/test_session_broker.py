@@ -85,6 +85,7 @@ ANSWER_RESULT = ToolCall(
         "reasoning": "grounded",
         "answer": "use oauth",
         "task_activity": "wiring up oauth",
+        "task_summary": "Chose oauth",
     },
 )
 COLOR_TOOL_INPUT: dict[str, Any] = {
@@ -126,6 +127,7 @@ ESCALATE_RESULT = ToolCall(
     name="escalate",
     input={
         "reasoning": "plan looks wrong",
+        "task_summary": "Questioned a stale plan",
         "situation": "the plan contradicts the code",
         "what_was_asked": "how to proceed",
         "what_is_at_stake": "architecture drift",
@@ -587,8 +589,10 @@ async def complete(h: Harness) -> None:
             name="complete",
             input={
                 "reasoning": "task finished",
-                "summary": "shipped it",
+                "headline": "shipped it",
+                "supporting": "all tests pass",
                 "task_activity": "wrapping up",
+                "task_summary": "Shipped the change",
             },
         )
     )

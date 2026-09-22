@@ -263,11 +263,12 @@ class PermissionLogPayload(BaseModel):
 
 
 class CompletionPayload(BaseModel):
-    """broker -> master completion notice with summary."""
+    """broker -> master completion notice: split outcome for the modal and chat."""
 
     model_config = ConfigDict(extra="ignore")
 
-    summary: str
+    headline: str
+    supporting: str
 
 
 class FatalErrorPayload(BaseModel):

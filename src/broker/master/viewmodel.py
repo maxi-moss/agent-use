@@ -89,7 +89,8 @@ class ProposalArrived:
 @dataclass(frozen=True, slots=True)
 class CompletionArrived:
     session_id: str
-    summary: str
+    headline: str
+    supporting: str
 
 
 @dataclass(frozen=True, slots=True)
