@@ -77,6 +77,7 @@ async def retrieve(
 
 def _neighbor(edge: Edge, seeds: dict[str, float]) -> str | None:
     """The node ``edge`` pulls into the neighbourhood of a seed, per the design's hop rules."""
+
     if edge.kind is EdgeKind.CALLS:
         if edge.source in seeds:
             return edge.target
@@ -126,6 +127,8 @@ def _expand(store: IndexStore, seeds: dict[str, float]) -> GroundingContext:
     seed_paths = sorted({symbols[q].path for q in seeds if q in symbols})
     return GroundingContext(
         symbols=context_symbols,
-        edges=[ContextEdge(source=e.source, target=e.target, kind=e.kind) for e in kept],
+        edges=[
+            ContextEdge(source=e.source, target=e.target, kind=e.kind) for e in kept
+        ],
         imports=store.import_edges(seed_paths),
     )

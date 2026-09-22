@@ -280,7 +280,9 @@ def agent_get(target: str, *, timeout_s: float) -> dict[str, Any]:
     unwrapped = _unwrap_result(_parse_json(stdout))
     if isinstance(unwrapped, dict):
         return cast(dict[str, Any], unwrapped)
-    raise HerdrError("unexpected_result", f"agent get returned {type(unwrapped).__name__}")
+    raise HerdrError(
+        "unexpected_result", f"agent get returned {type(unwrapped).__name__}"
+    )
 
 
 def agent_status(info: dict[str, Any]) -> str:

@@ -189,7 +189,9 @@ def test_missing_pane_id_marked_unmanaged(
     monkeypatch.setattr(driver, "pane_read", unexpected_pane_read)
     # Run through asyncio.run on a fresh loop, exactly as main() does before
     # the TUI builds its own.
-    warnings = asyncio.run(reconcile_registry(registry, _queue(home), _permissions(home)))
+    warnings = asyncio.run(
+        reconcile_registry(registry, _queue(home), _permissions(home))
+    )
     assert len(warnings) == 1
     # The probe-was-attempted failure would read "inconclusive" here, because
     # the inconclusive branch absorbs the AssertionError.

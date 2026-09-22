@@ -10,7 +10,9 @@ def _row(kind: DecisionKind, **fields: str) -> DecisionRow:
 
 
 def _build(state: SessionState, *rows: DecisionRow):
-    return build_outcome(session_id="s1", title="Attach recovery", state=state, rows=list(rows))
+    return build_outcome(
+        session_id="s1", title="Attach recovery", state=state, rows=list(rows)
+    )
 
 
 def _kinds_and_labels(history: tuple[OutcomeEvent, ...]) -> list[tuple[str, str]]:
@@ -35,7 +37,9 @@ def test_kept_actions_in_order_and_empty_summaries_skipped() -> None:
 def test_escalation_carries_reason_and_next_kept_action_as_solution() -> None:
     out = _build(
         SessionState.COMPLETED,
-        _row(DecisionKind.ESCALATION_RAISED, task_summary="Reason X", escalation_id="e1"),
+        _row(
+            DecisionKind.ESCALATION_RAISED, task_summary="Reason X", escalation_id="e1"
+        ),
         _row(DecisionKind.DISPATCHED, escalation_id="e1", detail="go with B"),
         _row(DecisionKind.ANSWERED, task_summary="Did Y"),
     )
@@ -52,7 +56,9 @@ def test_escalation_carries_reason_and_next_kept_action_as_solution() -> None:
 def test_escalation_without_follow_up_gets_fallback() -> None:
     out = _build(
         SessionState.STOPPED,
-        _row(DecisionKind.ESCALATION_RAISED, task_summary="Reason X", escalation_id="e1"),
+        _row(
+            DecisionKind.ESCALATION_RAISED, task_summary="Reason X", escalation_id="e1"
+        ),
     )
     assert out.history[0].resolution == "(no recorded follow-up)"
 
@@ -76,22 +82,36 @@ def test_developer_prompt_result_and_fallback() -> None:
 def test_completion_sets_headline_and_resolves_pending_escalation() -> None:
     out = _build(
         SessionState.COMPLETED,
-        _row(DecisionKind.ESCALATION_RAISED, task_summary="Asked about the schema", escalation_id="e1"),
+        _row(
+            DecisionKind.ESCALATION_RAISED,
+            task_summary="Asked about the schema",
+            escalation_id="e1",
+        ),
         _row(DecisionKind.DISPATCHED, escalation_id="e1"),
-        _row(DecisionKind.COMPLETED, headline="H", supporting="S", task_summary="Wrapped up"),
+        _row(
+            DecisionKind.COMPLETED,
+            headline="H",
+            supporting="S",
+            task_summary="Wrapped up",
+        ),
     )
     assert out.status == "completed"
     assert out.headline == "H"
     assert out.supporting == "S"
     assert out.history[0].resolution == "Wrapped up"
-    assert (out.history[-1].kind, out.history[-1].label) == ("terminal", "Task completed")
+    assert (out.history[-1].kind, out.history[-1].label) == (
+        "terminal",
+        "Task completed",
+    )
 
 
 def test_error_state_uses_last_fatal_row_and_keeps_history() -> None:
     out = _build(
         SessionState.ERROR,
         _row(DecisionKind.ANSWERED, task_summary="Started the migration"),
-        _row(DecisionKind.ERROR, reasoning="stale dispatch_decision ignored", detail="e9"),
+        _row(
+            DecisionKind.ERROR, reasoning="stale dispatch_decision ignored", detail="e9"
+        ),
         _row(DecisionKind.ERROR, reasoning="HerdrError", detail="pane vanished"),
     )
     assert out.status == "error"
@@ -120,10 +140,20 @@ def test_reactivated_session_renders_both_runs_with_divider() -> None:
     out = _build(
         SessionState.COMPLETED,
         _row(DecisionKind.ANSWERED, task_summary="A1"),
-        _row(DecisionKind.COMPLETED, headline="First done", supporting="S1", task_summary="A2"),
+        _row(
+            DecisionKind.COMPLETED,
+            headline="First done",
+            supporting="S1",
+            task_summary="A2",
+        ),
         _row(DecisionKind.REACTIVATED, detail="new intent"),
         _row(DecisionKind.ANSWERED, task_summary="B1"),
-        _row(DecisionKind.COMPLETED, headline="Second done", supporting="S2", task_summary="B2"),
+        _row(
+            DecisionKind.COMPLETED,
+            headline="Second done",
+            supporting="S2",
+            task_summary="B2",
+        ),
     )
     assert _kinds_and_labels(out.history) == [
         ("action", "A1"),

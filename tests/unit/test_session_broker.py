@@ -203,9 +203,16 @@ class FakeLLM:
 RETRIEVED_CONTEXT = GroundingContext(
     symbols=[
         ContextSymbol(
-            qualified_name="src/x.py::do_it", path="src/x.py", kind=SymbolKind.FUNCTION,
-            start_line=1, end_line=3, signature="def do_it() -> None:", fields=[], methods=[],
-            score=0.7, rank=0.7,
+            qualified_name="src/x.py::do_it",
+            path="src/x.py",
+            kind=SymbolKind.FUNCTION,
+            start_line=1,
+            end_line=3,
+            signature="def do_it() -> None:",
+            fields=[],
+            methods=[],
+            score=0.7,
+            rank=0.7,
         )
     ],
     edges=[],

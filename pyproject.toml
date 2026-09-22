@@ -34,7 +34,10 @@ include = ["src", "tests"]
 extraPaths = ["src"]
 venvPath = "."
 venv = ".venv"
-exclude = ["tests/fixtures"]  # sample repos parsed by tests, not code
+ignore = [
+    "tests/fixtures",  # sample repos parsed by tests, not code
+    "scripts/flake8",
+]
 
 [tool.pytest.ini_options]
 minversion = "8.0"

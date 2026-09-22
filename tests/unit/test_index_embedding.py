@@ -76,11 +76,15 @@ async def test_only_symbols_whose_text_changed_are_reembedded(tmp_path: Path) ->
     db = tmp_path / "index.sqlite"
     await index_repo(repo, db, FakeEmbedder())
     target = repo / "app" / "providers" / "anthropic.py"
-    target.write_text(target.read_text().replace("return prompt", "return prompt.strip()"))
+    target.write_text(
+        target.read_text().replace("return prompt", "return prompt.strip()")
+    )
     fake = FakeEmbedder()
     await index_repo(repo, db, fake)
     # only `_call`'s body changed; the class text (fields + method signatures) did not
-    assert fake.embedded_names() == {"app/providers/anthropic.py::AnthropicProvider._call"}
+    assert fake.embedded_names() == {
+        "app/providers/anthropic.py::AnthropicProvider._call"
+    }
 
 
 async def test_vanished_symbols_lose_their_embeddings(tmp_path: Path) -> None:
@@ -91,7 +95,9 @@ async def test_vanished_symbols_lose_their_embeddings(tmp_path: Path) -> None:
     await index_repo(repo, db, FakeEmbedder())
     store = IndexStore.open(db)
     try:
-        assert not any(q.startswith("app/settings.py::") for q, _ in store.load_vectors())
+        assert not any(
+            q.startswith("app/settings.py::") for q, _ in store.load_vectors()
+        )
     finally:
         store.close()
 

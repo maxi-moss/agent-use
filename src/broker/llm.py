@@ -176,7 +176,8 @@ async def _create(
         raise LLMCallError(f"{type(exc).__name__}: {exc}") from exc
     if response.stop_reason == "refusal":
         raise LLMCallError(
-            f"model refused (stop_reason=refusal, request={response._request_id})"  # pyright: ignore[reportPrivateUsage]
+            "model refused (stop_reason=refusal, "
+            f"request={response._request_id})"  # pyright: ignore[reportPrivateUsage]
         )
     return response
 

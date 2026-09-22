@@ -748,7 +748,9 @@ class SessionBroker:
             events = self._read_transcript()
         except Exception as exc:
             self._log(
-                DecisionKind.CLARIFY_FAILED, f"{type(exc).__name__}: {exc}", req.escalation_id
+                DecisionKind.CLARIFY_FAILED,
+                f"{type(exc).__name__}: {exc}",
+                req.escalation_id,
             )
             return Response(
                 id=env.id, ok=False, payload={"error": f"{type(exc).__name__}: {exc}"}
@@ -777,7 +779,9 @@ class SessionBroker:
             return resolved
         except Exception as exc:
             self._log(
-                DecisionKind.CLARIFY_FAILED, f"{type(exc).__name__}: {exc}", req.escalation_id
+                DecisionKind.CLARIFY_FAILED,
+                f"{type(exc).__name__}: {exc}",
+                req.escalation_id,
             )
             return Response(
                 id=env.id, ok=False, payload={"error": f"{type(exc).__name__}: {exc}"}
@@ -1090,7 +1094,9 @@ class SessionBroker:
                 {"headline": result.headline, "supporting": result.supporting},
             )
             self._set_state(SessionState.COMPLETED)  # stop driving; keep serving
-        elif isinstance(result, NoActionCall):  # pyright: ignore[reportUnnecessaryIsInstance]
+        elif isinstance(
+            result, NoActionCall  # pyright: ignore[reportUnnecessaryIsInstance]
+        ):
             self._log(DecisionKind.NO_ACTION, result.reasoning, "")
 
     def _new_escalation(
@@ -1265,7 +1271,9 @@ class SessionBroker:
             else None
         )
         if echoed == expected:
-            self._log(DecisionKind.ASK_VERIFIED, "PostToolUse echo matches", tool_use_id)
+            self._log(
+                DecisionKind.ASK_VERIFIED, "PostToolUse echo matches", tool_use_id
+            )
             return
         self.queue.put_nowait(
             lambda: self._ask_verify_failed(
@@ -1562,7 +1570,9 @@ class SessionBroker:
         Args:
             payload: The new task intent, grounded before anything is typed.
         """
-        self._log(DecisionKind.REACTIVATED, "new task in the same session", payload.intent)
+        self._log(
+            DecisionKind.REACTIVATED, "new task in the same session", payload.intent
+        )
         self._end_active_escalation()
         self.budget_count = 0
         await self._to_master(T_BUDGET_UPDATE, {"count": 0})

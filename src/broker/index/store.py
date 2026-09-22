@@ -137,7 +137,9 @@ class IndexStore:
         rows = self._conn.execute("SELECT path, language FROM files")
         return {row["path"]: row["language"] for row in rows}
 
-    def replace_file(self, extraction: FileExtraction, digest: str, language: str) -> None:
+    def replace_file(
+        self, extraction: FileExtraction, digest: str, language: str
+    ) -> None:
         """Replace everything stored for one file, atomically."""
         with self._conn:
             self._delete_path(extraction.path)
@@ -159,11 +161,18 @@ class IndexStore:
             )
             self._conn.executemany(
                 "INSERT INTO refs (path, source, kind, target) VALUES (?, ?, ?, ?)",
-                [(extraction.path, r.source, r.kind.value, r.target) for r in extraction.references],
+                [
+                    (extraction.path, r.source, r.kind.value, r.target)
+                    for r in extraction.references
+                ],
             )
             self._conn.executemany(
-                "INSERT INTO imports (path, local_name, module, imported_name) VALUES (?, ?, ?, ?)",
-                [(i.path, i.local_name, i.module, i.imported_name) for i in extraction.imports],
+                "INSERT INTO imports (path, local_name, module, imported_name) "
+                "VALUES (?, ?, ?, ?)",
+                [
+                    (i.path, i.local_name, i.module, i.imported_name)
+                    for i in extraction.imports
+                ],
             )
 
     def delete_file(self, path: str) -> None:
@@ -181,7 +190,8 @@ class IndexStore:
     def symbol_keys(self) -> list[SymbolKey]:
         """Return every symbol's identity, ordered by qualified name."""
         rows = self._conn.execute(
-            "SELECT qualified_name, path, scope, name, kind FROM symbols ORDER BY qualified_name"
+            "SELECT qualified_name, path, scope, name, kind FROM symbols "
+            "ORDER BY qualified_name"
         )
         return [
             SymbolKey(
@@ -200,7 +210,9 @@ class IndexStore:
             "SELECT source, kind, target FROM refs ORDER BY source, kind, target"
         )
         return [
-            Reference(source=row["source"], kind=RefKind(row["kind"]), target=row["target"])
+            Reference(
+                source=row["source"], kind=RefKind(row["kind"]), target=row["target"]
+            )
             for row in rows
         ]
 
@@ -257,14 +269,17 @@ class IndexStore:
         )
         return [_symbol_row(row) for row in rows]
 
-    def methods_of(self, class_qnames: Iterable[str]) -> dict[str, list[tuple[str, str]]]:
+    def methods_of(
+        self, class_qnames: Iterable[str]
+    ) -> dict[str, list[tuple[str, str]]]:
         """Map each class to its methods' ``(name, signature)`` in source order."""
         out: dict[str, list[tuple[str, str]]] = {}
         for qname in class_qnames:
             path, _, scope = qname.partition("::")
             rows = self._conn.execute(
                 "SELECT name, signature FROM symbols "
-                "WHERE kind = 'method' AND path = ? AND scope = ? ORDER BY start_line, name",
+                "WHERE kind = 'method' AND path = ? AND scope = ? "
+                "ORDER BY start_line, name",
                 (path, scope),
             )
             out[qname] = [(row["name"], row["signature"]) for row in rows]
@@ -281,7 +296,10 @@ class IndexStore:
             self._conn.executemany(
                 "INSERT OR REPLACE INTO embeddings (qualified_name, text_hash, vector) "
                 "VALUES (?, ?, ?)",
-                [(qname, digest, unit_vector(vector).tobytes()) for qname, digest, vector in items],
+                [
+                    (qname, digest, unit_vector(vector).tobytes())
+                    for qname, digest, vector in items
+                ],
             )
 
     def prune_embeddings(self) -> None:
@@ -312,7 +330,8 @@ class IndexStore:
         out: dict[str, Symbol] = {}
         for qname in names:
             row = self._conn.execute(
-                f"SELECT {_SYMBOL_COLUMNS} FROM symbols WHERE qualified_name = ?", (qname,)
+                f"SELECT {_SYMBOL_COLUMNS} FROM symbols WHERE qualified_name = ?",
+                (qname,),
             ).fetchone()
             if row is not None:
                 out[qname] = _symbol_row(row)
@@ -337,7 +356,8 @@ class IndexStore:
         out: dict[str, list[str]] = {}
         for path in paths:
             rows = self._conn.execute(
-                "SELECT target FROM edges WHERE kind = 'IMPORTS' AND source = ? ORDER BY target",
+                "SELECT target FROM edges WHERE kind = 'IMPORTS' AND source = ? "
+                "ORDER BY target",
                 (path,),
             )
             targets = [row["target"] for row in rows]

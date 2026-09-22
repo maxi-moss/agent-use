@@ -26,26 +26,63 @@ def cs(
 ) -> ContextSymbol:
     path = qname.split("::")[0]
     return ContextSymbol(
-        qualified_name=qname, path=path, kind=kind, start_line=10, end_line=20,
-        signature=sig, fields=fields or [], methods=methods or [], score=score, rank=rank,
+        qualified_name=qname,
+        path=path,
+        kind=kind,
+        start_line=10,
+        end_line=20,
+        signature=sig,
+        fields=fields or [],
+        methods=methods or [],
+        score=score,
+        rank=rank,
     )
 
 
 CONTEXT = GroundingContext(
     symbols=[
-        cs("a.py::Service.send", SymbolKind.METHOD, "def send(self) -> None:", score=0.9, rank=0.9),
-        cs("b.py::make", SymbolKind.FUNCTION, "@cached\ndef make() -> Service:", score=0.5, rank=0.5),
         cs(
-            "a.py::Service", SymbolKind.CLASS, "class Service(Base):", score=None, rank=0.9,
-            fields=["name: str"], methods=["send", "other"],
+            "a.py::Service.send",
+            SymbolKind.METHOD,
+            "def send(self) -> None:",
+            score=0.9,
+            rank=0.9,
         ),
-        cs("b.py::unrelated", SymbolKind.FUNCTION, "def unrelated() -> None:", score=None, rank=0.9),
+        cs(
+            "b.py::make",
+            SymbolKind.FUNCTION,
+            "@cached\ndef make() -> Service:",
+            score=0.5,
+            rank=0.5,
+        ),
+        cs(
+            "a.py::Service",
+            SymbolKind.CLASS,
+            "class Service(Base):",
+            score=None,
+            rank=0.9,
+            fields=["name: str"],
+            methods=["send", "other"],
+        ),
+        cs(
+            "b.py::unrelated",
+            SymbolKind.FUNCTION,
+            "def unrelated() -> None:",
+            score=None,
+            rank=0.9,
+        ),
     ],
     edges=[
-        ContextEdge(source="a.py::Service", target="a.py::Service.send", kind=EdgeKind.DEFINES),
-        ContextEdge(source="a.py::Service.send", target="b.py::unrelated", kind=EdgeKind.CALLS),
+        ContextEdge(
+            source="a.py::Service", target="a.py::Service.send", kind=EdgeKind.DEFINES
+        ),
+        ContextEdge(
+            source="a.py::Service.send", target="b.py::unrelated", kind=EdgeKind.CALLS
+        ),
         ContextEdge(source="b.py::make", target="a.py::Service", kind=EdgeKind.CALLS),
-        ContextEdge(source="a.py::Service", target="a.py::Base", kind=EdgeKind.INHERITS),
+        ContextEdge(
+            source="a.py::Service", target="a.py::Base", kind=EdgeKind.INHERITS
+        ),
     ],
     imports={"a.py": ["b.py::make"]},
 )
@@ -84,5 +121,8 @@ def test_budget_drops_lowest_ranked_expansion_and_never_seeds(
 ) -> None:
     monkeypatch.setattr(render, "BUDGET_CHARS", 1)
     trimmed = fit_to_budget(CONTEXT)
-    assert [s.qualified_name for s in trimmed.symbols] == ["a.py::Service.send", "b.py::make"]
+    assert [s.qualified_name for s in trimmed.symbols] == [
+        "a.py::Service.send",
+        "b.py::make",
+    ]
     assert trimmed.edges == CONTEXT.edges  # edges still name dropped neighbours

@@ -150,7 +150,9 @@ def _class(
             continue
         start = decorator_start if decorator_start is not None else member.start_byte
         decorator_start = None
-        _member(file, member, start, class_scope, class_qname, fields, child_symbol_ids, acc)
+        _member(
+            file, member, start, class_scope, class_qname, fields, child_symbol_ids, acc
+        )
     _merge(
         acc,
         Symbol(
@@ -191,7 +193,9 @@ def _member(
         name = name_of(inner, ("name",))
         if name is not None:
             child_symbol_ids.add(node.id)
-            _callable(file, node, inner, start, name, SymbolKind.METHOD, class_scope, acc)
+            _callable(
+                file, node, inner, start, name, SymbolKind.METHOD, class_scope, acc
+            )
     elif inner.type in spec.class_nodes:
         child_symbol_ids.add(node.id)
         _class(file, node, inner, start, class_scope, acc)
@@ -204,7 +208,9 @@ def _member(
         annotation = inner.child_by_field_name(type_field)
         if value is not None and value.type in spec.function_value_nodes:
             child_symbol_ids.add(node.id)
-            _callable(file, node, value, start, name, SymbolKind.METHOD, class_scope, acc)
+            _callable(
+                file, node, value, start, name, SymbolKind.METHOD, class_scope, acc
+            )
             return
         if annotation is None:
             if not spec.fields_require_annotation:
@@ -282,7 +288,9 @@ def _assigned_functions(
     if inner.type == spec.declarator_node:
         declarators = [inner]
     else:
-        declarators = [c for c in inner.named_children if c.type == spec.declarator_node]
+        declarators = [
+            c for c in inner.named_children if c.type == spec.declarator_node
+        ]
     for decl in declarators:
         name_node = decl.child_by_field_name(name_field)
         if name_node is None or name_node.type != "identifier":

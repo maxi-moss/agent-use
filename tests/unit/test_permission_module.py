@@ -277,7 +277,10 @@ async def test_second_escalation_supersedes_the_first(home: Path) -> None:
 
 async def test_slot_occupied_nack_is_routine(home: Path) -> None:
     master = StubMaster(
-        nack={"error": "an escalation is already live", "reason_code": NACK_SLOT_OCCUPIED}
+        nack={
+            "error": "an escalation is already live",
+            "reason_code": NACK_SLOT_OCCUPIED,
+        }
     )
     llm = FakeLLM(ESCALATE, ESCALATE_2)
     async with _module(home, llm, master=master) as (module, _, log):

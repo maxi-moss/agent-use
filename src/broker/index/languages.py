@@ -32,6 +32,7 @@ def node_text(node: Node) -> str:
 
 def dotted_name(node: Node, member_access_node: str) -> str | None:
     """Return ``a.b.c`` for an identifier or plain member-access chain, else ``None``."""
+
     if node.type not in ("identifier", member_access_node):
         return None
     text = node_text(node)

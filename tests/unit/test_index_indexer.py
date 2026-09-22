@@ -64,18 +64,36 @@ async def test_python_edges_resolve_across_files(tmp_path: Path) -> None:
     )
     expected = {
         # module import + attribute call
-        ("app/chat.py::ChatService.__init__", "app/providers/factory.py::create_provider", C),
+        (
+            "app/chat.py::ChatService.__init__",
+            "app/providers/factory.py::create_provider",
+            C,
+        ),
         # self.method on the enclosing class
         ("app/chat.py::ChatService.send", "app/chat.py::ChatService._prepare", C),
-        ("app/providers/anthropic.py::AnthropicProvider.complete",
-         "app/providers/anthropic.py::AnthropicProvider._call", C),
+        (
+            "app/providers/anthropic.py::AnthropicProvider.complete",
+            "app/providers/anthropic.py::AnthropicProvider._call",
+            C,
+        ),
         # relative import → base class
-        ("app/providers/anthropic.py::AnthropicProvider", "app/providers/base.py::Provider", I),
+        (
+            "app/providers/anthropic.py::AnthropicProvider",
+            "app/providers/base.py::Provider",
+            I,
+        ),
         # class instantiation through an absolute import
-        ("app/providers/factory.py::create_provider",
-         "app/providers/anthropic.py::AnthropicProvider", C),
+        (
+            "app/providers/factory.py::create_provider",
+            "app/providers/anthropic.py::AnthropicProvider",
+            C,
+        ),
         ("app/providers/factory.py::create_provider", "app/settings.py::Settings", T),
-        ("app/providers/factory.py::create_provider", "app/providers/base.py::Provider", T),
+        (
+            "app/providers/factory.py::create_provider",
+            "app/providers/base.py::Provider",
+            T,
+        ),
         # imports render per file
         ("app/chat.py", "app/providers/factory.py", M),
         ("app/chat.py", "app/settings.py::Settings", M),
@@ -99,12 +117,26 @@ async def test_typescript_and_javascript_edges(tmp_path: Path) -> None:
     edges = edge_set(db)
     C, I, M = EdgeKind.CALLS, EdgeKind.INHERITS, EdgeKind.IMPORTS
     expected = {
-        ("src/chat.ts::ChatService.constructor", "src/providers/factory.ts::createProvider", C),
-        ("src/providers/factory.ts::createProvider",
-         "src/providers/anthropic.ts::AnthropicProvider", C),
-        ("src/providers/anthropic.ts::AnthropicProvider", "src/providers/base.ts::Provider", I),
-        ("src/providers/anthropic.ts::AnthropicProvider.complete",
-         "src/providers/anthropic.ts::AnthropicProvider.call", C),
+        (
+            "src/chat.ts::ChatService.constructor",
+            "src/providers/factory.ts::createProvider",
+            C,
+        ),
+        (
+            "src/providers/factory.ts::createProvider",
+            "src/providers/anthropic.ts::AnthropicProvider",
+            C,
+        ),
+        (
+            "src/providers/anthropic.ts::AnthropicProvider",
+            "src/providers/base.ts::Provider",
+            I,
+        ),
+        (
+            "src/providers/anthropic.ts::AnthropicProvider.complete",
+            "src/providers/anthropic.ts::AnthropicProvider.call",
+            C,
+        ),
         # JS → TS relative import with extension probing
         ("src/index.js", "src/chat.ts::handleChat", M),
         ("src/index.js::main", "src/chat.ts::handleChat", C),
@@ -113,7 +145,9 @@ async def test_typescript_and_javascript_edges(tmp_path: Path) -> None:
     assert ("src/chat.ts::handleChat", "src/chat.ts::ChatService.send", C) not in edges
 
 
-async def test_unresolved_receivers_do_not_match_unique_method_names(tmp_path: Path) -> None:
+async def test_unresolved_receivers_do_not_match_unique_method_names(
+    tmp_path: Path,
+) -> None:
     repo = make_repo(tmp_path, "python_repo")
     (repo / "unrelated.py").write_text(
         "import os\n"
@@ -180,7 +214,9 @@ async def test_removed_file_drops_symbols_and_edges(tmp_path: Path) -> None:
     assert not any("app/settings.py" in t for _, t, _ in edges)
 
 
-async def test_unchanged_run_parses_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_unchanged_run_parses_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     repo = make_repo(tmp_path, "python_repo")
     db = tmp_path / "index.sqlite"
     await index_repo(repo, db, FakeEmbedder())

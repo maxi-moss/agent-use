@@ -107,7 +107,9 @@ def _batches(pending: list[_Pending]) -> list[list[_Pending]]:
     chars = 0
     for item in pending:
         size = len(item[2])
-        if current and (len(current) >= _BATCH_MAX_ITEMS or chars + size > _BATCH_MAX_CHARS):
+        if current and (
+            len(current) >= _BATCH_MAX_ITEMS or chars + size > _BATCH_MAX_CHARS
+        ):
             batches.append(current)
             current, chars = [], 0
         current.append(item)
@@ -121,7 +123,9 @@ async def _embed_changed(store: IndexStore, embedder: Embedder) -> int:
     """Embed every embeddable symbol whose text hash is new; return how many."""
     hashes = store.embedding_hashes()
     symbols = store.embeddable_symbols()
-    methods = store.methods_of(s.qualified_name for s in symbols if s.kind is SymbolKind.CLASS)
+    methods = store.methods_of(
+        s.qualified_name for s in symbols if s.kind is SymbolKind.CLASS
+    )
     pending: list[_Pending] = []
     for symbol in symbols:
         text = embedding_text(
@@ -133,9 +137,14 @@ async def _embed_changed(store: IndexStore, embedder: Embedder) -> int:
         pending.append((symbol.qualified_name, digest, text))
     embedded = 0
     for batch in _batches(pending):
-        vectors = await embedder.embed([text for _, _, text in batch], timeout_s=EMBED_BATCH_TIMEOUT_S)
+        vectors = await embedder.embed(
+            [text for _, _, text in batch], timeout_s=EMBED_BATCH_TIMEOUT_S
+        )
         store.store_embeddings(
-            [(qname, digest, vector) for (qname, digest, _), vector in zip(batch, vectors, strict=True)]
+            [
+                (qname, digest, vector)
+                for (qname, digest, _), vector in zip(batch, vectors, strict=True)
+            ]
         )
         embedded += len(batch)
         logger.info("embedded %d symbols", len(batch))
@@ -180,7 +189,10 @@ async def index_repo(repo: Path, db_path: Path, embedder: Embedder) -> IndexSumm
             store.delete_file(path)
             logger.info("removed %s", path)
         edges = resolve_edges(
-            store.symbol_keys(), store.references(), store.imports(), store.file_languages()
+            store.symbol_keys(),
+            store.references(),
+            store.imports(),
+            store.file_languages(),
         )
         store.replace_edges(edges)
         embedded = await _embed_changed(store, embedder)

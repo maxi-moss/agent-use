@@ -16,7 +16,10 @@ def fit_to_budget(context: GroundingContext) -> GroundingContext:
     Seeds are never dropped; a seeds-only block may exceed the budget.
     """
     kept = list(context.symbols)
-    while len(render_relevant_code(context.model_copy(update={"symbols": kept}))) > BUDGET_CHARS:
+    while (
+        len(render_relevant_code(context.model_copy(update={"symbols": kept})))
+        > BUDGET_CHARS
+    ):
         expansion = [i for i, s in enumerate(kept) if s.score is None]
         if not expansion:
             break
@@ -63,11 +66,15 @@ def _owner(qualified_name: str) -> str | None:
     return f"{path}::{inner.rsplit('.', 1)[0]}"
 
 
-def _symbol_lines(context: GroundingContext, symbol: ContextSymbol, indent: str) -> list[str]:
+def _symbol_lines(
+    context: GroundingContext, symbol: ContextSymbol, indent: str
+) -> list[str]:
     """Render one symbol's heading, signature and edge lines."""
     _, _, inner = symbol.qualified_name.partition("::")
     tag = symbol.kind.value + (", seed" if symbol.score is not None else "")
-    lines = [f"{indent}### {inner} ({tag}, lines {symbol.start_line}-{symbol.end_line})"]
+    lines = [
+        f"{indent}### {inner} ({tag}, lines {symbol.start_line}-{symbol.end_line})"
+    ]
     lines += [f"{indent}    {line}" for line in symbol.signature.splitlines()]
     if symbol.kind is SymbolKind.CLASS:
         lines += [f"{indent}    {field}" for field in symbol.fields]
@@ -76,11 +83,48 @@ def _symbol_lines(context: GroundingContext, symbol: ContextSymbol, indent: str)
     q = symbol.qualified_name
     edges = context.edges
     groups = [
-        ("calls", sorted({e.target for e in edges if e.kind is EdgeKind.CALLS and e.source == q})),
-        ("called by", sorted({e.source for e in edges if e.kind is EdgeKind.CALLS and e.target == q})),
-        ("owner", sorted({e.source for e in edges if e.kind is EdgeKind.DEFINES and e.target == q})),
-        ("bases", sorted({e.target for e in edges if e.kind is EdgeKind.INHERITS and e.source == q})),
-        ("types", sorted({e.target for e in edges if e.kind is EdgeKind.REFERENCES_TYPE and e.source == q})),
+        (
+            "calls",
+            sorted(
+                {e.target for e in edges if e.kind is EdgeKind.CALLS and e.source == q}
+            ),
+        ),
+        (
+            "called by",
+            sorted(
+                {e.source for e in edges if e.kind is EdgeKind.CALLS and e.target == q}
+            ),
+        ),
+        (
+            "owner",
+            sorted(
+                {
+                    e.source
+                    for e in edges
+                    if e.kind is EdgeKind.DEFINES and e.target == q
+                }
+            ),
+        ),
+        (
+            "bases",
+            sorted(
+                {
+                    e.target
+                    for e in edges
+                    if e.kind is EdgeKind.INHERITS and e.source == q
+                }
+            ),
+        ),
+        (
+            "types",
+            sorted(
+                {
+                    e.target
+                    for e in edges
+                    if e.kind is EdgeKind.REFERENCES_TYPE and e.source == q
+                }
+            ),
+        ),
     ]
     for label, names in groups:
         if names:

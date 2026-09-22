@@ -53,6 +53,7 @@ class BrokerMasterApp(App[None]):
     # The fleet pane holds FLEET_WIDTH content cells plus Textual's default
     # vertical scrollbar (2 cells).
     """The master's Textual app: fleet sidebar, attention notice, chat and composer over one MasterRuntime."""
+
     CSS = f"#fleet {{ width: {FLEET_WIDTH + 2}; }}" + """
     #chat { height: 1fr; }
     #activity {
@@ -330,7 +331,10 @@ class BrokerMasterApp(App[None]):
     def _show_permission(self, session_id: str | None) -> None:
         """Paste an open permission prompt's disclosure into the chat, verbatim."""
         self._paste_held(
-            self._permissions, session_id, noun="permission prompt", command="/permission"
+            self._permissions,
+            session_id,
+            noun="permission prompt",
+            command="/permission",
         )
 
     def _show_proposal(self, session_id: str | None) -> None:
