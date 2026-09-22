@@ -64,6 +64,7 @@ from broker.protocol.constants import (
     T_ASK_QUESTION,
     T_BUDGET_UPDATE,
     T_COMPLETION,
+    T_DECISION_DELIVERED,
     T_DECISION_UNDELIVERED,
     T_DISPATCH_DECISION,
     T_ESCALATION,
@@ -89,6 +90,7 @@ from broker.protocol.schemas import (
     ClarifyEscalationRequestPayload,
     AskQuestionDecisionPayload,
     AskQuestionRequestPayload,
+    DecisionDeliveredPayload,
     DecisionLogPayload,
     DecisionUndeliveredPayload,
     DispatchDecisionPayload,
@@ -1480,12 +1482,14 @@ class SessionBroker:
         )
 
     async def _deliver_decision(self, decision: DispatchDecisionPayload) -> None:
-        """Submit the developer's decision and resume driving the session.
+        """Submit the developer's decision, then confirm the outcome upstream.
 
         The decision text is typed into the pane exactly as written — developer
         text is wrapped, never rewritten. Contact with the developer resets the
-        autonomous answer budget. A decision whose escalation id does not match
-        the active escalation is stale and dropped rather than acted on.
+        autonomous answer budget. The master resolves the escalation only on the
+        delivery confirmation this sends: a decision whose id no longer matches
+        the active escalation, or one whose pane write fails, reports back as
+        undelivered instead of resolving.
 
         Args:
             decision: The dispatched decision, carrying the escalation id it
@@ -1493,7 +1497,9 @@ class SessionBroker:
         """
         active = self._active_escalation
         if active is None or decision.escalation_id != active.escalation_id:
-            # Stale; the master's dispatch-time liveness should have caught it.
+            # The broker has moved past this escalation, so the master should
+            # drop its queue entry (still_live=False). Reachable when a master
+            # restart re-surfaces an escalation this broker already answered.
             self._log(
                 DecisionKind.ERROR,
                 "stale dispatch_decision ignored",
@@ -1504,10 +1510,32 @@ class SessionBroker:
                 DecisionUndeliveredPayload(
                     escalation_id=decision.escalation_id,
                     detail="session had already moved past this escalation",
+                    still_live=False,
                 ).model_dump(),
             )
             return
-        await self._submit(decision.response)
+        try:
+            await self._submit(decision.response)
+        except Exception as exc:
+            # The master resolves only on confirmed delivery, so a failed pane
+            # write leaves the escalation live there. Report the miss loudly
+            # (still_live=True); it stays surfaced for a re-decide.
+            detail = f"{type(exc).__name__}: {exc}"
+            self._log(
+                DecisionKind.DISPATCH_FAILED,
+                "pane submission failed",
+                detail,
+                escalation_id=decision.escalation_id,
+            )
+            await self._to_master(
+                T_DECISION_UNDELIVERED,
+                DecisionUndeliveredPayload(
+                    escalation_id=decision.escalation_id,
+                    detail=detail,
+                    still_live=True,
+                ).model_dump(),
+            )
+            return
         self._end_active_escalation()
         self.budget_count = 0
         await self._to_master(T_BUDGET_UPDATE, {"count": 0})
@@ -1517,6 +1545,14 @@ class SessionBroker:
             "developer decision delivered",
             decision.response,
             escalation_id=decision.escalation_id,
+        )
+        # Resolution waits for this: the escalation clears on the master only
+        # now that the decision has actually reached the pane.
+        await self._to_master(
+            T_DECISION_DELIVERED,
+            DecisionDeliveredPayload(
+                escalation_id=decision.escalation_id
+            ).model_dump(),
         )
 
     async def _reactivate(self, payload: ReactivatePayload) -> None:

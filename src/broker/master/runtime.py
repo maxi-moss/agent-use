@@ -69,6 +69,7 @@ from broker.protocol.constants import (
     T_CLARIFY_ESCALATION,
     T_BUDGET_UPDATE,
     T_COMPLETION,
+    T_DECISION_DELIVERED,
     T_DECISION_UNDELIVERED,
     T_DISPATCH_DECISION,
     T_ESCALATION,
@@ -91,6 +92,7 @@ from broker.protocol.schemas import (
     ClarifyEscalationRequestPayload,
     BudgetUpdatePayload,
     CompletionPayload,
+    DecisionDeliveredPayload,
     DecisionLogPayload,
     DecisionUndeliveredPayload,
     DispatchDecisionPayload,
@@ -465,6 +467,10 @@ class MasterRuntime:
         self.anchor_pane = anchor_pane
         self.queue = queue
         self._surfaced_id: str | None = None
+        # Escalation whose decision has been dispatched but not yet confirmed
+        # delivered to the pane. Memory-only: an unconfirmed dispatch simply
+        # re-surfaces on restart, and the developer re-decides.
+        self._inflight: str | None = None
         self.paths = BrokerPaths(cfg.broker_home)
         self.master_socket_path = self.paths.master_socket
         self.proposals: dict[str, PendingProposal] = {}
@@ -561,6 +567,7 @@ class MasterRuntime:
             return self._ack(env, ok=True)
         if env.type == T_RETRACT:
             p = RetractPayload.model_validate(env.payload)
+            self._clear_inflight(p.escalation_id)
             cleared = self.queue.retract(p.escalation_id)
             if isinstance(cleared, EscalationPayload):
                 # Raising it set ESCALATED here; withdrawing it must undo that
@@ -595,6 +602,9 @@ class MasterRuntime:
             self.registry.upsert(record)
             self._publish_fleet()
             return self._ack(env, ok=True)
+        if env.type == T_DECISION_DELIVERED:
+            dp = DecisionDeliveredPayload.model_validate(env.payload)
+            return await self._on_decision_delivered(env, name, dp)
         if env.type == T_DECISION_UNDELIVERED:
             p = DecisionUndeliveredPayload.model_validate(env.payload)
             return await self._on_decision_undelivered(env, name, p)
@@ -986,8 +996,9 @@ class MasterRuntime:
         Returns:
             An outcome line: dispatched to the named session, a refusal
             naming the escalation that is no longer live, a refusal naming the
-            pane when the escalation is a permission prompt, or a rejection if
-            the session NACKed delivery.
+            pane when the escalation is a permission prompt, a refusal when a
+            decision is already in flight for it, or a rejection if the session
+            NACKed delivery.
         """
         # Liveness is checked THE INSTANT before the write, not at
         # surface time. A stale dispatch is the worst failure this system
@@ -1011,6 +1022,15 @@ class MasterRuntime:
             )
             self.emit(Notice(msg))
             return msg
+        if self._inflight is not None:
+            # A decision is already on its way to the pane; a second would
+            # double-submit the same escalation.
+            msg = (
+                f"decision NOT dispatched — a decision for escalation "
+                f"{self._inflight} is already being delivered"
+            )
+            self.emit(Notice(msg))
+            return msg
         record = self.registry.get(active.session_id)
         env = self._env(
             T_DISPATCH_DECISION,
@@ -1029,35 +1049,80 @@ class MasterRuntime:
         if rejected is not None:
             self.emit(Notice(rejected))
             return rejected
-        # Resolve on the accept-ACK, not on pane delivery: a missed delivery
-        # comes back via T_DECISION_UNDELIVERED.
-        self.queue.resolve(escalation_id)
-        self._surfaced_id = None
-        # No state write: DRIVING is the broker's transition to report, and
-        # its push carries it — the master never invents an operating state.
+        # The ACK only confirms the broker accepted the decision for
+        # processing. Resolution waits for T_DECISION_DELIVERED confirming it
+        # reached the pane; until then the escalation stays surfaced and no
+        # second decision may be dispatched for it.
+        self._inflight = escalation_id
         self._publish_fleet()
-        await self._surface_head()
         return f"decision dispatched to session {record.name}"
 
-    async def _on_decision_undelivered(
-        self, env: Envelope, name: str, p: DecisionUndeliveredPayload
+    def _clear_inflight(self, escalation_id: str) -> None:
+        """Drop the in-flight dispatch marker if it names ``escalation_id``."""
+        if self._inflight == escalation_id:
+            self._inflight = None
+
+    async def _on_decision_delivered(
+        self, env: Envelope, name: str, p: DecisionDeliveredPayload
     ) -> Response:
-        """Surface a dispatched decision that failed to reach the pane.
+        """Resolve an escalation now that its decision reached the pane.
 
         Args:
-            env: The undelivered-decision envelope.
-            name: Session that reported the miss.
-            p: The escalation the decision answered and why it did not land.
+            env: The delivered-decision envelope.
+            name: Session that confirmed delivery.
+            p: The escalation whose decision landed.
 
         Returns:
             The ACK.
         """
-        self.emit(
-            Notice(
-                f"decision for escalation {p.escalation_id} did NOT reach "
-                f"session {name}: {p.detail}"
+        self._clear_inflight(p.escalation_id)
+        if self.queue.resolve(p.escalation_id) is not None:
+            # It was the live head: surface whatever is next. DRIVING is the
+            # broker's transition to report; the master never invents it.
+            self._surfaced_id = None
+            self._publish_fleet()
+            await self._surface_head()
+        return self._ack(env, ok=True)
+
+    async def _on_decision_undelivered(
+        self, env: Envelope, name: str, p: DecisionUndeliveredPayload
+    ) -> Response:
+        """Handle a dispatched decision that did not reach the pane.
+
+        Resolution waits for confirmed delivery, so the escalation was never
+        resolved: a still-live miss (a failed pane write) stays surfaced for a
+        re-decide, while a stale dispatch (the broker moved past it) drops the
+        now orphaned queue entry.
+
+        Args:
+            env: The undelivered-decision envelope.
+            name: Session that reported the miss.
+            p: The escalation the decision answered, why it did not land, and
+                whether the broker still holds it live.
+
+        Returns:
+            The ACK.
+        """
+        self._clear_inflight(p.escalation_id)
+        if p.still_live:
+            self.emit(
+                Notice(
+                    f"decision for escalation {p.escalation_id} did NOT reach "
+                    f"session {name}: {p.detail}"
+                )
             )
-        )
+            return self._ack(env, ok=True)
+        cleared = self.queue.retract(p.escalation_id)
+        if cleared is not None and cleared.escalation_id == self._surfaced_id:
+            self._surfaced_id = None
+            self.emit(
+                Notice(
+                    f"escalation {p.escalation_id} from session {name} "
+                    f"cleared: {p.detail}"
+                )
+            )
+        self._publish_fleet()
+        await self._surface_head()
         return self._ack(env, ok=True)
 
     async def clarify_escalation(self, escalation_id: str, question: str) -> str:
@@ -1251,6 +1316,13 @@ class MasterRuntime:
                 proc.terminate()
                 await proc.wait()
         await self._retract_stranded_escalation(session_id, "permission")
+        # A hard stop mid-delivery leaves no delivered/undelivered reply to
+        # clear the in-flight marker. Drop it for this session's own head (the
+        # broker escalation is intentionally kept) so a re-dispatch is not
+        # refused as still being delivered.
+        active = self.queue.active
+        if active is not None and active.session_id == session_id:
+            self._clear_inflight(active.escalation_id)
         self._set_state(session_id, SessionState.STOPPED)
         return f"session {session_id} stopped"
 
@@ -1420,6 +1492,7 @@ class MasterRuntime:
         )
         if cleared is None:
             return
+        self._clear_inflight(cleared.escalation_id)
         if cleared.escalation_id == self._surfaced_id:
             self._surfaced_id = None
         self.emit(
