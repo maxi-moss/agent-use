@@ -28,6 +28,7 @@ from broker.llm import TurnResult
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry, SessionRecord
 from broker.master.tui.app import BrokerMasterApp
+from broker.master.tui.fleet import FleetSidebar, SessionRowWidget
 from broker.master.tui.notice import AttentionNotice
 from broker.master.tui.outcome_modal import OutcomeModal
 from broker.master.tui.prompt_area import PromptArea
@@ -98,9 +99,12 @@ def chat_texts(app: BrokerMasterApp) -> list[str]:
 
 
 def _fleet_text(app: BrokerMasterApp) -> str:
-    content = app.query_one("#fleet-table", Static).content
-    assert isinstance(content, Text)
-    return content.plain
+    parts: list[str] = []
+    for widget in app.query_one(FleetSidebar).query(Static):
+        content = widget.content
+        if isinstance(content, Text):
+            parts.append(content.plain)
+    return "\n".join(parts)
 
 
 def _chat_only_texts(app: BrokerMasterApp) -> list[str]:
@@ -592,8 +596,31 @@ async def test_slash_outcome_opens_modal_from_the_decision_log(home: Path) -> No
             FleetUpdated(_fleet_view((completed, _session_row("s2", ()))))
         )
         await pilot.pause()
-        assert "/outcome s1 — view outcome" in _fleet_text(app)
-        assert "/outcome s2" not in _fleet_text(app)
+        # The settled row shows the View outcome affordance; the working one does not.
+        s1_row = next(
+            w for w in app.query(SessionRowWidget) if w.session_id == "s1"
+        )
+        s2_row = next(
+            w for w in app.query(SessionRowWidget) if w.session_id == "s2"
+        )
+        s1_content = s1_row.content
+        assert isinstance(s1_content, Text)
+        assert "View outcome" in s1_content.plain
+        s2_content = s2_row.content
+        assert isinstance(s2_content, Text)
+        assert "View outcome" not in s2_content.plain
+        # Clicking a working row does nothing; clicking the settled one opens it.
+        await pilot.click(s2_row)
+        await pilot.pause()
+        assert len(app.screen_stack) == 1
+        await pilot.click(s1_row)
+        await pilot.pause()
+        assert isinstance(app.screen, OutcomeModal)
+        assert len(app.screen_stack) == 2
+        await pilot.press("escape")
+        await pilot.pause()
+        assert len(app.screen_stack) == 1
+        # The /outcome command still opens the same modal.
         box = app.query_one("#box", PromptArea)
         box.focus()
         box.text = "/outcome s1"
