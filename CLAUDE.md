@@ -4,7 +4,7 @@ This file provides guidance to Claude Code when working with this repository.
 
 ## Project Overview
 
-Routes decisions between one developer and N interactive Claude Code sessions driven through Herdr.
+A master process routes decisions between one developer and N session brokers, each driving an interactive Claude Code session through Herdr. Each session broker owns its session's Herdr pane and performs every programmatic send to Claude.
 
 ## Stack
 
@@ -87,3 +87,4 @@ Then `Args:` / `Returns:` / `Raises:` as applicable. Nothing else.
 - **On Claude Code's hook path:** exit 0 always, stdout carries the decision and nothing else, stdlib imports only. A dead broker degrades a session to stock Claude Code; it never breaks one.
 - **Every wait names its target and its timeout explicitly.**
 - **Check Herdr and Claude Code behaviour against the installed binaries, never from memory.** Both move fast; the load-bearing mechanisms are version-sensitive.
+- **Read the `[tool.importlinter]` contracts in `pyproject.toml` before any cross-module architectural decision.** A plan that assumes a forbidden import is wrong before it starts; `uv run lint-imports` is the check.
