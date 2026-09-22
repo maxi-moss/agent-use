@@ -67,6 +67,13 @@ class DispatchDecisionArgs(BaseModel):
     decision: str
 
 
+class ClarifyEscalationArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    escalation_id: str
+    question: str
+
+
 class ListSessionsArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -154,6 +161,18 @@ _REGISTRY = (
         DispatchDecisionArgs,
         lambda rt, a: rt.dispatch(a.escalation_id, a.decision),
         "dispatching a decision…",
+    ),
+    MasterTool(
+        "clarify_escalation",
+        "Ask the owning session broker a read-only question about a live "
+        "escalation and relay its answer. Use for a live question the static "
+        'escalation does not answer ("what did it already try?", "does this '
+        'touch the payments module?"); the escalation stays pending. This is '
+        "not a resolution — use dispatch_decision when the developer actually "
+        "decides.",
+        ClarifyEscalationArgs,
+        lambda rt, a: rt.clarify_escalation(a.escalation_id, a.question),
+        "asking the session about an escalation…",
     ),
     MasterTool(
         "list_sessions",
