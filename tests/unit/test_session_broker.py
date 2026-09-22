@@ -24,7 +24,9 @@ from broker.permission import PermissionModule
 from broker.permission.llm import ToolCall as PermissionToolCall
 from broker.protocol import client
 from broker.protocol.constants import (
+    NACK_WRONG_STATE,
     T_APPROVE_PROMPT,
+    T_CLARIFY_ESCALATION,
     T_ASK_QUESTION,
     T_BUDGET_UPDATE,
     T_COMPLETION,
@@ -43,7 +45,7 @@ from broker.protocol.constants import (
     T_SHUTDOWN,
     T_STATUS,
 )
-from broker.protocol.schemas import Envelope, Response
+from broker.protocol.schemas import ClarifyEscalationReplyPayload, Envelope, Response
 from broker.protocol.server import serve_unix
 from broker.session.broker import (
     PHRASE_GROUNDING,
@@ -131,6 +133,10 @@ ESCALATE_RESULT = ToolCall(
         "uncertainty": "whether the plan is stale",
         "what_would_change_my_mind": "a fresher plan",
     },
+)
+CLARIFY_RESULT = ToolCall(
+    name="answer_clarification",
+    input={"reasoning": "the transcript says so", "answer": "it tried A first"},
 )
 
 
@@ -344,6 +350,15 @@ def ask_question_env(tool_use_id: str, tool_input: dict[str, Any]) -> Envelope:
         type=T_ASK_QUESTION,
         session_id="cc-1",
         payload={"tool_input": tool_input, "tool_use_id": tool_use_id},
+    )
+
+
+def clarify_escalation_env(escalation_id: str, question: str) -> Envelope:
+    return Envelope(
+        id=uuid.uuid4().hex,
+        type=T_CLARIFY_ESCALATION,
+        session_id="s1",
+        payload={"escalation_id": escalation_id, "question": question},
     )
 
 
@@ -1275,6 +1290,137 @@ async def test_dispatch_decision_submits_and_resets_budget(
     ]
     assert harness.broker.budget_count == 0
     await wait_state(harness.broker, "driving")
+
+
+async def escalate_via_stop(h: Harness) -> str:
+    """Drive one Stop through triage to a raised escalation; return its id."""
+    await client.notify(
+        h.sock, hook_env("Stop", {"last_assistant_message": "proceed how?"})
+    )
+    await h.llm.results.put(ESCALATE_RESULT)
+    escalation = await h.master.wait_for(T_ESCALATION)
+    await wait_state(h.broker, "escalated")
+    return cast(str, escalation.payload["escalation_id"])
+
+
+async def test_clarify_escalation_answers(harness: Harness) -> None:
+    await launch(harness)
+    escalation_id = await escalate_via_stop(harness)
+    harness.run.calls.clear()
+    await harness.llm.results.put(CLARIFY_RESULT)
+    resp = await client.request(
+        harness.sock,
+        clarify_escalation_env(escalation_id, "what did it already try?"),
+        timeout_s=5.0,
+    )
+    assert resp.ok is True
+    assert (
+        ClarifyEscalationReplyPayload.model_validate(resp.payload).answer
+        == "it tried A first"
+    )
+    call = harness.llm.calls[-1]
+    assert call["model"] == "test-model"
+    content = cast(list[dict[str, Any]], call["messages"][0]["content"])
+    assert "what did it already try?" in content[-1]["text"]
+    assert "the plan contradicts the code" in content[-1]["text"]
+    # The escalation is untouched: still pending, nothing typed, nothing sent.
+    assert harness.broker.state == "escalated"
+    assert harness.run.drive_calls() == []
+    assert len(harness.master.of_type(T_ESCALATION)) == 1
+    assert harness.master.of_type(T_RETRACT) == []
+    assert "clarified" in await decision_log_text(harness)
+
+
+async def test_clarify_escalation_wrong_id_refused(harness: Harness) -> None:
+    await launch(harness)
+    await escalate_via_stop(harness)
+    calls_before = len(harness.llm.calls)
+    resp = await client.request(
+        harness.sock, clarify_escalation_env("bogus", "anything?"), timeout_s=5.0
+    )
+    assert resp.ok is False
+    assert resp.payload["reason_code"] == NACK_WRONG_STATE
+    assert len(harness.llm.calls) == calls_before
+    assert harness.broker.state == "escalated"
+
+
+async def test_clarify_escalation_not_escalated_refused(harness: Harness) -> None:
+    await launch(harness)
+    calls_before = len(harness.llm.calls)
+    resp = await client.request(
+        harness.sock, clarify_escalation_env("e1", "anything?"), timeout_s=5.0
+    )
+    assert resp.ok is False
+    assert resp.payload["reason_code"] == NACK_WRONG_STATE
+    assert len(harness.llm.calls) == calls_before
+
+
+async def test_clarify_escalation_cancelled_by_retract(harness: Harness) -> None:
+    await launch(harness)
+    await harness.llm.results.put(ESCALATE_RESULT)
+    resp = await client.request(
+        harness.sock,
+        ask_question_env(PENDING_ASK_ID, COLOR_TOOL_INPUT),
+        timeout_s=5.0,
+    )
+    assert resp.payload["decision"] == "escalated"
+    escalation = await harness.master.wait_for(T_ESCALATION)
+    await wait_state(harness.broker, "escalated")
+    calls_before = len(harness.llm.calls)
+    harness.llm.never_resolve = True
+    asking = asyncio.create_task(
+        client.request(
+            harness.sock,
+            clarify_escalation_env(
+                escalation.payload["escalation_id"], "what did it try?"
+            ),
+            timeout_s=5.0,
+        )
+    )
+    async with asyncio.timeout(5.0):
+        while len(harness.llm.calls) == calls_before:
+            await asyncio.sleep(0.01)
+    # The transcript already holds the paired answer: this hook retracts.
+    await client.notify(harness.sock, hook_env("PostToolUse", {}))
+    retract = await harness.master.wait_for(T_RETRACT)
+    assert retract.payload["escalation_id"] == escalation.payload["escalation_id"]
+    answer = await asking
+    assert answer.ok is False
+    assert answer.payload["error"] == "escalation resolved in the pane"
+    assert answer.payload["reason_code"] == NACK_WRONG_STATE
+    assert harness.broker._clarify_tasks == set()  # pyright: ignore[reportPrivateUsage]
+    await wait_state(harness.broker, "driving")
+
+
+async def test_clarify_escalation_timeout_fails_loud_and_cancels_the_call(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("broker.session.broker.CLARIFY_TIMEOUT_S", 0.1)
+    await launch(harness)
+    escalation_id = await escalate_via_stop(harness)
+    harness.llm.never_resolve = True
+    asking = asyncio.create_task(
+        client.request(
+            harness.sock,
+            clarify_escalation_env(escalation_id, "what did it try?"),
+            timeout_s=5.0,
+        )
+    )
+    in_flight = harness.broker._clarify_tasks  # pyright: ignore[reportPrivateUsage]
+    async with asyncio.timeout(5.0):
+        while not in_flight:
+            await asyncio.sleep(0.01)
+    llm_task = next(iter(in_flight))
+    resp = await asking
+    assert resp.ok is False
+    assert "TimeoutError" in resp.payload["error"]
+    # The timed-out LLM call is cancelled with the connection's wait, so
+    # nothing is left for a later dispatch or retract to chase.
+    assert llm_task.cancelled()
+    assert in_flight == set()
+    assert harness.broker.state == "escalated"
+    assert harness.master.of_type(T_RETRACT) == []
+    assert "clarify_failed" in await decision_log_text(harness)
 
 
 async def test_stale_dispatch_decision_is_ignored(harness: Harness) -> None:

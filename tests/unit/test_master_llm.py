@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from pydantic import ValidationError
 
 from anthropic.types import (
     MessageParam,
@@ -17,7 +18,12 @@ from anthropic.types import (
 
 from broker.config import BrokerConfig
 from broker.llm import ToolCall, TurnResult
-from broker.master.llm import MAX_TOOL_ROUNDS, MASTER_TOOLS, MasterLLM
+from broker.master.llm import (
+    MAX_TOOL_ROUNDS,
+    MASTER_TOOLS,
+    ClarifyEscalationArgs,
+    MasterLLM,
+)
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry, SessionRecord
 from broker.paths import BrokerPaths
@@ -373,6 +379,7 @@ def test_master_tools_are_strict_and_complete() -> None:
         "spawn_session",
         "approve_prompt",
         "dispatch_decision",
+        "clarify_escalation",
         "list_sessions",
         "send_prompt_to_session",
         "get_decision_log",
@@ -387,3 +394,14 @@ def test_master_tools_are_strict_and_complete() -> None:
         schema = cast(dict[str, Any], tool["input_schema"])
         assert schema["additionalProperties"] is False
         assert sorted(schema["required"]) == sorted(schema["properties"])
+
+
+def test_clarify_escalation_args_are_closed() -> None:
+    args = ClarifyEscalationArgs.model_validate(
+        {"escalation_id": "e1", "question": "q"}
+    )
+    assert (args.escalation_id, args.question) == ("e1", "q")
+    with pytest.raises(ValidationError):
+        ClarifyEscalationArgs.model_validate(
+            {"escalation_id": "e1", "question": "q", "decision": "B"}
+        )

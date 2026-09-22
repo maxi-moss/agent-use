@@ -41,6 +41,7 @@ from broker.protocol.constants import (
     NACK_UNKNOWN_SESSION,
     SessionState,
     T_APPROVE_PROMPT,
+    T_CLARIFY_ESCALATION,
     T_BUDGET_UPDATE,
     T_COMPLETION,
     T_DISPATCH_DECISION,
@@ -107,6 +108,19 @@ class ReasoningNackSession:
 
     async def handler(self, env: Envelope) -> Response:
         return Response(id=env.id, ok=False, payload={"error": self.reason})
+
+
+class ClarifyingSession:
+    """Session-socket handler answering clarify_escalation with a fixed answer."""
+
+    answer = "it tried A"
+
+    def __init__(self) -> None:
+        self.envelopes: list[Envelope] = []
+
+    async def handler(self, env: Envelope) -> Response:
+        self.envelopes.append(env)
+        return Response(id=env.id, ok=True, payload={"answer": self.answer})
 
 
 class FakeProcess:
@@ -986,6 +1000,97 @@ async def test_dispatch_delivers_decision_when_live(
             await send(runtime, T_LIVE_STATUS, {"state": "driving"})
         ).ok
         assert runtime.registry.get("s1").state == "driving"
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_clarify_escalation_relays_answer(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, posts = rt
+    stub = ClarifyingSession()
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
+        result = await runtime.clarify_escalation("e1", "what did it try?")
+        assert len(stub.envelopes) == 1
+        env = stub.envelopes[0]
+        assert env.type == T_CLARIFY_ESCALATION
+        assert env.payload == {"escalation_id": "e1", "question": "what did it try?"}
+        # The answer reaches the developer verbatim; the tool loop gets only
+        # an acknowledgement it cannot paraphrase from.
+        notices = [m.text for m in posts if isinstance(m, Notice)]
+        assert any("it tried A" in t and "e1" in t for t in notices)
+        assert "it tried A" not in result
+        assert "shown to the developer" in result
+        active = runtime.queue.active
+        assert active is not None and active.escalation_id == "e1"
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_clarify_escalation_wrong_id(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, posts = rt
+    stub = ClarifyingSession()
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        result = await runtime.clarify_escalation("ghost", "q")
+        assert "NOT sent" in result
+        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
+        result = await runtime.clarify_escalation("e2", "q")
+        assert "NOT sent" in result
+        assert stub.envelopes == []
+        notices = [m.text for m in posts if isinstance(m, Notice)]
+        assert any("NOT sent" in t for t in notices)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_clarify_escalation_permission_refused(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, posts = rt
+    stub = ClarifyingSession()
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        assert (
+            await send(
+                runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
+            )
+        ).ok
+        result = await runtime.clarify_escalation("p1", "q")
+        assert "NOT sent" in result
+        assert PANE_UNKNOWN in result
+        assert stub.envelopes == []
+        assert runtime.queue.active is not None
+        notices = [m.text for m in posts if isinstance(m, Notice)]
+        assert any("NOT sent" in t for t in notices)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_clarify_escalation_broker_nack(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, posts = rt
+    stub = ReasoningNackSession()
+    stub.reason = "escalation resolved in the pane"
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
+        result = await runtime.clarify_escalation("e1", "q")
+        assert result.startswith("no clarification from session s1")
+        assert result.endswith(": escalation resolved in the pane")
+        notices = [m.text for m in posts if isinstance(m, Notice)]
+        assert result in notices
+        # The master never resolves on the broker's behalf.
+        assert runtime.queue.active is not None
     finally:
         server.close()
         await server.wait_closed()
