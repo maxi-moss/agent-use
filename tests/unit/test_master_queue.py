@@ -1,4 +1,4 @@
-"""EscalationQueue: FIFO order, the per-raiser invariant, keyed clears, and
+"""EscalationQueue: FIFO order, the per-session invariant, keyed clears, and
 eager persistence through the queue file."""
 
 import tempfile
@@ -7,12 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from broker.master.queue import EscalationQueue, ProtocolViolation, QueueError
-from broker.protocol.schemas import (
-    EscalationPayload,
-    PermissionEscalationPayload,
-    RaiserIdentity,
+from broker.master.queue import (
+    EscalationProtocolViolation,
+    EscalationQueue,
+    QueueError,
 )
+from broker.protocol.schemas import EscalationPayload
 
 
 def escalation(esc_id: str = "e1", session: str = "s1") -> EscalationPayload:
@@ -20,7 +20,6 @@ def escalation(esc_id: str = "e1", session: str = "s1") -> EscalationPayload:
         {
             "escalation_id": esc_id,
             "session_id": session,
-            "raiser": {"component": "broker", "session_id": session},
             "task_context": "ctx",
             "situation": "sit",
             "what_was_asked": "asked",
@@ -29,24 +28,6 @@ def escalation(esc_id: str = "e1", session: str = "s1") -> EscalationPayload:
             "recommendation": "rec",
             "uncertainty": "unc",
             "what_would_change_my_mind": "change",
-        }
-    )
-
-
-def permission_escalation(
-    esc_id: str = "p1", session: str = "s1"
-) -> PermissionEscalationPayload:
-    return PermissionEscalationPayload.model_validate(
-        {
-            "escalation_id": esc_id,
-            "session_id": session,
-            "raiser": {"component": "permission", "session_id": session},
-            "tool_name": "Bash",
-            "tool_input": {"command": "git push"},
-            "task_intent": "intent",
-            "reason": "reason",
-            "raised_at": "2026-07-29T12:00:00+00:00",
-            "permission_suggestions": [],
         }
     )
 
@@ -75,64 +56,54 @@ def test_accept_makes_first_payload_active(queue_path: Path) -> None:
 def test_second_accept_queues_behind_the_active(queue_path: Path) -> None:
     queue = EscalationQueue.load(queue_path)
     e1 = escalation("e1", "s1")
-    p1 = permission_escalation("p1", "s1")
+    e2 = escalation("e2", "s2")
     queue.accept(e1)
-    queue.accept(p1)
+    queue.accept(e2)
     assert queue.active is e1
     assert queue.depth == 2
-    assert queue.waiting == ("s1",)
+    assert queue.waiting == ("s2",)
 
 
 def test_fifo_order_preserved_across_resolves(queue_path: Path) -> None:
     queue = EscalationQueue.load(queue_path)
     e1 = escalation("e1", "s1")
     e2 = escalation("e2", "s2")
-    p1 = permission_escalation("p1", "s1")
+    e3 = escalation("e3", "s3")
     queue.accept(e1)
     queue.accept(e2)
-    queue.accept(p1)
+    queue.accept(e3)
     assert queue.active is e1
     assert queue.resolve("e1") is e1
     assert queue.active is e2
     assert queue.resolve("e2") is e2
-    assert queue.active is p1
-    assert queue.resolve("p1") is p1
+    assert queue.active is e3
+    assert queue.resolve("e3") is e3
     assert queue.active is None
 
 
-def test_same_raiser_raise_while_queued_is_protocol_violation(
+def test_same_session_raise_while_queued_is_protocol_violation(
     queue_path: Path,
 ) -> None:
     queue = EscalationQueue.load(queue_path)
     queue.accept(escalation("e1", "s1"))
     queue.accept(escalation("e2", "s2"))
-    # The raiser's live entry is waiting, not surfaced — still its turn to hold.
-    with pytest.raises(ProtocolViolation):
+    # The session's live entry is waiting, not surfaced — still its turn to hold.
+    with pytest.raises(EscalationProtocolViolation):
         queue.accept(escalation("e3", "s2"))
     assert queue.depth == 2
-
-
-def test_cross_raiser_accept_is_never_refused(queue_path: Path) -> None:
-    queue = EscalationQueue.load(queue_path)
-    queue.accept(escalation("e1", "s1"))
-    queue.accept(permission_escalation("p1", "s1"))
-    queue.accept(escalation("e2", "s2"))
-    queue.accept(permission_escalation("p2", "s2"))
-    assert queue.depth == 4
-    assert queue.waiting == ("s1", "s2", "s2")
 
 
 def test_retract_removes_a_queued_entry(queue_path: Path) -> None:
     queue = EscalationQueue.load(queue_path)
     e1 = escalation("e1", "s1")
-    p1 = permission_escalation("p1", "s1")
     e2 = escalation("e2", "s2")
+    e3 = escalation("e3", "s3")
     queue.accept(e1)
-    queue.accept(p1)
     queue.accept(e2)
-    assert queue.retract("p1") is p1
+    queue.accept(e3)
+    assert queue.retract("e2") is e2
     assert queue.active is e1  # the head is untouched
-    assert queue.waiting == ("s2",)
+    assert queue.waiting == ("s3",)
 
 
 def test_retract_of_the_head_advances_active(queue_path: Path) -> None:
@@ -157,34 +128,25 @@ def test_resolve_ignores_a_non_head_id(queue_path: Path) -> None:
     assert queue.active is e1
 
 
-def test_retract_for_raiser_clears_that_raisers_entry(queue_path: Path) -> None:
+def test_retract_for_session_clears_that_sessions_entry(queue_path: Path) -> None:
     queue = EscalationQueue.load(queue_path)
     e1 = escalation("e1", "s1")
-    p1 = permission_escalation("p1", "s1")
+    e2 = escalation("e2", "s2")
     queue.accept(e1)
-    queue.accept(p1)
-    raiser = RaiserIdentity(component="permission", session_id="s1")
-    assert queue.retract_for_raiser(raiser) is p1
-    # The broker escalation from the same session is a different raiser.
+    queue.accept(e2)
+    assert queue.retract_for_session("s2") is e2
     assert queue.active is e1
-    assert queue.retract_for_raiser(raiser) is None
+    assert queue.retract_for_session("s2") is None
 
 
 def test_round_trip_through_load(queue_path: Path) -> None:
     queue = EscalationQueue.load(queue_path)
     e1 = escalation("e1", "s1")
-    p1 = permission_escalation("p1", "s1")
+    e2 = escalation("e2", "s2")
     queue.accept(e1)
-    queue.accept(p1)
+    queue.accept(e2)
     reloaded = EscalationQueue.load(queue_path)
-    assert reloaded.depth == 2
-    head = reloaded.active
-    assert isinstance(head, EscalationPayload)
-    assert head == e1
-    assert reloaded.resolve("e1") == e1
-    tail = reloaded.active
-    assert isinstance(tail, PermissionEscalationPayload)
-    assert tail == p1
+    assert reloaded.entries == (e1, e2)
 
 
 def test_load_missing_file_starts_empty(queue_path: Path) -> None:
@@ -200,7 +162,7 @@ def test_load_malformed_file_raises_queue_error(home: Path) -> None:
         EscalationQueue.load(broken)
     invalid_entry = home / "invalid-entry.json"
     invalid_entry.write_text(
-        '{"queue": [{"kind": "escalation", "payload": {}}]}', encoding="utf-8"
+        '{"queue": [{"escalation_id": "e1"}]}', encoding="utf-8"
     )
     # One bad entry fails the whole load — a skipped escalation is a silently
     # dropped decision.

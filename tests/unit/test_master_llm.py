@@ -24,6 +24,7 @@ from broker.master.llm import (
     ClarifyEscalationArgs,
     MasterLLM,
 )
+from broker.master.permission_escalations import PermissionEscalations
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry, SessionRecord
 from broker.paths import BrokerPaths
@@ -46,11 +47,11 @@ class RecordingRuntime(MasterRuntime):
     """Real runtime object; session-control methods record instead of act."""
 
     def __init__(self, registry: Registry, cfg: BrokerConfig) -> None:
-        queue = EscalationQueue.load(
-            BrokerPaths(cfg.broker_home).escalation_queue
-        )
+        paths = BrokerPaths(cfg.broker_home)
+        queue = EscalationQueue.load(paths.escalation_queue)
+        permissions = PermissionEscalations.load(paths.permission_escalations)
         super().__init__(
-            lambda _msg: None, registry, queue, cfg, anchor_pane="%1"
+            lambda _msg: None, registry, queue, permissions, cfg, anchor_pane="%1"
         )
         self.spawned: list[tuple[str, str]] = []
         self.dispatched: list[tuple[str, str]] = []
@@ -104,7 +105,6 @@ ESCALATION = EscalationPayload.model_validate(
     {
         "escalation_id": "e1",
         "session_id": "s1",
-        "raiser": {"component": "broker", "session_id": "s1"},
         "task_context": "ctx",
         "situation": "sit",
         "what_was_asked": "asked",
@@ -116,11 +116,14 @@ ESCALATION = EscalationPayload.model_validate(
     }
 )
 
+WAITING_ESCALATION = ESCALATION.model_copy(
+    update={"escalation_id": "e2", "session_id": "s2", "what_was_asked": "later"}
+)
+
 PERMISSION_ESCALATION = PermissionEscalationPayload.model_validate(
     {
         "escalation_id": "p1",
         "session_id": "s1",
-        "raiser": {"component": "permission", "session_id": "s1"},
         "tool_name": "Bash",
         "tool_input": {"command": "git push"},
         "task_intent": "intent",
@@ -237,16 +240,18 @@ async def test_escalation_block_is_byte_identical(
     assert render_escalation(ESCALATION) in texts
 
 
-async def test_active_permission_escalation_reaches_llm_context(
+async def test_open_permission_escalation_reaches_llm_context(
     runtime: RecordingRuntime,
 ) -> None:
-    runtime.queue.accept(PERMISSION_ESCALATION)
+    runtime.queue.accept(ESCALATION)
+    runtime.permissions.accept(PERMISSION_ESCALATION)
     fake = FakeLLM([TurnResult(text="ok")])
     master = make_master(runtime, fake)
     await master.handle_developer_message("what is s1 waiting on?")
     texts = _block_texts(fake.calls[0])
     # Without it the master would answer "nothing is blocked" while a session
-    # sits on a native prompt.
+    # sits on a native prompt — even when a decision is the active escalation.
+    assert render_escalation(ESCALATION) in texts
     assert (
         render_permission_escalation(
             PERMISSION_ESCALATION, runtime.pane_of("s1")
@@ -259,7 +264,7 @@ async def test_llm_context_carries_only_the_surfaced_head(
     runtime: RecordingRuntime,
 ) -> None:
     runtime.queue.accept(ESCALATION)
-    runtime.queue.accept(PERMISSION_ESCALATION)
+    runtime.queue.accept(WAITING_ESCALATION)
     fake = FakeLLM([TurnResult(text="ok")])
     master = make_master(runtime, fake)
     await master.handle_developer_message("status?")
@@ -269,14 +274,9 @@ async def test_llm_context_carries_only_the_surfaced_head(
     assert render_escalation(ESCALATION) in texts
     assert "e1" in joined
     # The waiting escalation and the queue itself never enter LLM context.
-    assert "p1" not in joined
+    assert "e2" not in joined
     assert "queue" not in joined.lower()
-    assert (
-        render_permission_escalation(
-            PERMISSION_ESCALATION, runtime.pane_of("s1")
-        )
-        not in texts
-    )
+    assert render_escalation(WAITING_ESCALATION) not in texts
 
 
 async def test_pending_proposal_reaches_llm_context(

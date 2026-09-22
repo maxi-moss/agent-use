@@ -34,6 +34,7 @@ from broker.protocol.constants import (
     T_DECISION_UNDELIVERED,
     T_DISPATCH_DECISION,
     T_ESCALATION,
+    T_ESCALATION_RETRACT,
     T_FATAL_ERROR,
     T_GET_DECISION_LOG,
     T_GET_PERMISSION_LOG,
@@ -42,7 +43,6 @@ from broker.protocol.constants import (
     T_PERMISSION_REQUEST,
     T_PROMPT_PROPOSAL,
     T_REACTIVATE,
-    T_RETRACT,
     T_SESSION_ENDED,
     T_SHUTDOWN,
     T_STATUS,
@@ -843,12 +843,6 @@ async def test_escalation_sent_then_broker_is_quiescent(
     escalation = await harness.master.wait_for(T_ESCALATION)
     assert escalation.payload["situation"] == "the plan contradicts the code"
     assert escalation.payload["task_context"] == "APPROVED PROMPT"
-    # The raiser identity is what lets the master hold one slot per raiser
-    # rather than one per session.
-    assert escalation.payload["raiser"] == {
-        "component": "broker",
-        "session_id": "s1",
-    }
     await wait_state(harness.broker, "escalated")
     harness.run.calls.clear()
     # Further turn boundaries must not write to the pane (quiescence).
@@ -899,7 +893,7 @@ async def test_ask_question_escalates_and_retracts_on_answer(
     assert len(harness.master.of_type(T_ESCALATION)) == 1
     # The transcript contains the paired answer -> next hook event retracts.
     await client.notify(harness.sock, hook_env("PostToolUse", {}))
-    retract = await harness.master.wait_for(T_RETRACT)
+    retract = await harness.master.wait_for(T_ESCALATION_RETRACT)
     assert retract.payload["escalation_id"] == escalation.payload["escalation_id"]
     assert retract.payload["reason"] == "resolved in pane"
     await wait_state(harness.broker, "driving")
@@ -1111,7 +1105,7 @@ async def test_ask_verify_mismatch_escalates_without_auto_retract(
         harness.sock, hook_env("Stop", {"last_assistant_message": "moving on"})
     )
     await asyncio.sleep(0.2)
-    assert harness.master.of_type(T_RETRACT) == []
+    assert harness.master.of_type(T_ESCALATION_RETRACT) == []
     assert harness.broker.state == "escalated"
 
 
@@ -1162,7 +1156,7 @@ async def test_ask_verify_backstop_escalates_then_retracts_on_answer(
         f.write(json.dumps(question_record) + "\n")
         f.write(json.dumps(answer_record) + "\n")
     await client.notify(harness.sock, hook_env("PostToolUse", {}))
-    retract = await harness.master.wait_for(T_RETRACT)
+    retract = await harness.master.wait_for(T_ESCALATION_RETRACT)
     assert retract.payload["escalation_id"] == escalation.payload["escalation_id"]
     await wait_state(harness.broker, "driving")
 
@@ -1229,7 +1223,7 @@ async def test_ask_verify_backstop_read_failure_escalates_without_auto_retract(
         harness.sock, hook_env("Stop", {"last_assistant_message": "moving on"})
     )
     await asyncio.sleep(0.2)
-    assert harness.master.of_type(T_RETRACT) == []
+    assert harness.master.of_type(T_ESCALATION_RETRACT) == []
     assert harness.broker.state == "escalated"
 
 
@@ -1256,7 +1250,7 @@ async def test_stop_that_resolves_an_escalation_still_triages_its_turn(
         harness.sock,
         hook_env("Stop", {"last_assistant_message": "Which auth provider?"}),
     )
-    retract = await harness.master.wait_for(T_RETRACT)
+    retract = await harness.master.wait_for(T_ESCALATION_RETRACT)
     assert retract.payload["escalation_id"] == escalation.payload["escalation_id"]
     await harness.master.wait_for(T_BUDGET_UPDATE)
     assert harness.run.drive_calls() == [
@@ -1340,7 +1334,7 @@ async def test_clarify_escalation_answers(harness: Harness) -> None:
     assert harness.broker.state == "escalated"
     assert harness.run.drive_calls() == []
     assert len(harness.master.of_type(T_ESCALATION)) == 1
-    assert harness.master.of_type(T_RETRACT) == []
+    assert harness.master.of_type(T_ESCALATION_RETRACT) == []
     assert "clarified" in await decision_log_text(harness)
 
 
@@ -1395,7 +1389,7 @@ async def test_clarify_escalation_cancelled_by_retract(harness: Harness) -> None
             await asyncio.sleep(0.01)
     # The transcript already holds the paired answer: this hook retracts.
     await client.notify(harness.sock, hook_env("PostToolUse", {}))
-    retract = await harness.master.wait_for(T_RETRACT)
+    retract = await harness.master.wait_for(T_ESCALATION_RETRACT)
     assert retract.payload["escalation_id"] == escalation.payload["escalation_id"]
     answer = await asking
     assert answer.ok is False
@@ -1432,7 +1426,7 @@ async def test_clarify_escalation_timeout_fails_loud_and_cancels_the_call(
     assert llm_task.cancelled()
     assert in_flight == set()
     assert harness.broker.state == "escalated"
-    assert harness.master.of_type(T_RETRACT) == []
+    assert harness.master.of_type(T_ESCALATION_RETRACT) == []
     assert "clarify_failed" in await decision_log_text(harness)
 
 

@@ -1,5 +1,5 @@
-"""reconcile_registry classification harness: a real registry and queue on
-disk under /private/tmp, driver.pane_read monkeypatched, the live-broker case
+"""reconcile_registry classification harness: a real registry, queue and
+permission store on disk under /private/tmp, driver.pane_read monkeypatched, the live-broker case
 served by a real serve_unix socket."""
 
 import asyncio
@@ -11,6 +11,7 @@ import pytest
 
 from broker.herdr import driver
 from broker.herdr.driver import HerdrError
+from broker.master.permission_escalations import PermissionEscalations
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry, SessionRecord
 from broker.master.runtime import reconcile_registry
@@ -56,12 +57,15 @@ def _queue(home: Path) -> EscalationQueue:
     return EscalationQueue.load(home / "escalation-queue.json")
 
 
+def _permissions(home: Path) -> PermissionEscalations:
+    return PermissionEscalations.load(home / "permission-escalations.json")
+
+
 def _broker_escalation(esc_id: str, session: str) -> EscalationPayload:
     return EscalationPayload.model_validate(
         {
             "escalation_id": esc_id,
             "session_id": session,
-            "raiser": {"component": "broker", "session_id": session},
             "task_context": "ctx",
             "situation": "sit",
             "what_was_asked": "asked",
@@ -81,7 +85,6 @@ def _permission_escalation(
         {
             "escalation_id": esc_id,
             "session_id": session,
-            "raiser": {"component": "permission", "session_id": session},
             "tool_name": "Bash",
             "tool_input": {"command": "ls"},
             "task_intent": "intent",
@@ -106,7 +109,7 @@ async def test_live_broker_left_alone(home: Path) -> None:
 
     server = await serve_unix(home / "s" / "s1.sock", handler)
     try:
-        warnings = await reconcile_registry(registry, _queue(home))
+        warnings = await reconcile_registry(registry, _queue(home), _permissions(home))
     finally:
         server.close()
         await server.wait_closed()
@@ -124,7 +127,7 @@ async def test_live_pane_marked_unmanaged(
         return "visible pane text"
 
     monkeypatch.setattr(driver, "pane_read", fake_pane_read)
-    warnings = await reconcile_registry(registry, _queue(home))
+    warnings = await reconcile_registry(registry, _queue(home), _permissions(home))
     assert len(warnings) == 1
     assert "unmanaged" in warnings[0]
     assert "attach_session" in warnings[0]
@@ -135,18 +138,20 @@ async def test_dead_pane_removed_and_retracts(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registry = _registry_with_s1(home)
-    seeded = _queue(home)
-    seeded.accept(_broker_escalation("e1", "s1"))
-    seeded.accept(_permission_escalation("p1", "s1"))
+    queue = _queue(home)
+    queue.accept(_broker_escalation("e1", "s1"))
+    permissions = _permissions(home)
+    permissions.accept(_permission_escalation("p1", "s1"))
     _fail_pane_read(monkeypatch, HerdrError("pane_not_found", "no such pane"))
-    warnings = await reconcile_registry(registry, seeded)
+    warnings = await reconcile_registry(registry, queue, permissions)
     # A session whose pane is gone is finished: removed here and on reload, so
     # it can never be handed back to the master as a routing candidate.
     assert "s1" not in registry.records
     assert "s1" not in Registry.load(home / "registry.json").records
-    # Both raiser identities retracted from the PERSISTED queue, so the head
-    # the runtime re-announces on startup cannot belong to a dead session.
+    # Both kinds retracted from their PERSISTED stores, so nothing the runtime
+    # re-announces on startup can belong to a dead session.
     assert _queue(home).depth == 0
+    assert _permissions(home).entries == ()
     retraction_lines = [w for w in warnings if "retracted" in w]
     assert any("e1" in w for w in retraction_lines)
     assert any("p1" in w for w in retraction_lines)
@@ -158,14 +163,17 @@ async def test_inconclusive_probe_never_marks_dead(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registry = _registry_with_s1(home)
-    seeded = _queue(home)
-    seeded.accept(_permission_escalation("p1", "s1"))
+    queue = _queue(home)
+    queue.accept(_broker_escalation("e1", "s1"))
+    permissions = _permissions(home)
+    permissions.accept(_permission_escalation("p1", "s1"))
     _fail_pane_read(monkeypatch, HerdrError("unknown", "herdr hiccup"))
-    warnings = await reconcile_registry(registry, seeded)
+    warnings = await reconcile_registry(registry, queue, permissions)
     # A wrong `unmanaged` costs the developer a glance; a wrong `dead` throws
-    # away queued decisions.
+    # away queued decisions and open prompts.
     assert Registry.load(home / "registry.json").get("s1").state == "unmanaged"
     assert _queue(home).depth == 1
+    assert len(_permissions(home).entries) == 1
     assert len(warnings) == 1
     assert "herdr hiccup" in warnings[0]
 
@@ -181,7 +189,7 @@ def test_missing_pane_id_marked_unmanaged(
     monkeypatch.setattr(driver, "pane_read", unexpected_pane_read)
     # Run through asyncio.run on a fresh loop, exactly as main() does before
     # the TUI builds its own.
-    warnings = asyncio.run(reconcile_registry(registry, _queue(home)))
+    warnings = asyncio.run(reconcile_registry(registry, _queue(home), _permissions(home)))
     assert len(warnings) == 1
     # The probe-was-attempted failure would read "inconclusive" here, because
     # the inconclusive branch absorbs the AssertionError.

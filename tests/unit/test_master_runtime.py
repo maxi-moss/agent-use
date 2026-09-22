@@ -18,6 +18,7 @@ from broker import decision_log
 from broker.decision_log import DecisionKind
 from broker.config import BrokerConfig
 from broker.herdr import driver
+from broker.master.permission_escalations import PermissionEscalations
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry, SessionRecord
 from broker.master.runtime import (
@@ -33,6 +34,7 @@ from broker.master.viewmodel import (
     FleetUpdated,
     Notice,
     PermissionEscalationArrived,
+    PermissionRequest,
     ProposalArrived,
     SessionStatusChanged,
 )
@@ -50,13 +52,14 @@ from broker.protocol.constants import (
     T_DECISION_UNDELIVERED,
     T_DISPATCH_DECISION,
     T_ESCALATION,
+    T_ESCALATION_RETRACT,
     T_FATAL_ERROR,
     T_GET_PERMISSION_LOG,
     T_LIVE_STATUS,
     T_PERMISSION_ESCALATION,
+    T_PERMISSION_RETRACT,
     T_PROMPT_PROPOSAL,
     T_REACTIVATE,
-    T_RETRACT,
     T_SESSION_ENDED,
     T_STATUS,
 )
@@ -235,7 +238,6 @@ def escalation_dict(esc_id: str = "e1", session: str = "s1") -> dict[str, Any]:
     return {
         "escalation_id": esc_id,
         "session_id": session,
-        "raiser": {"component": "broker", "session_id": session},
         "task_context": "ctx-task-value",
         "situation": "situation-value",
         "what_was_asked": "asked-value",
@@ -256,7 +258,6 @@ def permission_escalation_dict(
     return {
         "escalation_id": esc_id,
         "session_id": session,
-        "raiser": {"component": "permission", "session_id": session},
         "tool_name": "tool-name-value",
         "tool_input": {"command": "command-value"},
         "task_intent": "task-intent-value",
@@ -306,7 +307,10 @@ async def rt(
     )
     posts: list[Any] = []
     queue = EscalationQueue.load(home / "escalation-queue.json")
-    runtime = MasterRuntime(posts.append, registry, queue, cfg, anchor_pane="%1")
+    permissions = PermissionEscalations.load(home / "permission-escalations.json")
+    runtime = MasterRuntime(
+        posts.append, registry, queue, permissions, cfg, anchor_pane="%1"
+    )
     task = asyncio.create_task(runtime.serve())
     for _ in range(200):
         if runtime.master_socket_path.exists():
@@ -334,6 +338,18 @@ async def send(
     )
 
 
+def _add_session(runtime: MasterRuntime, name: str) -> None:
+    runtime.registry.upsert(
+        SessionRecord(
+            name=name,
+            socket_path=f"/private/tmp/{name}.sock",
+            cwd="/private/tmp",
+            anchor_pane="%1",
+            state=SessionState.DRIVING,
+        )
+    )
+
+
 def _leaf_values(value: Any) -> Iterator[str]:
     if isinstance(value, str):
         yield value
@@ -356,8 +372,8 @@ async def test_escalation_rendered_verbatim(
     assert len(arrived) == 1
     rendered = arrived[0].rendered
     # Every value the developer decides on appears byte-for-byte — no
-    # paraphrase. The raiser is routing identity, not something they read.
-    for value in _leaf_values({k: v for k, v in payload.items() if k != "raiser"}):
+    # paraphrase.
+    for value in _leaf_values(payload):
         assert value in rendered
     assert rendered == render_escalation(
         EscalationPayload.model_validate(payload)
@@ -373,7 +389,7 @@ async def test_second_escalation_while_active_is_protocol_violation(
     assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
     resp = await send(runtime, T_ESCALATION, escalation_dict("e2"))
     assert not resp.ok
-    # Same raiser: the broker was told to hold one at a time and did not.
+    # Same session: the broker was told to hold one at a time and did not.
     assert resp.payload["reason_code"] == NACK_PROTOCOL_VIOLATION
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("PROTOCOL VIOLATION" in t for t in notices)
@@ -402,13 +418,8 @@ async def test_permission_escalation_rendered_names_pane_and_offers_no_dispatch(
         PermissionEscalationPayload.model_validate(payload), "w3:p2"
     )
     # Every field the developer judges the prompt on appears byte-for-byte.
-    # The raiser is routing identity and raised_at is the resolution baseline;
-    # neither is something they read.
-    judged = {
-        k: v
-        for k, v in payload.items()
-        if k not in ("raiser", "raised_at")
-    }
+    # raised_at is the resolution baseline, not something they read.
+    judged = {k: v for k, v in payload.items() if k != "raised_at"}
     for value in _leaf_values(judged):
         assert value in rendered
     # No timestamp reaches the block: it is carried into the master's LLM
@@ -417,11 +428,12 @@ async def test_permission_escalation_rendered_names_pane_and_offers_no_dispatch(
     assert "w3:p2" in rendered  # the pane the native prompt is waiting in
     assert "cannot be answered here" in rendered
     assert "dispatch" not in rendered.lower()  # no affordance to answer it here
-    assert runtime.queue.active is not None
-    assert runtime.queue.active.escalation_id == "p1"
+    # Held apart from the decision queue, never in it.
+    assert runtime.queue.active is None
+    assert [p.escalation_id for p in runtime.permissions.entries] == ["p1"]
 
 
-async def test_same_raiser_double_raise_is_protocol_violation(
+async def test_second_permission_escalation_from_a_session_is_protocol_violation(
     rt: tuple[MasterRuntime, list[Any]]
 ) -> None:
     runtime, posts = rt
@@ -431,33 +443,40 @@ async def test_same_raiser_double_raise_is_protocol_violation(
     resp = await send(
         runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p2")
     )
+    # The permission module retracts the old prompt before raising the next.
     assert not resp.ok
     assert resp.payload["reason_code"] == NACK_PROTOCOL_VIOLATION
-    assert runtime.queue.active is not None
-    assert runtime.queue.active.escalation_id == "p1"
+    assert [p.escalation_id for p in runtime.permissions.entries] == ["p1"]
     assert (
         len([m for m in posts if isinstance(m, PermissionEscalationArrived)]) == 1
     )
 
 
-async def test_cross_raiser_escalation_queues_behind_the_active_one(
-    rt: tuple[MasterRuntime, list[Any]]
+async def test_permission_escalation_never_waits_behind_a_decision(
+    rt: tuple[MasterRuntime, list[Any]], recording_run: RecordingRun
 ) -> None:
     runtime, posts = rt
     assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
     resp = await send(
         runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
     )
-    # Two distinct raisers: the second one broke no rule, so it waits its
-    # turn rather than being refused.
+    # The native prompt is already blocking the session, so the developer is
+    # told about it now — it takes no place in the decision queue.
     assert resp.ok
     assert runtime.queue.active is not None
     assert runtime.queue.active.escalation_id == "e1"
-    # Not surfaced yet: the developer sees the head and a depth line only.
-    assert [m for m in posts if isinstance(m, PermissionEscalationArrived)] == []
-    fleets = [m for m in posts if isinstance(m, FleetUpdated)]
-    assert fleets[-1].view.queue_depth == 2
-    assert fleets[-1].view.waiting == ("s1",)
+    arrived = [m for m in posts if isinstance(m, PermissionEscalationArrived)]
+    assert [m.escalation_id for m in arrived] == ["p1"]
+    notify_calls = [
+        c for c in recording_run.calls if c[1:3] == ["notification", "show"]
+    ]
+    assert len(notify_calls) == 2  # the decision head and the prompt
+    view = [m for m in posts if isinstance(m, FleetUpdated)][-1].view
+    assert view.queue_depth == 1
+    assert view.waiting == ()
+    assert view.permissions == (
+        PermissionRequest("s1", "p1", "tool-name-value"),
+    )
 
 
 async def test_malformed_permission_escalation_nacked_never_surfaced(
@@ -473,7 +492,7 @@ async def test_malformed_permission_escalation_nacked_never_surfaced(
     assert [m for m in posts if isinstance(m, PermissionEscalationArrived)] == []
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("MALFORMED" in t for t in notices)
-    assert runtime.queue.active is None
+    assert runtime.permissions.entries == ()
 
 
 async def test_escalation_from_an_unknown_session_never_enters_the_queue(
@@ -496,6 +515,7 @@ async def test_escalation_from_an_unknown_session_never_enters_the_queue(
     assert not resp.ok
     assert resp.payload["reason_code"] == NACK_UNKNOWN_SESSION
     assert runtime.queue.active is None
+    assert runtime.permissions.entries == ()
     assert [m for m in posts if isinstance(m, EscalationArrived)] == []
     assert [m for m in posts if isinstance(m, PermissionEscalationArrived)] == []
 
@@ -507,18 +527,25 @@ async def test_dispatch_refuses_permission_escalation(
     stub = StubSession()
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
+        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
         assert (
             await send(
                 runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
             )
         ).ok
         result = await runtime.dispatch("p1", "yes, go ahead")
+        # Refused as a permission prompt, not as a stale decision: the
+        # developer is told where the answer belongs.
         assert "NOT dispatched" in result
+        assert "permission prompt" in result
         # The registry has no pane for s1 here; the refusal still has to say
         # where the answer belongs rather than go silent.
         assert PANE_UNKNOWN in result
         assert stub.envelopes == []  # nothing reached the session
-        assert runtime.queue.active is not None  # nothing was resolved either
+        # Nothing was resolved either.
+        assert runtime.permissions.find("p1") is not None
+        assert runtime.queue.active is not None
+        assert runtime.queue.active.escalation_id == "e1"
         notices = [m.text for m in posts if isinstance(m, Notice)]
         assert any("NOT dispatched" in t for t in notices)
     finally:
@@ -531,24 +558,21 @@ async def test_reassign_retracts_that_sessions_permission_escalation(
 ) -> None:
     runtime, posts = rt
     _bind_session(runtime)
-    # Another session's escalation must survive: reassigning s1 says nothing
+    # Another session's prompt must survive: reassigning s1 says nothing
     # about it.
     other = PermissionEscalationPayload.model_validate(
         permission_escalation_dict("p9", "s9")
     )
-    runtime.queue.accept(other)
-    await runtime.reassign_session("s1", "take it from here")
-    assert runtime.queue.active is other
-
-    runtime.queue.retract("p9")
+    runtime.permissions.accept(other)
     assert (
         await send(
             runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
         )
     ).ok
-    await runtime.reassign_session("s1", "and again")
-    # Its raiser died with the broker, so nothing else would ever clear it.
-    assert runtime.queue.active is None
+    await runtime.reassign_session("s1", "take it from here")
+    # Its permission module died with the broker, so nothing else would ever
+    # clear it.
+    assert runtime.permissions.entries == (other,)
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("p1" in t and "retracted" in t for t in notices)
 
@@ -557,27 +581,21 @@ async def test_stop_session_retracts_that_sessions_permission_escalation(
     rt: tuple[MasterRuntime, list[Any]]
 ) -> None:
     runtime, posts = rt
-    # A broker-raised escalation from the same session must survive the stop:
-    # raiser identity is the only thing telling the two kinds apart.
     assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-    await runtime.stop_session("s1")
-    assert runtime.queue.active is not None
-    assert runtime.queue.active.escalation_id == "e1"
-
-    runtime.queue.retract("e1")
     assert (
         await send(
             runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
         )
     ).ok
-    assert runtime.queue.active is not None
     await runtime.stop_session("s1")
-    # Its raiser died with the broker and the native prompt is still on screen,
-    # so no retraction is ever coming and the slot would stay held for every
-    # other session too.
-    assert runtime.queue.active is None
+    # The permission module died with the broker and the native prompt is
+    # still on screen, so no retraction is ever coming.
+    assert runtime.permissions.entries == ()
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("p1" in t and "retracted" in t for t in notices)
+    # The decision escalation from the same session is kept on purpose.
+    assert runtime.queue.active is not None
+    assert runtime.queue.active.escalation_id == "e1"
 
 
 async def test_get_permission_log_round_trip(
@@ -630,7 +648,7 @@ async def test_retract_clears_head_and_informs(
     assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
     resp = await send(
         runtime,
-        T_RETRACT,
+        T_ESCALATION_RETRACT,
         {"escalation_id": "e1", "reason": "resolved in pane"},
     )
     assert resp.ok
@@ -648,7 +666,7 @@ async def test_permission_retract_leaves_session_state_alone(
     # A permission escalation never set the state, so withdrawing it must not
     # claim the session is driving when its broker knows otherwise — its own
     # escalation may still be live.
-    runtime, _ = rt
+    runtime, posts = rt
     assert (
         await send(
             runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
@@ -659,10 +677,15 @@ async def test_permission_retract_leaves_session_state_alone(
     runtime.registry.upsert(record)
     assert (
         await send(
-            runtime, T_RETRACT, {"escalation_id": "p1", "reason": "answered"}
+            runtime,
+            T_PERMISSION_RETRACT,
+            {"escalation_id": "p1", "reason": "answered"},
         )
     ).ok
     assert runtime.registry.get("s1").state == SessionState.ESCALATED
+    assert runtime.permissions.entries == ()
+    notices = [m.text for m in posts if isinstance(m, Notice)]
+    assert any("p1" in t and "retracted: answered" in t for t in notices)
 
 
 async def test_queued_escalation_surfaces_after_resolve(
@@ -671,36 +694,30 @@ async def test_queued_escalation_surfaces_after_resolve(
     recording_run: RecordingRun,
 ) -> None:
     runtime, posts = rt
+    _add_session(runtime, "s2")
     stub = StubSession()
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+
+    def surfaced() -> list[str]:
+        return [m.escalation_id for m in posts if isinstance(m, EscalationArrived)]
+
     try:
         assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
         assert (
-            await send(
-                runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
-            )
+            await send(runtime, T_ESCALATION, escalation_dict("e2", "s2"), "s2")
         ).ok
-        assert (
-            [m for m in posts if isinstance(m, PermissionEscalationArrived)]
-            == []
-        )
+        assert surfaced() == ["e1"]
         result = await runtime.dispatch("e1", "use option B")
         assert "dispatched" in result
         # Resolution waits for confirmed delivery: e1 is still the head and
         # nothing new surfaces until the broker confirms it reached the pane.
-        assert [
-            m for m in posts if isinstance(m, PermissionEscalationArrived)
-        ] == []
+        assert surfaced() == ["e1"]
         assert runtime.queue.active is not None
         assert runtime.queue.active.escalation_id == "e1"
         assert (await send(runtime, T_DECISION_DELIVERED, {"escalation_id": "e1"})).ok
-        arrived = [
-            m for m in posts if isinstance(m, PermissionEscalationArrived)
-        ]
-        assert len(arrived) == 1
-        assert arrived[0].escalation_id == "p1"
+        assert surfaced() == ["e1", "e2"]
         assert runtime.queue.active is not None
-        assert runtime.queue.active.escalation_id == "p1"
+        assert runtime.queue.active.escalation_id == "e2"
         notify_calls = [
             c for c in recording_run.calls if c[1:3] == ["notification", "show"]
         ]
@@ -714,47 +731,48 @@ async def test_queued_escalation_surfaces_after_retract(
     rt: tuple[MasterRuntime, list[Any]]
 ) -> None:
     runtime, posts = rt
+    _add_session(runtime, "s2")
     assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
+    assert (await send(runtime, T_ESCALATION, escalation_dict("e2", "s2"), "s2")).ok
     assert (
         await send(
-            runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
+            runtime,
+            T_ESCALATION_RETRACT,
+            {"escalation_id": "e1", "reason": "answered"},
         )
     ).ok
-    assert (
-        await send(
-            runtime, T_RETRACT, {"escalation_id": "e1", "reason": "answered"}
-        )
-    ).ok
-    arrived = [m for m in posts if isinstance(m, PermissionEscalationArrived)]
-    assert len(arrived) == 1
-    assert arrived[0].escalation_id == "p1"
+    arrived = [m.escalation_id for m in posts if isinstance(m, EscalationArrived)]
+    assert arrived == ["e1", "e2"]
     assert runtime.queue.active is not None
-    assert runtime.queue.active.escalation_id == "p1"
+    assert runtime.queue.active.escalation_id == "e2"
 
 
 async def test_retracted_queued_escalation_is_never_surfaced(
     rt: tuple[MasterRuntime, list[Any]]
 ) -> None:
     runtime, posts = rt
+    _add_session(runtime, "s2")
     assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
+    assert (await send(runtime, T_ESCALATION, escalation_dict("e2", "s2"), "s2")).ok
     assert (
         await send(
-            runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
+            runtime,
+            T_ESCALATION_RETRACT,
+            {"escalation_id": "e2", "reason": "resolved in pane"},
+            "s2",
         )
     ).ok
     assert (
         await send(
-            runtime, T_RETRACT, {"escalation_id": "p1", "reason": "superseded"}
-        )
-    ).ok
-    assert (
-        await send(
-            runtime, T_RETRACT, {"escalation_id": "e1", "reason": "answered"}
+            runtime,
+            T_ESCALATION_RETRACT,
+            {"escalation_id": "e1", "reason": "answered"},
         )
     ).ok
     # The queued escalation was withdrawn before its turn; announcing it would
     # hand the developer a decision nobody is waiting on.
-    assert [m for m in posts if isinstance(m, PermissionEscalationArrived)] == []
+    arrived = [m.escalation_id for m in posts if isinstance(m, EscalationArrived)]
+    assert arrived == ["e1"]
     assert runtime.queue.active is None
 
 
@@ -764,6 +782,7 @@ async def test_notification_fires_at_surface_time_not_accept(
     recording_run: RecordingRun,
 ) -> None:
     runtime, _ = rt
+    _add_session(runtime, "s2")
     stub = StubSession()
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
 
@@ -779,9 +798,7 @@ async def test_notification_fires_at_surface_time_not_accept(
     try:
         assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
         assert (
-            await send(
-                runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
-            )
+            await send(runtime, T_ESCALATION, escalation_dict("e2", "s2"), "s2")
         ).ok
         assert notify_count() == 1  # only the surfaced head is announced
         await runtime.dispatch("e1", "use option B")
@@ -793,33 +810,37 @@ async def test_notification_fires_at_surface_time_not_accept(
         await server.wait_closed()
 
 
-async def test_startup_resurfaces_the_persisted_head(
+async def test_startup_resurfaces_the_persisted_head_and_open_prompts(
     home: Path, recording_run: RecordingRun
 ) -> None:
     queue_path = home / "escalation-queue.json"
+    permissions_path = home / "permission-escalations.json"
     seeded = EscalationQueue.load(queue_path)
     seeded.accept(EscalationPayload.model_validate(escalation_dict("e1")))
-    seeded.accept(
+    seeded.accept(EscalationPayload.model_validate(escalation_dict("e2", "s2")))
+    PermissionEscalations.load(permissions_path).accept(
         PermissionEscalationPayload.model_validate(
             permission_escalation_dict("p1")
         )
     )
     cfg = BrokerConfig(model_id="test-model", broker_home=home)
     registry = Registry.load(home / "registry.json")
-    registry.upsert(
-        SessionRecord(
-            name="s1",
-            socket_path=str(home / "s" / "s1.sock"),
-            cwd="/private/tmp",
-            anchor_pane="%1",
-            state=SessionState.DRIVING,
+    for name in ("s1", "s2"):
+        registry.upsert(
+            SessionRecord(
+                name=name,
+                socket_path=str(home / "s" / f"{name}.sock"),
+                cwd="/private/tmp",
+                anchor_pane="%1",
+                state=SessionState.DRIVING,
+            )
         )
-    )
     posts: list[Any] = []
     runtime = MasterRuntime(
         posts.append,
         registry,
         EscalationQueue.load(queue_path),
+        PermissionEscalations.load(permissions_path),
         cfg,
         anchor_pane="%1",
     )
@@ -839,11 +860,15 @@ async def test_startup_resurfaces_the_persisted_head(
     assert arrived[0].rendered == render_escalation(
         EscalationPayload.model_validate(escalation_dict("e1"))
     )
-    # The waiting entry stays unannounced; the fleet view carries it.
-    assert [m for m in posts if isinstance(m, PermissionEscalationArrived)] == []
+    # An open prompt persisted across the restart is announced again: the
+    # native prompt is still blocking its session.
+    prompts = [m for m in posts if isinstance(m, PermissionEscalationArrived)]
+    assert [m.escalation_id for m in prompts] == ["p1"]
+    # The waiting decision stays unannounced; the fleet view carries it.
     fleets = [m for m in posts if isinstance(m, FleetUpdated)]
     assert fleets[0].view.queue_depth == 2
-    assert fleets[0].view.waiting == ("s1",)
+    assert fleets[0].view.waiting == ("s2",)
+    assert [p.escalation_id for p in fleets[0].view.permissions] == ["p1"]
 
 
 async def test_probe_of_a_settled_session_keeps_it_settled(home: Path) -> None:
@@ -869,6 +894,7 @@ async def test_probe_of_a_settled_session_keeps_it_settled(home: Path) -> None:
         posts.append,
         registry,
         EscalationQueue.load(home / "escalation-queue.json"),
+        PermissionEscalations.load(home / "permission-escalations.json"),
         cfg,
         anchor_pane="%1",
     )
@@ -907,6 +933,7 @@ async def test_repopulate_from_brokers_fills_task_activity_at_startup(
         posts.append,
         registry,
         EscalationQueue.load(home / "escalation-queue.json"),
+        PermissionEscalations.load(home / "permission-escalations.json"),
         cfg,
         anchor_pane="%1",
     )
@@ -965,6 +992,7 @@ async def test_repopulate_from_brokers_recovers_pending_proposal(
         posts.append,
         registry,
         EscalationQueue.load(home / "escalation-queue.json"),
+        PermissionEscalations.load(home / "permission-escalations.json"),
         cfg,
         anchor_pane="%1",
     )
@@ -1012,6 +1040,7 @@ async def test_repopulate_from_brokers_registers_nothing_when_no_proposal(
         posts.append,
         registry,
         EscalationQueue.load(home / "escalation-queue.json"),
+        PermissionEscalations.load(home / "permission-escalations.json"),
         cfg,
         anchor_pane="%1",
     )
@@ -1038,58 +1067,40 @@ async def test_repopulate_from_brokers_registers_nothing_when_no_proposal(
     assert [m for m in posts if isinstance(m, ProposalArrived)] == []
 
 
-async def test_stop_session_retracts_a_queued_permission_escalation(
-    rt: tuple[MasterRuntime, list[Any]]
-) -> None:
-    runtime, posts = rt
-    assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-    assert (
-        await send(
-            runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
-        )
-    ).ok
-    await runtime.stop_session("s1")
-    # The stranded retraction reaches an entry that never surfaced; the broker
-    # escalation from the same session is a different raiser and survives.
-    assert runtime.queue.depth == 1
-    assert runtime.queue.active is not None
-    assert runtime.queue.active.escalation_id == "e1"
-    notices = [m.text for m in posts if isinstance(m, Notice)]
-    assert any("p1" in t and "retracted" in t for t in notices)
-    assert [m for m in posts if isinstance(m, PermissionEscalationArrived)] == []
-
-
-async def test_queue_depth_reflects_every_mutation(
+async def test_fleet_view_tracks_the_queue_and_open_prompts_separately(
     rt: tuple[MasterRuntime, list[Any]], home: Path
 ) -> None:
     runtime, posts = rt
     stub = StubSession()
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
 
-    def depth() -> tuple[int, tuple[str, ...]]:
-        fleets = [m for m in posts if isinstance(m, FleetUpdated)]
-        return (fleets[-1].view.queue_depth, fleets[-1].view.waiting)
+    def state() -> tuple[int, tuple[str, ...], tuple[str, ...]]:
+        view = [m for m in posts if isinstance(m, FleetUpdated)][-1].view
+        prompts = tuple(p.escalation_id for p in view.permissions)
+        return (view.queue_depth, view.waiting, prompts)
 
     try:
-        assert depth() == (0, ())  # serve() announces the loaded queue
+        assert state() == (0, (), ())  # serve() announces the loaded stores
         assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-        assert depth() == (1, ())
+        assert state() == (1, (), ())
         assert (
             await send(
                 runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
             )
         ).ok
-        assert depth() == (2, ("s1",))
+        assert state() == (1, (), ("p1",))  # counted apart from the queue
         await runtime.dispatch("e1", "use option B")
-        assert depth() == (2, ("s1",))  # unresolved until delivery is confirmed
+        assert state() == (1, (), ("p1",))  # unresolved until delivery lands
         assert (await send(runtime, T_DECISION_DELIVERED, {"escalation_id": "e1"})).ok
-        assert depth() == (1, ())
+        assert state() == (0, (), ("p1",))
         assert (
             await send(
-                runtime, T_RETRACT, {"escalation_id": "p1", "reason": "answered"}
+                runtime,
+                T_PERMISSION_RETRACT,
+                {"escalation_id": "p1", "reason": "answered"},
             )
         ).ok
-        assert depth() == (0, ())
+        assert state() == (0, (), ())
     finally:
         server.close()
         await server.wait_closed()
@@ -1265,8 +1276,14 @@ async def test_fatal_error_retracts_a_live_escalation(
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
         assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
+        assert (
+            await send(
+                runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
+            )
+        ).ok
         # A session that dies with a live escalation would otherwise wedge the
-        # head forever, undispatchable to a dead session.
+        # head forever, undispatchable to a dead session, and its open prompt
+        # would stay shown with no permission module left to retract it.
         assert (
             await send(
                 runtime,
@@ -1276,8 +1293,10 @@ async def test_fatal_error_retracts_a_live_escalation(
         ).ok
         assert runtime.registry.get("s1").state == "error"
         assert runtime.queue.active is None
+        assert runtime.permissions.entries == ()
         notices = [m.text for m in posts if isinstance(m, Notice)]
         assert any("e1" in t and "retracted" in t for t in notices)
+        assert any("p1" in t and "retracted" in t for t in notices)
     finally:
         server.close()
         await server.wait_closed()
@@ -1336,6 +1355,7 @@ async def test_clarify_escalation_permission_refused(
     stub = ClarifyingSession()
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
+        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
         assert (
             await send(
                 runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
@@ -1343,9 +1363,10 @@ async def test_clarify_escalation_permission_refused(
         ).ok
         result = await runtime.clarify_escalation("p1", "q")
         assert "NOT sent" in result
+        assert "permission prompt" in result
         assert PANE_UNKNOWN in result
         assert stub.envelopes == []
-        assert runtime.queue.active is not None
+        assert runtime.permissions.find("p1") is not None
         notices = [m.text for m in posts if isinstance(m, Notice)]
         assert any("NOT sent" in t for t in notices)
     finally:
@@ -1481,18 +1502,25 @@ async def test_session_ended_retracts_its_stranded_escalation(
     # s1 is the surfaced FIFO head, waiting on a decision the developer never
     # gave before running /exit; a bystander waits behind it and must survive.
     assert (await send(runtime, T_ESCALATION, escalation_dict("e1", "s1"))).ok
+    assert (
+        await send(
+            runtime, T_PERMISSION_ESCALATION, permission_escalation_dict("p1")
+        )
+    ).ok
     other = EscalationPayload.model_validate(escalation_dict("e9", "s9"))
     runtime.queue.accept(other)
     assert runtime.queue.active is not other
     resp = await send(runtime, T_SESSION_ENDED, {})
     assert resp.ok
-    # The broker exits without withdrawing it, so ending must retract it —
-    # otherwise the head wedges the queue forever, undispatchable to a gone
-    # session, and blocks the bystander behind it.
+    # The broker exits without withdrawing either, so ending must retract
+    # both — otherwise the head wedges the queue forever, undispatchable to a
+    # gone session, and the open prompt stays shown for a session that is gone.
     assert runtime.queue.depth == 1
     assert runtime.queue.active is other
+    assert runtime.permissions.entries == ()
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("e1" in t and "retracted" in t for t in notices)
+    assert any("p1" in t and "retracted" in t for t in notices)
 
 
 async def test_thin_escalation_rejected(
@@ -1519,7 +1547,7 @@ async def test_every_broker_message_type_is_acked(
     assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
     assert (
         await send(
-            runtime, T_RETRACT, {"escalation_id": "e1", "reason": "r"}
+            runtime, T_ESCALATION_RETRACT, {"escalation_id": "e1", "reason": "r"}
         )
     ).ok
     assert (
@@ -1529,7 +1557,7 @@ async def test_every_broker_message_type_is_acked(
     ).ok
     assert (
         await send(
-            runtime, T_RETRACT, {"escalation_id": "p1", "reason": "r"}
+            runtime, T_PERMISSION_RETRACT, {"escalation_id": "p1", "reason": "r"}
         )
     ).ok
     assert (
@@ -1898,27 +1926,28 @@ async def test_attach_retracts_stranded_escalations(
 ) -> None:
     runtime, posts = rt
     _bind_session(runtime)
-    # Another session's escalation must survive: attaching s1 says nothing
-    # about it.
-    other = PermissionEscalationPayload.model_validate(
+    # Another session's escalations must survive: attaching s1 says nothing
+    # about them.
+    other_decision = EscalationPayload.model_validate(escalation_dict("e9", "s9"))
+    other_prompt = PermissionEscalationPayload.model_validate(
         permission_escalation_dict("p9", "s9")
     )
-    runtime.queue.accept(other)
+    runtime.queue.accept(other_decision)
+    runtime.permissions.accept(other_prompt)
     runtime.queue.accept(
         EscalationPayload.model_validate(escalation_dict("e1", "s1"))
     )
-    runtime.queue.accept(
+    runtime.permissions.accept(
         PermissionEscalationPayload.model_validate(
             permission_escalation_dict("p1", "s1")
         )
     )
     await runtime.attach_session("s1")
     assert spawn.argvs != []  # the refusals all passed and a broker spawned
-    # Both raiser identities retracted: a live same-raiser entry would refuse
-    # the resumed broker's first escalation, and a dispatched decision would
-    # be discarded to its log.
-    assert runtime.queue.depth == 1
-    assert runtime.queue.active is other
+    # Both kinds retracted: a live entry would refuse the resumed broker's
+    # first raise, and a dispatched decision would be discarded to its log.
+    assert runtime.queue.entries == (other_decision,)
+    assert runtime.permissions.entries == (other_prompt,)
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("e1" in t and "retracted" in t for t in notices)
     assert any("p1" in t and "retracted" in t for t in notices)
@@ -1970,42 +1999,42 @@ async def test_build_fleet_view_idle_master_and_no_sessions(home: Path) -> None:
     cfg = BrokerConfig(model_id="test-model", broker_home=home)
     registry = Registry.load(home / "registry.json")
     queue = EscalationQueue.load(home / "escalation-queue.json")
+    permissions = PermissionEscalations.load(home / "permission-escalations.json")
     runtime = MasterRuntime(
-        lambda _event: None, registry, queue, cfg, anchor_pane="%1"
+        lambda _event: None, registry, queue, permissions, cfg, anchor_pane="%1"
     )
     view = runtime.build_fleet_view()
     assert view.master_activity is None
     assert view.rows == ()
     assert view.queue_depth == 0
+    assert view.permissions == ()
 
 
 async def test_build_fleet_view_reports_master_activity_and_queue_state(
     rt: tuple[MasterRuntime, list[Any]]
 ) -> None:
     runtime, _ = rt
-    runtime.registry.upsert(
-        SessionRecord(
-            name="s2",
-            socket_path="/private/tmp/s2.sock",
-            cwd="/private/tmp",
-            anchor_pane="%1",
-            state=SessionState.DRIVING,
-        )
-    )
+    for name in ("s2", "s10"):
+        _add_session(runtime, name)
     runtime.note_master_activity("thinking…")
     assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-    assert (
-        await send(
-            runtime,
-            T_PERMISSION_ESCALATION,
-            permission_escalation_dict("p1", "s2"),
-            session="s2",
-        )
-    ).ok
+    assert (await send(runtime, T_ESCALATION, escalation_dict("e2", "s2"), "s2")).ok
+    for name, esc_id in (("s10", "p10"), ("s2", "p2")):
+        assert (
+            await send(
+                runtime,
+                T_PERMISSION_ESCALATION,
+                permission_escalation_dict(esc_id, name),
+                session=name,
+            )
+        ).ok
     view = runtime.build_fleet_view()
     assert view.master_activity == "thinking…"
+    # Only decisions count as waiting; open prompts are listed apart, in
+    # numeric session order (s2 before s10) whatever order they arrived in.
     assert view.queue_depth == 2
     assert view.waiting == ("s2",)
+    assert [p.session_id for p in view.permissions] == ["s2", "s10"]
 
 
 async def test_build_fleet_view_badges_reflect_queue_proposals_and_prompts(
@@ -2031,8 +2060,8 @@ async def test_build_fleet_view_badges_reflect_queue_proposals_and_prompts(
             pane_id="w3:p2",
         )
     )
-    # s1: a queued broker escalation AND a queued permission escalation from
-    # the same session — distinct raiser identities, so both badges carry.
+    # s1: a queued decision escalation AND an open permission escalation from
+    # the same session — held apart, so both badges carry.
     assert (await send(runtime, T_ESCALATION, escalation_dict("e1", "s1"))).ok
     assert (
         await send(
