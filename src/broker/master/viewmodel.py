@@ -49,25 +49,35 @@ class SessionRow:
 
 @dataclass(frozen=True, slots=True)
 class HeadRequest:
-    """The one queue entry the developer is asked about right now. ``text`` is
-    the escalation's question verbatim, or the tool a permission prompt names."""
+    """The decision escalation the developer is asked about right now. ``text``
+    is its question verbatim."""
 
     session_id: str
     escalation_id: str
-    kind: Attention
     text: str
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionRequest:
+    """One open native permission prompt, answered in its session's pane."""
+
+    session_id: str
+    escalation_id: str
+    tool_name: str
 
 
 @dataclass(frozen=True, slots=True)
 class FleetView:
     """The whole sidebar in one value: master activity, one row per session
-    (numeric id order), and the escalation queue summary."""
+    (numeric id order), the decision-escalation queue summary, and every open
+    permission prompt (numeric session order)."""
 
     master_activity: str | None
     rows: tuple[SessionRow, ...]
     queue_depth: int
     waiting: tuple[str, ...]
     head: HeadRequest | None
+    permissions: tuple[PermissionRequest, ...]
 
 
 @dataclass(frozen=True, slots=True)

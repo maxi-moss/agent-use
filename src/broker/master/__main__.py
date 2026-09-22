@@ -6,8 +6,9 @@ runtime/app built → App.run() (the socket server starts inside on_mount).
 The registry file is READ before hook registration only to supply candidate
 shadow paths (known cwds are needed here); reconciliation and its save happen
 in their bound position, after verify-and-repair and before the app is built,
-so a dead session's retracted escalations are gone from disk before the
-runtime re-announces the persisted head.
+so a dead session's retracted escalation and open permission escalation are
+gone from disk before the runtime re-announces the persisted head and open
+permission prompts.
 """
 
 import argparse
@@ -26,6 +27,7 @@ from broker.herdr import driver
 from broker.paths import BrokerPaths
 from broker.llm import build_client
 from broker.master.llm import bind_call_turn
+from broker.master.permission_escalations import PermissionEscalations, PermissionStoreError
 from broker.master.queue import EscalationQueue, QueueError
 from broker.master.registry import Registry
 from broker.master.runtime import reconcile_registry
@@ -107,6 +109,10 @@ def main() -> None:
         queue = EscalationQueue.load(paths.escalation_queue)
     except QueueError as exc:
         _fail(str(exc))
+    try:
+        permissions = PermissionEscalations.load(paths.permission_escalations)
+    except PermissionStoreError as exc:
+        _fail(str(exc))
 
     if args.test_mode:
         warnings = [TEST_MODE_WARNING]
@@ -127,7 +133,7 @@ def main() -> None:
         warnings = list(report.warnings)
 
         # 3. Reconcile the registry: probe, classify, retract — never spawn.
-        warnings.extend(asyncio.run(reconcile_registry(registry, queue)))
+        warnings.extend(asyncio.run(reconcile_registry(registry, queue, permissions)))
 
         llm_call = bind_call_turn(build_client(cfg))
 
@@ -136,6 +142,7 @@ def main() -> None:
         cfg,
         registry,
         queue,
+        permissions,
         llm_call,
         anchor_pane=anchor,
         startup_warnings=warnings,

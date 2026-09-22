@@ -1,7 +1,8 @@
 """Synthetic peers that speak the real NDJSON protocol.
 
-``FakeBrokerClient`` raises and retracts escalations over the master socket
-through the same ``protocol.client.request`` a session broker uses.
+``FakeBrokerClient`` raises and retracts escalations and permission
+escalations over the master socket through the same
+``protocol.client.request`` a session broker and its permission module use.
 ``FakeSessionSocket`` binds a session socket that records every envelope it
 receives and ACKs it, standing in for a broker's listening end.
 """
@@ -16,17 +17,19 @@ from broker.protocol.constants import (
     SessionState,
     T_DECISION_DELIVERED,
     T_ESCALATION,
+    T_ESCALATION_RETRACT,
     T_PERMISSION_ESCALATION,
-    T_RETRACT,
+    T_PERMISSION_RETRACT,
     T_STATUS,
 )
 from broker.protocol.schemas import (
     DecisionDeliveredPayload,
     Envelope,
     EscalationPayload,
+    EscalationRetractPayload,
     PermissionEscalationPayload,
+    PermissionRetractPayload,
     Response,
-    RetractPayload,
     StatusPayload,
 )
 from broker.protocol.server import serve_unix
@@ -53,11 +56,18 @@ class FakeBrokerClient:
         """Raise a permission escalation and return the master's reply."""
         return await self._send(T_PERMISSION_ESCALATION, payload)
 
-    async def retract(self, escalation_id: str, reason: str) -> Response:
-        """Withdraw an escalation and return the master's reply."""
+    async def escalation_retract(self, escalation_id: str, reason: str) -> Response:
+        """Withdraw a broker escalation and return the master's reply."""
         return await self._send(
-            T_RETRACT,
-            RetractPayload(escalation_id=escalation_id, reason=reason),
+            T_ESCALATION_RETRACT,
+            EscalationRetractPayload(escalation_id=escalation_id, reason=reason),
+        )
+
+    async def permission_retract(self, escalation_id: str, reason: str) -> Response:
+        """Withdraw a permission escalation and return the master's reply."""
+        return await self._send(
+            T_PERMISSION_RETRACT,
+            PermissionRetractPayload(escalation_id=escalation_id, reason=reason),
         )
 
     async def deliver(self, escalation_id: str) -> Response:
@@ -73,7 +83,8 @@ class FakeBrokerClient:
         payload: (
             EscalationPayload
             | PermissionEscalationPayload
-            | RetractPayload
+            | EscalationRetractPayload
+            | PermissionRetractPayload
             | DecisionDeliveredPayload
         ),
     ) -> Response:

@@ -212,15 +212,6 @@ class ClarifyEscalationReplyPayload(BaseModel):
     answer: str
 
 
-class RaiserIdentity(BaseModel):
-    """Who raised an escalation: the one-at-a-time rule is per raiser."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    component: Literal["broker", "permission"]
-    session_id: str
-
-
 class Alternative(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -244,7 +235,6 @@ class EscalationPayload(BaseModel):
     recommendation: str
     uncertainty: str
     what_would_change_my_mind: str
-    raiser: RaiserIdentity
 
 
 class PermissionEscalationPayload(BaseModel):
@@ -263,7 +253,6 @@ class PermissionEscalationPayload(BaseModel):
     task_intent: str
     reason: str
     raised_at: str  # ISO timestamp; every resolution signal is dated against it
-    raiser: RaiserIdentity
     permission_suggestions: list[PermissionSuggestion] = Field(
         default_factory=list[PermissionSuggestion]
     )
@@ -295,8 +284,17 @@ class FatalErrorPayload(BaseModel):
     detail: str
 
 
-class RetractPayload(BaseModel):
-    """broker -> master: escalation resolved out of band."""
+class EscalationRetractPayload(BaseModel):
+    """broker -> master: a decision escalation resolved out of band."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    escalation_id: str
+    reason: str
+
+
+class PermissionRetractPayload(BaseModel):
+    """permission module -> master: a permission prompt that is no longer open."""
 
     model_config = ConfigDict(extra="ignore")
 

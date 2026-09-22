@@ -40,7 +40,6 @@ from broker.master.runtime import (
     render_permission_escalation,
     render_proposal,
 )
-from broker.protocol.schemas import PermissionEscalationPayload
 
 MAX_TOOL_ROUNDS = 6
 
@@ -382,9 +381,9 @@ class MasterLLM:
 
     def _assemble(self, developer_message: str) -> list[MessageParam]:
         """Fresh per turn: registry summary, the single active
-        escalation (verbatim block), any pending prompt proposals (verbatim
-        blocks), a bounded window of recent turns, then the developer's
-        message."""
+        escalation (verbatim block), every open permission escalation and
+        pending prompt proposal (verbatim blocks), a bounded window of recent
+        turns, then the developer's message."""
         blocks: list[TextBlockParam] = [
             {
                 "type": "text",
@@ -393,23 +392,27 @@ class MasterLLM:
             }
         ]
         active = self.runtime.queue.active
-        if isinstance(active, PermissionEscalationPayload):
+        if active is not None:
+            blocks.append({"type": "text", "text": "# Active escalation"})
+            # Byte-identical to the runtime rendering — its own block, so
+            # nothing is prepended to or reflowed around the broker's words.
+            blocks.append({"type": "text", "text": render_escalation(active)})
+        for prompt in self.runtime.open_permission_escalations():
             blocks.append(
-                {"type": "text", "text": "# Active permission escalation"}
+                {
+                    "type": "text",
+                    "text": "# Open permission escalation — session "
+                    + prompt.session_id,
+                }
             )
             blocks.append(
                 {
                     "type": "text",
                     "text": render_permission_escalation(
-                        active, self.runtime.pane_of(active.session_id)
+                        prompt, self.runtime.pane_of(prompt.session_id)
                     ),
                 }
             )
-        elif active is not None:
-            blocks.append({"type": "text", "text": "# Active escalation"})
-            # Byte-identical to the runtime rendering — its own block, so
-            # nothing is prepended to or reflowed around the broker's words.
-            blocks.append({"type": "text", "text": render_escalation(active)})
         for pending in self.runtime.pending_proposals():
             blocks.append(
                 {

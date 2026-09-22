@@ -1,74 +1,40 @@
-"""Persisted strict-FIFO escalation queue: broker_home/escalation-queue.json.
+"""Persisted strict-FIFO decision-escalation queue: broker_home/escalation-queue.json.
 
-One escalation is live per raiser; the head is the one surfaced to the
+One escalation is live per session; the head is the one surfaced to the
 developer. Order is the file's list order — every mutation persists before it
-returns, so a pending escalation survives a master restart.
+returns, so a pending escalation survives a master restart. Permission
+escalations are never queued here: they live in
+``broker.master.permission_escalations``.
 """
 
 import json
 from pathlib import Path
-from typing import Annotated, Any, Literal, cast
+from typing import Any, cast
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from pydantic import ValidationError
 
 from broker.claude.atomic import atomic_update_json
-from broker.protocol.schemas import (
-    EscalationPayload,
-    PermissionEscalationPayload,
-    RaiserIdentity,
-)
-
-# Whatever a session broker or its permission module escalated. Both carry the
-# identity the queue rules read: escalation_id, session_id and raiser.
-QueuePayload = EscalationPayload | PermissionEscalationPayload
+from broker.protocol.schemas import EscalationPayload
 
 
 class QueueError(Exception):
     """The persisted queue file could not be read or validated."""
 
 
-class ProtocolViolation(Exception):
-    """A raiser broke the one-outstanding-escalation invariant."""
-
-
-class _EscalationEntry(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    kind: Literal["escalation"] = "escalation"
-    payload: EscalationPayload
-
-
-class _PermissionEntry(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    kind: Literal["permission_escalation"] = "permission_escalation"
-    payload: PermissionEscalationPayload
-
-
-_Entry = _EscalationEntry | _PermissionEntry
-
-_ENTRY: TypeAdapter[_Entry] = TypeAdapter(
-    Annotated[_Entry, Field(discriminator="kind")]
-)
-
-
-def _to_entry(payload: QueuePayload) -> _Entry:
-    """Wrap a payload in its persistence entry."""
-    if isinstance(payload, PermissionEscalationPayload):
-        return _PermissionEntry(payload=payload)
-    return _EscalationEntry(payload=payload)
+class EscalationProtocolViolation(Exception):
+    """A session broke the one-outstanding-escalation invariant."""
 
 
 class EscalationQueue:
-    """Persisted strict-FIFO escalation store (accept / retract / resolve /
-    active)."""
+    """Persisted strict-FIFO decision-escalation store (accept / retract /
+    resolve / active)."""
 
     def __init__(
-        self, path: Path, entries: list[QueuePayload] | None = None
+        self, path: Path, entries: list[EscalationPayload] | None = None
     ) -> None:
         """Hold the queue file path and the payloads loaded from it."""
         self._path = path
-        self._entries: list[QueuePayload] = list(entries or [])
+        self._entries: list[EscalationPayload] = list(entries or [])
 
     @classmethod
     def load(cls, path: Path) -> "EscalationQueue":
@@ -97,10 +63,10 @@ class EscalationQueue:
         raw_queue = cast(dict[str, Any], parsed).get("queue", [])
         if not isinstance(raw_queue, list):
             raise QueueError(f"{path}: 'queue' is not a list")
-        entries: list[QueuePayload] = []
+        entries: list[EscalationPayload] = []
         for i, raw in enumerate(cast(list[Any], raw_queue)):
             try:
-                entries.append(_ENTRY.validate_python(raw).payload)
+                entries.append(EscalationPayload.model_validate(raw))
             except ValidationError as exc:
                 raise QueueError(
                     f"{path}: invalid queue entry {i}: {exc}"
@@ -108,7 +74,7 @@ class EscalationQueue:
         return cls(path, entries)
 
     @property
-    def active(self) -> QueuePayload | None:
+    def active(self) -> EscalationPayload | None:
         """Return the escalation awaiting the developer, or ``None``."""
         return self._entries[0] if self._entries else None
 
@@ -123,31 +89,31 @@ class EscalationQueue:
         return tuple(p.session_id for p in self._entries[1:])
 
     @property
-    def entries(self) -> tuple[QueuePayload, ...]:
+    def entries(self) -> tuple[EscalationPayload, ...]:
         """Return every live entry, head first, as a read-only snapshot."""
         return tuple(self._entries)
 
-    def accept(self, payload: QueuePayload) -> None:
+    def accept(self, payload: EscalationPayload) -> None:
         """Append ``payload`` to the queue and persist it.
 
         Args:
             payload: The escalation to queue for the developer.
 
         Raises:
-            ProtocolViolation: The raiser already has a live escalation,
-                surfaced or waiting — it is expected to wait for its own
-                escalation to resolve.
+            EscalationProtocolViolation: The session already has a live
+                escalation, surfaced or waiting — it is expected to wait for
+                its own escalation to resolve.
         """
         for entry in self._entries:
-            if entry.raiser == payload.raiser:
-                raise ProtocolViolation(
+            if entry.session_id == payload.session_id:
+                raise EscalationProtocolViolation(
                     f"escalation {payload.escalation_id} arrived while "
                     f"{entry.escalation_id} is live"
                 )
         self._entries.append(payload)
         self.save()
 
-    def retract(self, escalation_id: str) -> QueuePayload | None:
+    def retract(self, escalation_id: str) -> EscalationPayload | None:
         """Clear an escalation its session has withdrawn, wherever it waits.
 
         Args:
@@ -163,7 +129,7 @@ class EscalationQueue:
                 return cleared
         return None
 
-    def resolve(self, escalation_id: str) -> QueuePayload | None:
+    def resolve(self, escalation_id: str) -> EscalationPayload | None:
         """Clear an escalation the developer has decided.
 
         Only a matching head is cleared: a stale resolve must be a no-op so a
@@ -181,18 +147,18 @@ class EscalationQueue:
             return cleared
         return None
 
-    def retract_for_raiser(self, raiser: RaiserIdentity) -> QueuePayload | None:
-        """Clear the live escalation raised by ``raiser``, if any.
+    def retract_for_session(self, session_id: str) -> EscalationPayload | None:
+        """Clear the live escalation raised by ``session_id``, if any.
 
         Args:
-            raiser: Identity whose live entry — there is at most one — is to
-                be withdrawn.
+            session_id: Session whose live entry — there is at most one — is
+                to be withdrawn.
 
         Returns:
-            The cleared payload, or ``None`` when the raiser had none live.
+            The cleared payload, or ``None`` when the session had none live.
         """
         for i, entry in enumerate(self._entries):
-            if entry.raiser == raiser:
+            if entry.session_id == session_id:
                 cleared = self._entries.pop(i)
                 self.save()
                 return cleared
@@ -200,7 +166,7 @@ class EscalationQueue:
 
     def save(self) -> None:
         """Write the in-memory entries back to the queue file."""
-        queue = [_to_entry(p).model_dump() for p in self._entries]
+        queue = [p.model_dump() for p in self._entries]
 
         def mutate(data: dict[str, Any]) -> dict[str, Any]:
             """Replace ``queue``, leaving the rest of the file intact."""

@@ -68,6 +68,7 @@ from broker.protocol.constants import (
     T_DECISION_UNDELIVERED,
     T_DISPATCH_DECISION,
     T_ESCALATION,
+    T_ESCALATION_RETRACT,
     T_FATAL_ERROR,
     T_GET_DECISION_LOG,
     T_GET_PERMISSION_LOG,
@@ -76,7 +77,6 @@ from broker.protocol.constants import (
     T_PERMISSION_REQUEST,
     T_PROMPT_PROPOSAL,
     T_REACTIVATE,
-    T_RETRACT,
     T_SEND_PROMPT,
     T_SESSION_ENDED,
     T_SHUTDOWN,
@@ -102,7 +102,6 @@ from broker.protocol.schemas import (
     PermissionLogPayload,
     PermissionRequestPayload,
     PromptProposalPayload,
-    RaiserIdentity,
     ReactivatePayload,
     Response,
     RetrievedSymbol,
@@ -1130,7 +1129,6 @@ class SessionBroker:
             recommendation=recommendation,
             uncertainty=uncertainty,
             what_would_change_my_mind=what_would_change_my_mind,
-            raiser=RaiserIdentity(component="broker", session_id=self.cfg.name),
         )
 
     async def _escalate_handover(
@@ -1477,7 +1475,7 @@ class SessionBroker:
         self._end_active_escalation()
         self._set_state(SessionState.DRIVING)
         await self._to_master(
-            T_RETRACT,
+            T_ESCALATION_RETRACT,
             {"escalation_id": escalation_id, "reason": "resolved in pane"},
         )
 
