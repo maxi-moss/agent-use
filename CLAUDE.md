@@ -8,7 +8,7 @@ A master process routes decisions between one developer and N session brokers, e
 
 ## Stack
 
-- Python + `uv` for deps and locking — versions live in the root `pyproject.toml` and `uv.lock`
+- Python 3.14 + `uv` for deps and locking — versions live in the root `pyproject.toml` and `uv.lock`
 - pydantic — every socket and config boundary
 - Textual — TUI
 - asyncio unix domain sockets — all IPC
