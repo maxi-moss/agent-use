@@ -46,6 +46,7 @@ from broker.protocol.constants import (
     T_CLARIFY_ESCALATION,
     T_BUDGET_UPDATE,
     T_COMPLETION,
+    T_DECISION_DELIVERED,
     T_DECISION_UNDELIVERED,
     T_DISPATCH_DECISION,
     T_ESCALATION,
@@ -685,6 +686,14 @@ async def test_queued_escalation_surfaces_after_resolve(
         )
         result = await runtime.dispatch("e1", "use option B")
         assert "dispatched" in result
+        # Resolution waits for confirmed delivery: e1 is still the head and
+        # nothing new surfaces until the broker confirms it reached the pane.
+        assert [
+            m for m in posts if isinstance(m, PermissionEscalationArrived)
+        ] == []
+        assert runtime.queue.active is not None
+        assert runtime.queue.active.escalation_id == "e1"
+        assert (await send(runtime, T_DECISION_DELIVERED, {"escalation_id": "e1"})).ok
         arrived = [
             m for m in posts if isinstance(m, PermissionEscalationArrived)
         ]
@@ -776,6 +785,8 @@ async def test_notification_fires_at_surface_time_not_accept(
         ).ok
         assert notify_count() == 1  # only the surfaced head is announced
         await runtime.dispatch("e1", "use option B")
+        assert notify_count() == 1  # nothing new surfaces before delivery lands
+        assert (await send(runtime, T_DECISION_DELIVERED, {"escalation_id": "e1"})).ok
         assert notify_count() == 2  # the next head announces when it surfaces
     finally:
         server.close()
@@ -1070,6 +1081,8 @@ async def test_queue_depth_reflects_every_mutation(
         ).ok
         assert depth() == (2, ("s1",))
         await runtime.dispatch("e1", "use option B")
+        assert depth() == (2, ("s1",))  # unresolved until delivery is confirmed
+        assert (await send(runtime, T_DECISION_DELIVERED, {"escalation_id": "e1"})).ok
         assert depth() == (1, ())
         assert (
             await send(
@@ -1119,10 +1132,14 @@ async def test_dispatch_delivers_decision_when_live(
         assert env.type == T_DISPATCH_DECISION
         assert env.payload["escalation_id"] == "e1"
         assert env.payload["response"] == "use option B"
-        # Advanced optimistically the instant the broker accepts.
+        # The ACK only accepts it for processing: e1 stays the live head until
+        # the broker confirms delivery, then it resolves.
+        assert runtime.queue.active is not None
+        assert runtime.queue.active.escalation_id == "e1"
+        assert (await send(runtime, T_DECISION_DELIVERED, {"escalation_id": "e1"})).ok
         assert runtime.queue.active is None
-        # Single authority: the master never invents DRIVING at dispatch —
-        # the state stays until the broker reports its own transition.
+        # Single authority: the master never invents DRIVING — the state stays
+        # until the broker reports its own transition.
         assert runtime.registry.get("s1").state == "escalated"
         assert (
             await send(runtime, T_LIVE_STATUS, {"state": "driving"})
@@ -1133,7 +1150,7 @@ async def test_dispatch_delivers_decision_when_live(
         await server.wait_closed()
 
 
-async def test_undelivered_decision_is_reported_loudly(
+async def test_undelivered_still_live_keeps_escalation_for_redecide(
     rt: tuple[MasterRuntime, list[Any]], home: Path
 ) -> None:
     runtime, posts = rt
@@ -1141,31 +1158,100 @@ async def test_undelivered_decision_is_reported_loudly(
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
         assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-        # Optimistic advance resolved e1 already; the failed delivery arrives
-        # after.
         assert "dispatched" in await runtime.dispatch("e1", "use option B")
-        assert runtime.queue.active is None
-        surfaced_before = len(
-            [m for m in posts if isinstance(m, EscalationArrived)]
-        )
         assert (
             await send(
                 runtime,
                 T_DECISION_UNDELIVERED,
                 {
                     "escalation_id": "e1",
-                    "detail": "session had already moved on",
+                    "detail": "SubmitTimeout: pane wedged",
+                    "still_live": True,
                 },
             )
         ).ok
-        # The developer is told loudly rather than left believing it landed,
-        # and nothing is re-surfaced or mis-popped.
+        # A failed pane write never resolved e1: it is reported loudly and
+        # stays the live head so the developer can dispatch again.
         notices = [m.text for m in posts if isinstance(m, Notice)]
         assert any("did NOT reach" in t and "e1" in t for t in notices)
+        assert runtime.queue.active is not None
+        assert runtime.queue.active.escalation_id == "e1"
+        # The in-flight lock cleared, so a re-decide dispatches rather than
+        # bouncing off a decision that is supposedly still being delivered.
+        assert "dispatched" in await runtime.dispatch("e1", "retry")
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_undelivered_stale_retracts_orphaned_entry(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, posts = rt
+    stub = StubSession()
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
+        assert "dispatched" in await runtime.dispatch("e1", "use option B")
         assert (
-            len([m for m in posts if isinstance(m, EscalationArrived)])
-            == surfaced_before
+            await send(
+                runtime,
+                T_DECISION_UNDELIVERED,
+                {
+                    "escalation_id": "e1",
+                    "detail": "session had already moved past this escalation",
+                    "still_live": False,
+                },
+            )
+        ).ok
+        # The broker no longer holds e1 (e.g. answered before a master
+        # restart): the orphaned entry is dropped so the queue cannot wedge.
+        assert runtime.queue.active is None
+        notices = [m.text for m in posts if isinstance(m, Notice)]
+        assert any("cleared" in t and "e1" in t for t in notices)
+        # The in-flight lock cleared with it: a fresh escalation dispatches.
+        assert (await send(runtime, T_ESCALATION, escalation_dict("e2"))).ok
+        assert "dispatched" in await runtime.dispatch("e2", "go")
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_stop_session_clears_inflight_for_its_own_head(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, _ = rt
+    stub = StubSession()
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
+        assert "dispatched" in await runtime.dispatch("e1", "go")
+        # Stopped mid-delivery: no delivered/undelivered reply ever clears the
+        # marker, so the stop must, or a re-dispatch is wrongly refused.
+        await runtime.stop_session("s1")
+        assert (
+            "already being delivered"
+            not in await runtime.dispatch("e1", "retry")
         )
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_second_dispatch_refused_while_inflight(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, _ = rt
+    stub = StubSession()
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
+        assert "dispatched" in await runtime.dispatch("e1", "first")
+        # A decision is already on its way to the pane; a second would
+        # double-submit the same escalation.
+        result = await runtime.dispatch("e1", "second")
+        assert "already being delivered" in result
+        assert len(stub.envelopes) == 1  # the second never reached the session
     finally:
         server.close()
         await server.wait_closed()

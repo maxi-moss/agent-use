@@ -9,6 +9,7 @@
     {"op": "assert_surfaced", "escalation_id": "e1"},
     {"op": "retract", "session": "s2", "escalation_id": "e2", "reason": "resolved in the pane"},
     {"op": "dispatch", "escalation_id": "e1", "decision": "go ahead", "expect": "dispatched"},
+    {"op": "deliver", "session": "s1", "escalation_id": "e1"},
     {"op": "assert_never_surfaced", "escalation_id": "e2"},
     {"op": "assert_depth", "depth": 0, "waiting": []}
   ]

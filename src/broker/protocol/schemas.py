@@ -116,18 +116,33 @@ class DispatchDecisionPayload(BaseModel):
     response: str
 
 
+class DecisionDeliveredPayload(BaseModel):
+    """broker -> master: a dispatched decision reached the pane.
+
+    The master resolves the escalation only on this confirmation — the dispatch
+    ACK means the broker accepted the decision for processing, not that it
+    landed. Binding resolution to delivery keeps the two sides from diverging.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    escalation_id: str
+
+
 class DecisionUndeliveredPayload(BaseModel):
     """broker -> master: a dispatched decision did not reach the pane.
 
-    Sent only on failure. The escalation was resolved optimistically when the
-    dispatch ACK arrived; this brings the miss back loudly so the developer
-    never assumes a decision landed when it did not.
+    Sent when a pane write fails or the dispatch was stale. Since resolution
+    waits for delivery, the escalation was never resolved: ``still_live`` says
+    whether the broker still holds it (a failed write — keep it surfaced for a
+    re-decide) or has moved past it (a stale dispatch — drop the queue entry).
     """
 
     model_config = ConfigDict(extra="ignore")
 
     escalation_id: str
     detail: str = ""
+    still_live: bool = True
 
 
 class SendPromptPayload(BaseModel):

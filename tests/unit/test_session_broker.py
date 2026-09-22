@@ -30,6 +30,7 @@ from broker.protocol.constants import (
     T_ASK_QUESTION,
     T_BUDGET_UPDATE,
     T_COMPLETION,
+    T_DECISION_DELIVERED,
     T_DECISION_UNDELIVERED,
     T_DISPATCH_DECISION,
     T_ESCALATION,
@@ -148,6 +149,7 @@ class ScriptedRun:
 
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
+        self.fail_prompt: Exception | None = None
 
     def __call__(
         self,
@@ -159,6 +161,8 @@ class ScriptedRun:
     ) -> subprocess.CompletedProcess[str]:
         self.calls.append(list(argv))
         key = tuple(argv[1:3])
+        if key == ("agent", "prompt") and self.fail_prompt is not None:
+            raise self.fail_prompt
         if key == ("pane", "split"):
             out = (HERDR_FIXTURES / "pane_split.json").read_text()
         elif key == ("agent", "start"):
@@ -1295,6 +1299,10 @@ async def test_dispatch_decision_submits_and_resets_budget(
     ]
     assert harness.broker.budget_count == 0
     await wait_state(harness.broker, "driving")
+    # Resolution is bound to real delivery: the broker confirms the decision
+    # reached the pane so the master resolves the escalation, not on the ACK.
+    delivered = await harness.master.wait_for(T_DECISION_DELIVERED)
+    assert delivered.payload["escalation_id"] == escalation.payload["escalation_id"]
 
 
 async def escalate_via_stop(h: Harness) -> str:
@@ -1443,10 +1451,41 @@ async def test_stale_dispatch_decision_is_reported_not_submitted(
         ),
         timeout_s=5.0,
     )
-    # Nothing reaches the pane, and the miss is reported loudly, never silent.
+    # Nothing reaches the pane, and the miss is reported as no-longer-held so
+    # the master drops its orphaned queue entry.
     undelivered = await harness.master.wait_for(T_DECISION_UNDELIVERED)
     assert undelivered.payload["escalation_id"] == "stale-id"
+    assert undelivered.payload["still_live"] is False
     assert harness.run.drive_calls() == []
+
+
+async def test_dispatch_decision_submit_failure_reports_undelivered(
+    harness: Harness,
+) -> None:
+    await launch(harness)
+    escalation_id = await escalate_via_stop(harness)
+    harness.run.calls.clear()
+    harness.run.fail_prompt = RuntimeError("pane gone")
+    await client.request(
+        harness.sock,
+        Envelope(
+            id=uuid.uuid4().hex,
+            type=T_DISPATCH_DECISION,
+            session_id="s1",
+            payload={"escalation_id": escalation_id, "response": "go with a"},
+        ),
+        timeout_s=5.0,
+    )
+    # A failed pane write is a loud miss (still_live), never confirmed as
+    # delivered: the broker holds the escalation and stays ESCALATED so the
+    # master leaves it surfaced for a re-decide, with no fatal.
+    undelivered = await harness.master.wait_for(T_DECISION_UNDELIVERED)
+    assert undelivered.payload["escalation_id"] == escalation_id
+    assert "pane gone" in undelivered.payload["detail"]
+    assert undelivered.payload["still_live"] is True
+    assert harness.master.of_type(T_DECISION_DELIVERED) == []
+    assert harness.broker.state == "escalated"  # still held, awaiting re-decide
+    assert "dispatch_failed" in await decision_log_text(harness)
 
 
 async def test_budget_exhaustion_converts_answer_to_escalation(

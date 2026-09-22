@@ -30,6 +30,7 @@ class DecisionKind(StrEnum):
     COMPLETED = "completed"
     DEVELOPER_PROMPT = "developer_prompt"
     DISPATCHED = "dispatched"
+    DISPATCH_FAILED = "dispatch_failed"
     ERROR = "error"
     ESCALATION_RAISED = "escalation_raised"
     NO_ACTION = "no_action"
