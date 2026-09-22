@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from broker.config import BrokerConfig
+from broker.master.permission_escalations import PermissionEscalations
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry
 from broker.master.runtime import MasterRuntime
@@ -35,8 +36,11 @@ async def rt(home: Path) -> AsyncIterator[tuple[MasterRuntime, list[Any]]]:
     cfg = BrokerConfig(model_id="test-model", broker_home=home)
     registry = Registry.load(home / "registry.json")
     queue = EscalationQueue.load(home / "escalation-queue.json")
+    permissions = PermissionEscalations.load(home / "permission-escalations.json")
     posts: list[Any] = []
-    runtime = MasterRuntime(posts.append, registry, queue, cfg, anchor_pane="%1")
+    runtime = MasterRuntime(
+        posts.append, registry, queue, permissions, cfg, anchor_pane="%1"
+    )
     task = asyncio.create_task(runtime.serve())
     for _ in range(200):
         if runtime.master_socket_path.exists():
@@ -85,8 +89,8 @@ async def test_dispatch_race(rt: tuple[MasterRuntime, list[Any]]) -> None:
     await _run(rt, "dispatch-race")
 
 
-async def test_duplicate_raiser(rt: tuple[MasterRuntime, list[Any]]) -> None:
-    await _run(rt, "duplicate-raiser")
+async def test_duplicate_escalation(rt: tuple[MasterRuntime, list[Any]]) -> None:
+    await _run(rt, "duplicate-escalation")
 
 
 async def test_broker_death(rt: tuple[MasterRuntime, list[Any]]) -> None:
