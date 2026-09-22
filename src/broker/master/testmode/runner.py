@@ -28,14 +28,16 @@ from broker.master.testmode.schemas import (
     AssertIsolated,
     AssertNeverSurfaced,
     AssertNoDispatchWrite,
+    AssertOpenPermissions,
     AssertSurfaced,
     AssertUnreachable,
     Attach,
     Deliver,
     Dispatch,
     Escalate,
+    EscalationRetract,
     PermissionEscalate,
-    Retract,
+    PermissionRetract,
     Scenario,
     ScenarioError,
     ScenarioReport,
@@ -50,7 +52,6 @@ from broker.protocol.schemas import (
     Alternative,
     EscalationPayload,
     PermissionEscalationPayload,
-    RaiserIdentity,
     Response,
 )
 
@@ -102,7 +103,6 @@ def _escalation_payload(step: Escalate) -> EscalationPayload:
         recommendation=f"recommendation for {eid}",
         uncertainty=f"uncertainty for {eid}",
         what_would_change_my_mind=f"what would change my mind for {eid}",
-        raiser=RaiserIdentity(component="broker", session_id=step.session),
     )
 
 
@@ -117,7 +117,6 @@ def _permission_payload(step: PermissionEscalate) -> PermissionEscalationPayload
         task_intent=f"task intent for {eid}",
         reason=f"reason for {eid}",
         raised_at=step.raised_at,
-        raiser=RaiserIdentity(component="permission", session_id=step.session),
     )
 
 
@@ -306,12 +305,22 @@ async def _run_step(
         resp = await broker.permission_escalate(_permission_payload(step))
         return _check_expect(index, op, step.expect, resp)
 
-    if isinstance(step, Retract):
+    if isinstance(step, EscalationRetract):
         ctx.require_seeded(index, step.session)
         broker = FakeBrokerClient(
             runtime.master_socket_path, step.session, timeout_s=timeout_s
         )
-        resp = await broker.retract(step.escalation_id, step.reason)
+        resp = await broker.escalation_retract(step.escalation_id, step.reason)
+        passed = resp.ok
+        detail = "retracted" if passed else f"retract NACKed: {resp.payload}"
+        return StepResult(index=index, op=op, passed=passed, detail=detail)
+
+    if isinstance(step, PermissionRetract):
+        ctx.require_seeded(index, step.session)
+        broker = FakeBrokerClient(
+            runtime.master_socket_path, step.session, timeout_s=timeout_s
+        )
+        resp = await broker.permission_retract(step.escalation_id, step.reason)
         passed = resp.ok
         detail = "retracted" if passed else f"retract NACKed: {resp.payload}"
         return StepResult(index=index, op=op, passed=passed, detail=detail)
@@ -391,6 +400,25 @@ async def _run_step(
             if passed
             else f"expected depth={step.depth} waiting={want}, saw {seen}"
         )
+        return StepResult(index=index, op=op, passed=passed, detail=detail)
+
+    if isinstance(step, AssertOpenPermissions):
+        want_ids = step.escalation_ids
+
+        def permissions_match() -> bool:
+            latest = _latest(posts, FleetUpdated)
+            return latest is not None and [
+                p.escalation_id for p in latest.view.permissions
+            ] == want_ids
+
+        passed = await _poll_until(permissions_match, timeout_s)
+        latest = _latest(posts, FleetUpdated)
+        seen = (
+            f"open={[p.escalation_id for p in latest.view.permissions]}"
+            if latest is not None
+            else "no fleet view posted"
+        )
+        detail = seen if passed else f"expected open={want_ids}, saw {seen}"
         return StepResult(index=index, op=op, passed=passed, detail=detail)
 
     if isinstance(step, AssertIsolated):

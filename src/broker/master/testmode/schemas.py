@@ -62,10 +62,19 @@ class PermissionEscalate(BaseModel):
     expect: str = "ack"
 
 
-class Retract(BaseModel):
+class EscalationRetract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    op: Literal["retract"]
+    op: Literal["escalation_retract"]
+    session: str
+    escalation_id: str
+    reason: str
+
+
+class PermissionRetract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal["permission_retract"]
     session: str
     escalation_id: str
     reason: str
@@ -120,6 +129,13 @@ class AssertDepth(BaseModel):
     waiting: list[str] = Field(default_factory=list[str])
 
 
+class AssertOpenPermissions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal["assert_open_permissions"]
+    escalation_ids: list[str] = Field(default_factory=list[str])
+
+
 class AssertIsolated(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -146,13 +162,15 @@ Step = Annotated[
     | StopFakeSocket
     | Escalate
     | PermissionEscalate
-    | Retract
+    | EscalationRetract
+    | PermissionRetract
     | Dispatch
     | Deliver
     | Attach
     | AssertSurfaced
     | AssertNeverSurfaced
     | AssertDepth
+    | AssertOpenPermissions
     | AssertIsolated
     | AssertNoDispatchWrite
     | AssertUnreachable,

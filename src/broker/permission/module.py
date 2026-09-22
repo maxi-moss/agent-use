@@ -30,15 +30,14 @@ from broker.protocol.constants import (
     DECISION_ESCALATED,
     NACK_SLOT_OCCUPIED,
     T_PERMISSION_ESCALATION,
-    T_RETRACT,
+    T_PERMISSION_RETRACT,
 )
 from broker.protocol.schemas import (
     Envelope,
     PermissionEscalationPayload,
+    PermissionRetractPayload,
     PermissionSuggestion,
-    RaiserIdentity,
     Response,
-    RetractPayload,
 )
 
 logger = logging.getLogger(__name__)
@@ -262,9 +261,6 @@ class PermissionModule:
             task_intent=self.intent,
             reason=reason,
             raised_at=datetime.now(UTC).isoformat(timespec="seconds"),
-            raiser=RaiserIdentity(
-                component="permission", session_id=self.session_name
-            ),
             permission_suggestions=suggestions,
         )
         superseded = self._live
@@ -281,7 +277,7 @@ class PermissionModule:
         """Retract the escalation this one replaces, then raise this one.
 
         The two sends are sequential because the master holds one slot per
-        raiser: overlapping them would let the raise arrive first and be
+        session: overlapping them would let the raise arrive first and be
         refused for capacity by the very escalation it supersedes.
 
         Args:
@@ -290,7 +286,7 @@ class PermissionModule:
         """
         if superseded is not None:
             await self._send_retract(
-                RetractPayload(
+                PermissionRetractPayload(
                     escalation_id=superseded.escalation_id,
                     reason=_RETRACT_SUPERSEDED,
                 )
@@ -305,7 +301,7 @@ class PermissionModule:
             reason: Why it no longer needs the developer.
         """
         self._live = None
-        payload = RetractPayload(
+        payload = PermissionRetractPayload(
             escalation_id=live.escalation_id, reason=reason
         )
         self._spawn(self._send_retract(payload))
@@ -351,14 +347,14 @@ class PermissionModule:
         # claimed — a later call has to be free to raise.
         self._release(payload.escalation_id)
 
-    async def _send_retract(self, payload: RetractPayload) -> None:
+    async def _send_retract(self, payload: PermissionRetractPayload) -> None:
         """Send one retraction; a failed send leaves nothing to undo.
 
         Args:
             payload: The retraction to send.
         """
         await self._send(
-            T_RETRACT, payload.model_dump(), payload.escalation_id
+            T_PERMISSION_RETRACT, payload.model_dump(), payload.escalation_id
         )
 
     async def _send(

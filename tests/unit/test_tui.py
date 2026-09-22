@@ -25,6 +25,7 @@ from broker import decision_log
 from broker.decision_log import DecisionKind
 from broker.config import BrokerConfig
 from broker.llm import TurnResult
+from broker.master.permission_escalations import PermissionEscalations
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry, SessionRecord
 from broker.master.tui.app import BrokerMasterApp
@@ -39,6 +40,7 @@ from broker.master.viewmodel import (
     FleetView,
     HeadRequest,
     PermissionEscalationArrived,
+    PermissionRequest,
     ProposalArrived,
     SessionRow,
 )
@@ -86,7 +88,8 @@ def make_app(home: Path, llm: GatedLLM) -> BrokerMasterApp:
     cfg = BrokerConfig(model_id="test-model", broker_home=home)
     registry = Registry.load(home / "registry.json")
     queue = EscalationQueue.load(home / "escalation-queue.json")
-    return BrokerMasterApp(cfg, registry, queue, llm, anchor_pane="%1")
+    permissions = PermissionEscalations.load(home / "permission-escalations.json")
+    return BrokerMasterApp(cfg, registry, queue, permissions, llm, anchor_pane="%1")
 
 
 def chat_texts(app: BrokerMasterApp) -> list[str]:
@@ -153,6 +156,7 @@ def _fleet_view(
     *,
     queue_depth: int = 0,
     head: HeadRequest | None = None,
+    permissions: tuple[PermissionRequest, ...] = (),
 ) -> FleetView:
     return FleetView(
         master_activity=None,
@@ -160,6 +164,7 @@ def _fleet_view(
         queue_depth=queue_depth,
         waiting=(),
         head=head,
+        permissions=permissions,
     )
 
 
@@ -257,25 +262,67 @@ async def test_slash_escalation_forgets_a_head_the_fleet_no_longer_names(
         assert rendered not in _chat_only_texts(app)
 
 
-async def test_permission_escalation_pastes_verbatim_on_slash_escalation(
+async def test_slash_permission_pastes_one_prompt_and_disambiguates(
     home: Path,
 ) -> None:
-    rendered = (
-        "Permission escalation p1 — session s1\n\nanswer it in pane [w3:p2]"
-    )
+    s1_rendered = "Permission escalation p1 — session s1\n\nanswer it in pane [w3:p2]"
+    s2_rendered = "Permission escalation p2 — session s2\n\nanswer it in pane [w3:p4]"
+    app = make_app(home, GatedLLM())
+    async with app.run_test() as pilot:
+        await pilot.pause(0.05)
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            PermissionEscalationArrived("s1", "p1", s1_rendered)
+        )
+        await pilot.pause()
+        assert s1_rendered not in _chat_only_texts(app)  # arrival stays off the chat
+        box = app.query_one("#box", PromptArea)
+        box.focus()
+        box.text = "/escalation"
+        await pilot.press("enter")
+        await pilot.pause()
+        # A permission prompt is not a decision: /escalation never shows it.
+        assert s1_rendered not in _chat_only_texts(app)
+        box.focus()
+        box.text = "/permission"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert s1_rendered in _chat_only_texts(app)  # the only one: no sN needed
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            PermissionEscalationArrived("s2", "p2", s2_rendered)
+        )
+        await pilot.pause()
+        box.focus()
+        box.text = "/permission"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert s2_rendered not in _chat_only_texts(app)  # two open: ambiguous
+        box.focus()
+        box.text = "/permission s2"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert s2_rendered in _chat_only_texts(app)
+
+
+async def test_slash_permission_forgets_a_prompt_the_fleet_no_longer_names(
+    home: Path,
+) -> None:
+    rendered = "Permission escalation p1 — session s1\n\nanswer it in pane [w3:p2]"
     app = make_app(home, GatedLLM())
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
         app._emit(  # pyright: ignore[reportPrivateUsage]
             PermissionEscalationArrived("s1", "p1", rendered)
         )
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            FleetUpdated(_fleet_view((_session_row("s1", ()),)))
+        )
         await pilot.pause()
         box = app.query_one("#box", PromptArea)
         box.focus()
-        box.text = "/escalation"
+        box.text = "/permission s1"
         await pilot.press("enter")
         await pilot.pause()
-        assert rendered in _chat_only_texts(app)
+        assert rendered not in _chat_only_texts(app)
 
 
 async def test_slash_proposal_pastes_one_proposal_and_disambiguates(
@@ -357,7 +404,8 @@ async def test_fleet_sidebar_renders_badges_and_waiting_count(home: Path) -> Non
         ),
         queue_depth=1,
         waiting=(),
-        head=HeadRequest("s1", "e1", Attention.ESCALATION, "ship it?"),
+        head=HeadRequest("s1", "e1", "ship it?"),
+        permissions=(PermissionRequest("s2", "p2", "Bash"),),
     )
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
@@ -370,7 +418,7 @@ async def test_fleet_sidebar_renders_badges_and_waiting_count(home: Path) -> Non
         assert "permission · w3:p2" in text
         assert "1 request waiting" in text
         app._emit(  # pyright: ignore[reportPrivateUsage]
-            FleetUpdated(FleetView(None, (), 0, (), None))
+            FleetUpdated(FleetView(None, (), 0, (), None, ()))
         )
         await pilot.pause()
         assert "all clear" in _fleet_text(app)
@@ -394,9 +442,7 @@ async def test_notice_names_the_head_and_each_pending_proposal(
                         _session_row("s4", (Attention.ESCALATION,)),
                     ),
                     queue_depth=2,
-                    head=HeadRequest(
-                        "s2", "e2", Attention.ESCALATION, "retry or fail loud?"
-                    ),
+                    head=HeadRequest("s2", "e2", "retry or fail loud?"),
                 )
             )
         )
@@ -413,24 +459,52 @@ async def test_notice_names_the_head_and_each_pending_proposal(
         assert app.query_one("#notice", AttentionNotice).display is False
 
 
-async def test_notice_sends_a_permission_head_to_its_pane(home: Path) -> None:
+async def test_notice_lists_every_open_prompt_apart_from_the_count(
+    home: Path,
+) -> None:
     app = make_app(home, GatedLLM())
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
+        rows = (
+            _session_row("s1", (Attention.PERMISSION,), pane_id="w3:p2"),
+            _session_row("s2", (Attention.ESCALATION,)),
+            _session_row("s5", (Attention.PERMISSION,)),
+        )
+        prompts = (
+            PermissionRequest("s1", "p1", "Bash"),
+            PermissionRequest("s5", "p5", "Edit"),
+        )
         app._emit(  # pyright: ignore[reportPrivateUsage]
             FleetUpdated(
                 _fleet_view(
-                    (_session_row("s1", (Attention.PERMISSION,), pane_id="w3:p2"),),
+                    rows,
                     queue_depth=1,
-                    head=HeadRequest("s1", "p1", Attention.PERMISSION, "Bash"),
+                    head=HeadRequest("s2", "e2", "retry or fail loud?"),
+                    permissions=prompts,
                 )
             )
         )
         await pilot.pause()
+        text = _notice_text(app)
+        # The count is decisions only; each open prompt is its own line.
+        assert "1 request waiting · s2 needs a decision: retry or fail loud?" in text
         assert (
-            "1 request waiting · s1 permission prompt for Bash — answer it in "
-            "pane w3:p2"
-        ) in _notice_text(app)
+            "⚠ s1 permission prompt for Bash — answer it in pane w3:p2; "
+            "/permission s1 shows why"
+        ) in text
+        assert "⚠ s5 permission prompt for Edit — answer it in its pane" in text
+        assert "1 request waiting" in _fleet_text(app)
+        # With no decision waiting the prompts still show, and nothing counts
+        # them as waiting requests.
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            FleetUpdated(_fleet_view(rows, permissions=prompts))
+        )
+        await pilot.pause()
+        text = _notice_text(app)
+        assert app.query_one("#notice", AttentionNotice).display is True
+        assert "s1 permission prompt for Bash" in text
+        assert "waiting ·" not in text
+        assert "all clear" in _fleet_text(app)
 
 
 async def test_inject_runs_a_scenario_end_to_end(home: Path) -> None:
@@ -458,10 +532,12 @@ async def test_inject_runs_a_scenario_end_to_end(home: Path) -> None:
     cfg = BrokerConfig(model_id="test-model", broker_home=home)
     registry = Registry.load(home / "registry.json")
     queue = EscalationQueue.load(home / "escalation-queue.json")
+    permissions = PermissionEscalations.load(home / "permission-escalations.json")
     app = BrokerMasterApp(
         cfg,
         registry,
         queue,
+        permissions,
         GatedLLM(),
         anchor_pane="%1",
         scenarios_dir=scenarios_dir,

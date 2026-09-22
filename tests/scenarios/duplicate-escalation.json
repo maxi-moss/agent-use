@@ -1,5 +1,5 @@
 {
-  "name": "duplicate-raiser",
+  "name": "duplicate-escalation",
   "steps": [
     {"op": "seed_session", "name": "s1"},
     {"op": "escalate", "session": "s1", "escalation_id": "e1", "expect": "ack"},

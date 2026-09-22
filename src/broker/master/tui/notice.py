@@ -1,7 +1,8 @@
 """AttentionNotice: the pinned strip above the master chat naming what needs
-the developer right now — the queue head and any proposals awaiting approval.
-It renders from FleetView alone and hides itself when nothing is waiting; the
-disclosures themselves enter the chat only on /escalation or /proposal."""
+the developer right now — the decision-queue head, every open permission prompt
+and any proposals awaiting approval. It renders from FleetView alone and hides
+itself when nothing is waiting; the disclosures themselves enter the chat only
+on /escalation, /permission or /proposal."""
 
 from rich.text import Text
 from textual.widgets import Static
@@ -10,7 +11,8 @@ from broker.master.viewmodel import Attention, FleetView
 
 
 class AttentionNotice(Static):
-    """One line for the queue head, one per pending proposal."""
+    """One line for the queue head, one per open permission prompt, one per
+    pending proposal."""
 
     DEFAULT_CSS = """
     AttentionNotice {
@@ -33,6 +35,17 @@ class AttentionNotice(Static):
         head_line = AttentionNotice._head_line(view)
         if head_line is not None:
             lines.append(head_line)
+        for prompt in view.permissions:
+            pane = next(
+                (r.pane_id for r in view.rows if r.session_id == prompt.session_id),
+                None,
+            )
+            where = f"pane {pane}" if pane else "its pane"
+            lines.append(
+                f"⚠ {prompt.session_id} permission prompt for {prompt.tool_name}"
+                f" — answer it in {where}; /permission {prompt.session_id}"
+                " shows why"
+            )
         for row in view.rows:
             if Attention.PROPOSAL in row.badges:
                 lines.append(
@@ -48,16 +61,6 @@ class AttentionNotice(Static):
             return None
         n = view.queue_depth
         count = f"{n} request{'s' if n != 1 else ''} waiting"
-        if head.kind is Attention.PERMISSION:
-            pane = next(
-                (r.pane_id for r in view.rows if r.session_id == head.session_id),
-                None,
-            )
-            where = f"pane {pane}" if pane else "its pane"
-            return (
-                f"⚠ {count} · {head.session_id} permission prompt for "
-                f"{head.text} — answer it in {where}"
-            )
         return (
             f"⚠ {count} · {head.session_id} needs a decision: {head.text}"
             " — /escalation shows the disclosure"

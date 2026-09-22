@@ -25,6 +25,7 @@ from textual.worker import Worker, WorkerState
 from broker.config import BrokerConfig
 from broker.llm import LLMCaller, TurnResult
 from broker.master.llm import MasterLLM
+from broker.master.permission_escalations import PermissionEscalations
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry
 from broker.master.runtime import MasterRuntime
@@ -70,6 +71,7 @@ class BrokerMasterApp(App[None]):
         cfg: BrokerConfig,
         registry: Registry,
         queue: EscalationQueue,
+        permissions: PermissionEscalations,
         llm_call: LLMCaller[TurnResult],
         *,
         anchor_pane: str,
@@ -85,13 +87,15 @@ class BrokerMasterApp(App[None]):
         # scenario runner reads its assertions from, while still reaching the
         # widgets.
         self._scenario_posts: list[ViewEvent] = []
-        # Disclosures are held here, off the chat, until /escalation or
-        # /proposal pastes one in; FleetUpdated prunes what is no longer live.
-        self._head: EscalationArrived | PermissionEscalationArrived | None = None
+        # Disclosures are held here, off the chat, until /escalation,
+        # /permission or /proposal pastes one in; FleetUpdated prunes what is
+        # no longer live.
+        self._head: EscalationArrived | None = None
+        self._permissions: dict[str, str] = {}
         self._proposals: dict[str, str] = {}
         self._last_view: FleetView | None = None
         self.runtime = MasterRuntime(
-            self._emit, registry, queue, cfg, anchor_pane=anchor_pane
+            self._emit, registry, queue, permissions, cfg, anchor_pane=anchor_pane
         )
         self.master_llm = MasterLLM(llm_call, self.runtime, cfg)
         self._server_task: asyncio.Task[None] | None = None
@@ -150,6 +154,9 @@ class BrokerMasterApp(App[None]):
         box.clear()
         if text == "/escalation":
             self._show_escalation()
+            return
+        if text == "/permission" or text.startswith("/permission "):
+            self._show_permission(text[len("/permission"):].strip() or None)
             return
         if text == "/proposal" or text.startswith("/proposal "):
             self._show_proposal(text[len("/proposal"):].strip() or None)
@@ -273,7 +280,7 @@ class BrokerMasterApp(App[None]):
                 f"escalation {event.escalation_id} from {event.session_id}"
             )
         elif isinstance(event, PermissionEscalationArrived):
-            self._head = event
+            self._permissions[event.session_id] = event.rendered
             self._event_line(
                 f"permission escalation {event.escalation_id} from "
                 f"{event.session_id}"
@@ -304,6 +311,10 @@ class BrokerMasterApp(App[None]):
             head is None or head.escalation_id != self._head.escalation_id
         ):
             self._head = None
+        prompting = {p.session_id for p in view.permissions}
+        self._permissions = {
+            sid: text for sid, text in self._permissions.items() if sid in prompting
+        }
         proposing = {r.session_id for r in view.rows if Attention.PROPOSAL in r.badges}
         self._proposals = {
             sid: text for sid, text in self._proposals.items() if sid in proposing
@@ -316,16 +327,37 @@ class BrokerMasterApp(App[None]):
             return
         self._chat_block(self._head.rendered)
 
+    def _show_permission(self, session_id: str | None) -> None:
+        """Paste an open permission prompt's disclosure into the chat, verbatim."""
+        self._paste_held(
+            self._permissions, session_id, noun="permission prompt", command="/permission"
+        )
+
     def _show_proposal(self, session_id: str | None) -> None:
-        """Paste a pending proposal into the chat: ``session_id``'s, or the only one."""
-        if session_id is None and len(self._proposals) == 1:
-            session_id = next(iter(self._proposals))
-        rendered = self._proposals.get(session_id) if session_id else None
+        """Paste a pending proposal into the chat, verbatim."""
+        self._paste_held(
+            self._proposals, session_id, noun="proposal", command="/proposal"
+        )
+
+    def _paste_held(
+        self, held: dict[str, str], session_id: str | None, *, noun: str, command: str
+    ) -> None:
+        """Paste ``session_id``'s held disclosure, or the only one, into the chat.
+
+        Args:
+            held: Rendered disclosures by session id.
+            session_id: Session named on the command line, if any.
+            noun: What the disclosures are, for the activity line on a miss.
+            command: The command that names a session, for that same line.
+        """
+        if session_id is None and len(held) == 1:
+            session_id = next(iter(held))
+        rendered = held.get(session_id) if session_id else None
         if rendered is None:
             self._event_line(
-                "no single proposal — use /proposal sN"
-                if self._proposals
-                else "no proposal is waiting"
+                f"no single {noun} — use {command} sN"
+                if held
+                else f"no {noun} is waiting"
             )
             return
         self._chat_block(rendered)

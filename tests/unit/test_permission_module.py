@@ -29,7 +29,7 @@ from broker.protocol.constants import (
     NACK_MALFORMED,
     NACK_SLOT_OCCUPIED,
     T_PERMISSION_ESCALATION,
-    T_RETRACT,
+    T_PERMISSION_RETRACT,
 )
 from broker.protocol.schemas import Envelope, Response
 from broker.protocol.server import serve_unix
@@ -231,11 +231,11 @@ async def test_signals_1_2_4_retract(
         assert await module.decide("Bash", PUSH_INPUT, []) == DECISION_ESCALATED
         raised = await master.wait_for(T_PERMISSION_ESCALATION)
         signal(module)
-        retract = await master.wait_for(T_RETRACT)
+        retract = await master.wait_for(T_PERMISSION_RETRACT)
         # A second signal has nothing left to resolve.
         signal(module)
         await asyncio.sleep(SETTLE_S)
-        assert len(master.of_type(T_RETRACT)) == 1
+        assert len(master.of_type(T_PERMISSION_RETRACT)) == 1
     assert retract.payload["escalation_id"] == raised.payload["escalation_id"]
     assert retract.payload["reason"]
 
@@ -247,7 +247,7 @@ async def test_unrelated_tool_completion_does_not_retract(home: Path) -> None:
         await master.wait_for(T_PERMISSION_ESCALATION)
         module.note_tool_completed("Read", READ_INPUT)
         await asyncio.sleep(SETTLE_S)
-        assert master.of_type(T_RETRACT) == []
+        assert master.of_type(T_PERMISSION_RETRACT) == []
 
 
 async def test_second_escalation_supersedes_the_first(home: Path) -> None:
@@ -263,14 +263,14 @@ async def test_second_escalation_supersedes_the_first(home: Path) -> None:
         first = await master.wait_for(T_PERMISSION_ESCALATION)
         assert await module.decide("Bash", DEPLOY_INPUT, []) == DECISION_ESCALATED
         second = await master.wait_for(T_PERMISSION_ESCALATION, count=2)
-        retract = await master.wait_for(T_RETRACT)
+        retract = await master.wait_for(T_PERMISSION_RETRACT)
         await asyncio.sleep(SETTLE_S)
     assert retract.payload["escalation_id"] == first.payload["escalation_id"]
     assert second.payload["tool_input"] == DEPLOY_INPUT
-    # The slot is one-per-raiser, so the retraction has to land first or the
+    # The slot is one-per-session, so the retraction has to land first or the
     # replacement is refused for capacity by the escalation it replaces.
     order = [e.type for e in master.received]
-    assert order.index(T_RETRACT) < order.index(T_PERMISSION_ESCALATION, 1)
+    assert order.index(T_PERMISSION_RETRACT) < order.index(T_PERMISSION_ESCALATION, 1)
     written = entries(log)
     assert [e["reason"] for e in written] == ["publishes to a remote", "deploys"]
 
@@ -327,4 +327,4 @@ async def test_non_capacity_nack_still_frees_the_slot(home: Path) -> None:
         # Nothing reached the developer, so there is nothing to retract.
         module.note_session_ended()
         await asyncio.sleep(SETTLE_S)
-        assert master.of_type(T_RETRACT) == []
+        assert master.of_type(T_PERMISSION_RETRACT) == []

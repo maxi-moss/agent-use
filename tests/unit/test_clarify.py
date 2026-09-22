@@ -29,7 +29,6 @@ ESCALATION = EscalationPayload.model_validate(
     {
         "escalation_id": "e1",
         "session_id": "s1",
-        "raiser": {"component": "broker", "session_id": "s1"},
         "task_context": "add a login page",
         "situation": "SITUATION-TEXT",
         "what_was_asked": "ASKED-TEXT",

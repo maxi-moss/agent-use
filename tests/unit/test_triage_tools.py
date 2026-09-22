@@ -63,7 +63,6 @@ def test_escalate_tool_fields_match_escalation_payload() -> None:
         "escalation_id",
         "session_id",
         "task_context",
-        "raiser",
     }
     assert tool_fields == payload_fields
 

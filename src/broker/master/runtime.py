@@ -1,6 +1,6 @@
-"""Master runtime layer: socket server, escalation queue, session
-spawn/stop, dispatch with liveness-at-dispatch, and the ONLY
-renderers of broker payloads.
+"""Master runtime layer: socket server, decision-escalation queue, open
+permission escalations, session spawn/stop, dispatch with
+liveness-at-dispatch, and the ONLY renderers of broker payloads.
 
 The runtime/LLM split is load-bearing: everything the developer reads is
 rendered HERE, verbatim, and handed to the TUI (and to the LLM layer as an
@@ -21,7 +21,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import ValidationError
 
@@ -49,15 +49,16 @@ from broker.master.viewmodel import (
     HeadRequest,
     Notice,
     PermissionEscalationArrived,
+    PermissionRequest,
     ProposalArrived,
     SessionRow,
     SessionStatusChanged,
 )
-from broker.master.queue import (
-    EscalationQueue,
-    ProtocolViolation,
-    QueuePayload,
+from broker.master.permission_escalations import (
+    PermissionEscalations,
+    PermissionProtocolViolation,
 )
+from broker.master.queue import EscalationProtocolViolation, EscalationQueue
 from broker.master.registry import Registry, SessionRecord
 from broker.protocol import client
 from broker.protocol.constants import (
@@ -73,14 +74,15 @@ from broker.protocol.constants import (
     T_DECISION_UNDELIVERED,
     T_DISPATCH_DECISION,
     T_ESCALATION,
+    T_ESCALATION_RETRACT,
     T_FATAL_ERROR,
     T_GET_DECISION_LOG,
     T_GET_PERMISSION_LOG,
     T_LIVE_STATUS,
     T_PERMISSION_ESCALATION,
+    T_PERMISSION_RETRACT,
     T_PROMPT_PROPOSAL,
     T_REACTIVATE,
-    T_RETRACT,
     T_SEND_PROMPT,
     T_SESSION_ENDED,
     T_SHUTDOWN,
@@ -98,16 +100,16 @@ from broker.protocol.schemas import (
     DispatchDecisionPayload,
     Envelope,
     EscalationPayload,
+    EscalationRetractPayload,
     FatalErrorPayload,
     LiveStatusPayload,
     PermissionEscalationPayload,
     PermissionLogPayload,
+    PermissionRetractPayload,
     PermissionSuggestion,
     PromptProposalPayload,
-    RaiserIdentity,
     ReactivatePayload,
     Response,
-    RetractPayload,
     RetrievedSymbol,
     SendPromptPayload,
     StatusPayload,
@@ -218,23 +220,27 @@ def _adoption_fields(record: SessionRecord) -> AdoptedSession:
 
 
 async def reconcile_registry(
-    registry: Registry, queue: EscalationQueue
+    registry: Registry,
+    queue: EscalationQueue,
+    permissions: PermissionEscalations,
 ) -> list[str]:
     """Classify every registry session at startup, retracting for dead ones.
 
     Probes are client-side connects and pane reads only — nothing is spawned
     and nothing binds a socket. A session whose pane is definitively gone is
-    removed and its queued escalations are retracted; every other outcome
-    leaves the session recoverable. An inconclusive probe never removes a
-    session — a wrong ``unmanaged`` costs the developer a glance, a wrong
-    removal throws away queued decisions.
+    removed and its queued escalation and open permission escalation are
+    retracted; every other outcome leaves the session recoverable. An
+    inconclusive probe never removes a session — a wrong ``unmanaged`` costs
+    the developer a glance, a wrong removal throws away queued decisions.
 
     Args:
         registry: Loaded session registry; a gone session is removed, every
             other classification updates its state in place and is saved once.
         queue: Persisted escalation queue; a dead session's queued
-            escalations are retracted from it before the TUI re-announces
+            escalation is retracted from it before the TUI re-announces
             the head.
+        permissions: Persisted permission escalations; a dead session's open
+            one is retracted before the TUI re-announces what remains.
 
     Returns:
         One classification line per session, plus one line per retraction.
@@ -263,16 +269,20 @@ async def reconcile_registry(
                 warnings.append(
                     f"session {name}: pane {record.pane_id} gone — removed"
                 )
-                for component in ("broker", "permission"):
-                    cleared = queue.retract_for_raiser(
-                        RaiserIdentity(component=component, session_id=name)
+                queued = queue.retract_for_session(name)
+                if queued is not None:
+                    warnings.append(
+                        f"session {name}: queued escalation "
+                        f"{queued.escalation_id} retracted — the session "
+                        "is dead and no decision can reach it"
                     )
-                    if cleared is not None:
-                        warnings.append(
-                            f"session {name}: queued escalation "
-                            f"{cleared.escalation_id} retracted — the session "
-                            "is dead and no decision can reach it"
-                        )
+                prompt = permissions.retract_for_session(name)
+                if prompt is not None:
+                    warnings.append(
+                        f"session {name}: permission escalation "
+                        f"{prompt.escalation_id} retracted — its pane and "
+                        "prompt are gone"
+                    )
                 # A session whose pane is gone is finished: drop it so it can
                 # never be a routing candidate. remove() persists on its own.
                 registry.remove(name)
@@ -448,16 +458,18 @@ class MasterRuntime:
         emit: EventSink,
         registry: Registry,
         queue: EscalationQueue,
+        permissions: PermissionEscalations,
         cfg: BrokerConfig,
         *,
         anchor_pane: str,
     ) -> None:
-        """Wire the runtime to its frontend sink, the registry, the queue and the config.
+        """Wire the runtime to its frontend sink, its persisted stores and the config.
 
         Args:
             emit: Receives every renderer-neutral view event the runtime produces.
             registry: Loaded session registry.
-            queue: Loaded escalation queue.
+            queue: Loaded decision-escalation queue.
+            permissions: Loaded open permission escalations.
             cfg: Broker configuration.
             anchor_pane: Herdr pane every spawned session is anchored to.
         """
@@ -466,6 +478,7 @@ class MasterRuntime:
         self.cfg = cfg
         self.anchor_pane = anchor_pane
         self.queue = queue
+        self.permissions = permissions
         self._surfaced_id: str | None = None
         # Escalation whose decision has been dispatched but not yet confirmed
         # delivered to the pane. Memory-only: an unconfirmed dispatch simply
@@ -486,10 +499,12 @@ class MasterRuntime:
 
     async def serve(self) -> None:
         """Bind the master socket and serve until cancelled."""
-        # A head loaded from disk has never been announced in this process, so
-        # it surfaces here, exactly once.
+        # A head or open permission prompt loaded from disk has never been
+        # announced in this process, so each is announced here, exactly once.
         self._publish_fleet()
         await self._surface_head()
+        for prompt in self.open_permission_escalations():
+            await self._announce_permission_escalation(prompt)
         server = await serve_unix(self.master_socket_path, self.handle)
         await self._repopulate_from_brokers()
         async with server:
@@ -557,39 +572,20 @@ class MasterRuntime:
             )
             # An errored session can no longer answer; its escalations would
             # otherwise wedge the queue, undispatchable to a dead session.
-            await self._retract_stranded_escalation(name, "broker")
-            await self._retract_stranded_escalation(name, "permission")
+            await self._retract_stranded_escalation(name)
+            self._retract_stranded_permission_escalation(name)
             await self._notify(
                 notifier.notify_request,
                 f"Session {name} failed",
                 f"{p.error_class}: {p.detail}",
             )
             return self._ack(env, ok=True)
-        if env.type == T_RETRACT:
-            p = RetractPayload.model_validate(env.payload)
-            self._clear_inflight(p.escalation_id)
-            cleared = self.queue.retract(p.escalation_id)
-            if isinstance(cleared, EscalationPayload):
-                # Raising it set ESCALATED here; withdrawing it must undo that
-                # or the registry outlives the escalation it describes.
-                self._set_state(name, SessionState.DRIVING)
-            if (
-                cleared is not None
-                and cleared.escalation_id == self._surfaced_id
-            ):
-                # It was surfaced, so the developer must learn it is no
-                # longer live; a waiting entry they never saw retracts
-                # silently.
-                self._surfaced_id = None
-                self.emit(
-                    Notice(
-                        f"escalation {p.escalation_id} from session {name} "
-                        f"retracted: {p.reason}"
-                    )
-                )
-            self._publish_fleet()
-            await self._surface_head()
-            return self._ack(env, ok=True)
+        if env.type == T_ESCALATION_RETRACT:
+            rp = EscalationRetractPayload.model_validate(env.payload)
+            return await self._on_escalation_retract(env, name, rp)
+        if env.type == T_PERMISSION_RETRACT:
+            pp = PermissionRetractPayload.model_validate(env.payload)
+            return self._on_permission_retract(env, name, pp)
         if env.type == T_PROMPT_PROPOSAL:
             p = PromptProposalPayload.model_validate(env.payload)
             self._set_state(name, SessionState.AWAITING_APPROVAL)
@@ -659,9 +655,11 @@ class MasterRuntime:
         unknown = self._reject_unknown_session(env, p.session_id, "escalation")
         if unknown is not None:
             return unknown
-        refused = self._accept_into_queue(env, p)
-        if refused is not None:
-            return refused
+        try:
+            self.queue.accept(p)
+        except EscalationProtocolViolation as exc:
+            self.emit(Notice(f"PROTOCOL VIOLATION: {exc}"))
+            return self._nack(env, str(exc), NACK_PROTOCOL_VIOLATION)
         self._set_state(p.session_id, SessionState.ESCALATED)
         self._publish_fleet()
         await self._surface_head()
@@ -670,8 +668,7 @@ class MasterRuntime:
     async def _on_permission_escalation(
         self, env: Envelope, name: str
     ) -> Response:
-        """Validate one permission escalation, queue it, and surface it if it
-        is next.
+        """Validate one permission escalation, hold it, and announce it at once.
 
         Args:
             env: Envelope carrying the permission-escalation payload.
@@ -701,11 +698,69 @@ class MasterRuntime:
         )
         if unknown is not None:
             return unknown
-        refused = self._accept_into_queue(env, p)
-        if refused is not None:
-            return refused
+        try:
+            self.permissions.accept(p)
+        except PermissionProtocolViolation as exc:
+            self.emit(Notice(f"PROTOCOL VIOLATION: {exc}"))
+            return self._nack(env, str(exc), NACK_PROTOCOL_VIOLATION)
+        self._publish_fleet()
+        await self._announce_permission_escalation(p)
+        return self._ack(env, ok=True)
+
+    async def _on_escalation_retract(
+        self, env: Envelope, name: str, p: EscalationRetractPayload
+    ) -> Response:
+        """Clear a decision escalation its session resolved out of band.
+
+        Args:
+            env: The retract envelope.
+            name: Session that withdrew the escalation.
+            p: The escalation withdrawn and why.
+
+        Returns:
+            The ACK.
+        """
+        self._clear_inflight(p.escalation_id)
+        cleared = self.queue.retract(p.escalation_id)
+        if cleared is not None:
+            # Raising it set ESCALATED here; withdrawing it must undo that
+            # or the registry outlives the escalation it describes.
+            self._set_state(name, SessionState.DRIVING)
+        if cleared is not None and cleared.escalation_id == self._surfaced_id:
+            # It was surfaced, so the developer must learn it is no longer
+            # live; a waiting entry they never saw retracts silently.
+            self._surfaced_id = None
+            self.emit(
+                Notice(
+                    f"escalation {p.escalation_id} from session {name} "
+                    f"retracted: {p.reason}"
+                )
+            )
         self._publish_fleet()
         await self._surface_head()
+        return self._ack(env, ok=True)
+
+    def _on_permission_retract(
+        self, env: Envelope, name: str, p: PermissionRetractPayload
+    ) -> Response:
+        """Clear a permission escalation whose native prompt is no longer open.
+
+        Args:
+            env: The retract envelope.
+            name: Session whose prompt closed.
+            p: The permission escalation withdrawn and why.
+
+        Returns:
+            The ACK.
+        """
+        if self.permissions.retract(p.escalation_id) is not None:
+            self.emit(
+                Notice(
+                    f"permission escalation {p.escalation_id} from session "
+                    f"{name} retracted: {p.reason}"
+                )
+            )
+            self._publish_fleet()
         return self._ack(env, ok=True)
 
     def _reject_unknown_session(
@@ -727,46 +782,12 @@ class MasterRuntime:
         self.emit(Notice(msg))
         return self._nack(env, msg, NACK_UNKNOWN_SESSION)
 
-    def _accept_into_queue(
-        self, env: Envelope, payload: QueuePayload
-    ) -> Response | None:
-        """Queue ``payload``, or build the NACK refusing it.
-
-        Args:
-            env: Envelope being answered.
-            payload: The escalation offered to the queue.
-
-        Returns:
-            ``None`` once accepted, otherwise the NACK.
-        """
-        try:
-            self.queue.accept(payload)
-        except ProtocolViolation as exc:
-            self.emit(Notice(f"PROTOCOL VIOLATION: {exc}"))
-            return self._nack(env, str(exc), NACK_PROTOCOL_VIOLATION)
-        return None
-
     async def _surface_head(self) -> None:
         """Render, announce and notify the queue's head, exactly once."""
         head = self.queue.active
         if head is None or head.escalation_id == self._surfaced_id:
             return
         self._surfaced_id = head.escalation_id
-        if isinstance(head, PermissionEscalationPayload):
-            pane_id = self.pane_of(head.session_id)
-            self.emit(
-                PermissionEscalationArrived(
-                    head.session_id,
-                    head.escalation_id,
-                    render_permission_escalation(head, pane_id),
-                )
-            )
-            await self._notify(
-                notifier.notify_request,
-                f"Permission prompt in session {head.session_id}",
-                f"{head.tool_name} — answer it in pane {pane_id}",
-            )
-            return
         self.emit(
             EscalationArrived(
                 head.session_id, head.escalation_id, render_escalation(head)
@@ -776,6 +797,24 @@ class MasterRuntime:
             notifier.notify_request,
             f"Escalation from session {head.session_id}",
             head.what_was_asked,
+        )
+
+    async def _announce_permission_escalation(
+        self, p: PermissionEscalationPayload
+    ) -> None:
+        """Render, announce and notify one open permission prompt."""
+        pane_id = self.pane_of(p.session_id)
+        self.emit(
+            PermissionEscalationArrived(
+                p.session_id,
+                p.escalation_id,
+                render_permission_escalation(p, pane_id),
+            )
+        )
+        await self._notify(
+            notifier.notify_request,
+            f"Permission prompt in session {p.session_id}",
+            f"{p.tool_name} — answer it in pane {pane_id}",
         )
 
     # ── session control (LLM-layer tool implementations) ─────────────────────
@@ -891,12 +930,12 @@ class MasterRuntime:
                 f"session {session_id}: a broker is still answering on "
                 f"{record.socket_path} — refusing to attach"
             )
-        # The dead broker's stranded escalations, both raiser identities: a
-        # decision dispatched to one would be discarded, and a live
-        # same-raiser entry would refuse the resumed broker's first
-        # escalation. It re-raises if the situation still holds.
-        await self._retract_stranded_escalation(session_id, "broker")
-        await self._retract_stranded_escalation(session_id, "permission")
+        # The dead broker's stranded escalations, of both kinds: a decision
+        # dispatched to one would be discarded, and a live entry would refuse
+        # the resumed broker's first raise. It re-raises if the situation
+        # still holds.
+        await self._retract_stranded_escalation(session_id)
+        self._retract_stranded_permission_escalation(session_id)
         resume = ResumedTask(
             approved_prompt=record.approved_prompt,
             completed=record.state == SessionState.COMPLETED,
@@ -1000,6 +1039,18 @@ class MasterRuntime:
             decision is already in flight for it, or a rejection if the session
             NACKed delivery.
         """
+        prompt = self.permissions.find(escalation_id)
+        if prompt is not None:
+            # The native prompt is the only thing that can answer it, and it is
+            # on the session's own screen.
+            pane_id = self.pane_of(prompt.session_id)
+            msg = (
+                f"decision NOT dispatched — escalation {escalation_id} is a "
+                f"permission prompt in session {prompt.session_id}. The "
+                f"developer answers it in pane {pane_id}."
+            )
+            self.emit(Notice(msg))
+            return msg
         # Liveness is checked THE INSTANT before the write, not at
         # surface time. A stale dispatch is the worst failure this system
         # can produce.
@@ -1008,17 +1059,6 @@ class MasterRuntime:
             msg = (
                 f"decision NOT dispatched — escalation {escalation_id} is "
                 "no longer live"
-            )
-            self.emit(Notice(msg))
-            return msg
-        if isinstance(active, PermissionEscalationPayload):
-            # The native prompt is the only thing that can answer it, and it is
-            # on the session's own screen.
-            pane_id = self.pane_of(active.session_id)
-            msg = (
-                f"decision NOT dispatched — escalation {escalation_id} is a "
-                f"permission prompt in session {active.session_id}. The "
-                f"developer answers it in pane {pane_id}."
             )
             self.emit(Notice(msg))
             return msg
@@ -1140,18 +1180,19 @@ class MasterRuntime:
             An acknowledgement line, or a refusal naming why no answer was
             obtained (not the head, a permission prompt, or the broker declined).
         """
+        prompt = self.permissions.find(escalation_id)
+        if prompt is not None:
+            pane_id = self.pane_of(prompt.session_id)
+            msg = (
+                f"question NOT sent — escalation {escalation_id} is a permission "
+                f"prompt in session {prompt.session_id}. The developer answers it "
+                f"in pane {pane_id}."
+            )
+            self.emit(Notice(msg))
+            return msg
         active = self.queue.active
         if active is None or active.escalation_id != escalation_id:
             msg = f"question NOT sent — escalation {escalation_id} is no longer live"
-            self.emit(Notice(msg))
-            return msg
-        if isinstance(active, PermissionEscalationPayload):
-            pane_id = self.pane_of(active.session_id)
-            msg = (
-                f"question NOT sent — escalation {escalation_id} is a permission "
-                f"prompt in session {active.session_id}. The developer answers it "
-                f"in pane {pane_id}."
-            )
             self.emit(Notice(msg))
             return msg
         record = self.registry.get(active.session_id)
@@ -1315,7 +1356,7 @@ class MasterRuntime:
             except TimeoutError:
                 proc.terminate()
                 await proc.wait()
-        await self._retract_stranded_escalation(session_id, "permission")
+        self._retract_stranded_permission_escalation(session_id)
         # A hard stop mid-delivery leaves no delivered/undelivered reply to
         # clear the in-flight marker. Drop it for this session's own head (the
         # broker escalation is intentionally kept) so a re-dispatch is not
@@ -1474,22 +1515,13 @@ class MasterRuntime:
                 )
             await asyncio.sleep(SOCKET_POLL_S)
 
-    async def _retract_stranded_escalation(
-        self, session_id: str, component: Literal["broker", "permission"]
-    ) -> None:
-        """Clear a queued escalation whose raiser died with the broker.
-
-        An escalation is normally withdrawn by the component that raised it.
-        With the broker gone nothing is left to withdraw it, and it would
-        wait in the queue indefinitely.
+    async def _retract_stranded_escalation(self, session_id: str) -> None:
+        """Clear a queued decision escalation whose broker is gone.
 
         Args:
             session_id: Session whose broker is gone.
-            component: Raiser component whose live entry is cleared.
         """
-        cleared = self.queue.retract_for_raiser(
-            RaiserIdentity(component=component, session_id=session_id)
-        )
+        cleared = self.queue.retract_for_session(session_id)
         if cleared is None:
             return
         self._clear_inflight(cleared.escalation_id)
@@ -1503,6 +1535,23 @@ class MasterRuntime:
         )
         self._publish_fleet()
         await self._surface_head()
+
+    def _retract_stranded_permission_escalation(self, session_id: str) -> None:
+        """Clear an open permission escalation whose permission module is gone.
+
+        Args:
+            session_id: Session whose broker is gone.
+        """
+        cleared = self.permissions.retract_for_session(session_id)
+        if cleared is None:
+            return
+        self.emit(
+            Notice(
+                f"permission escalation {cleared.escalation_id} from session "
+                f"{session_id} retracted: its broker is gone"
+            )
+        )
+        self._publish_fleet()
 
     async def _on_session_ended(self, env: Envelope, name: str) -> Response:
         """Retire a session whose broker reported its ``SessionEnd``.
@@ -1525,8 +1574,8 @@ class MasterRuntime:
             # The broker exits without withdrawing a live escalation of either
             # kind, so retract both — a stranded head would wedge the FIFO
             # queue, undispatchable to a gone session.
-            await self._retract_stranded_escalation(name, "broker")
-            await self._retract_stranded_escalation(name, "permission")
+            await self._retract_stranded_escalation(name)
+            self._retract_stranded_permission_escalation(name)
             self.emit(
                 Notice(f"session {name} ended (/exit) — removed from the fleet")
             )
@@ -1600,36 +1649,31 @@ class MasterRuntime:
             queue_depth=self.queue.depth,
             waiting=self.queue.waiting,
             head=self._head_request(),
+            permissions=tuple(
+                PermissionRequest(p.session_id, p.escalation_id, p.tool_name)
+                for p in self.open_permission_escalations()
+            ),
         )
 
     def _head_request(self) -> HeadRequest | None:
         head = self.queue.active
         if head is None:
             return None
-        if isinstance(head, PermissionEscalationPayload):
-            return HeadRequest(
-                head.session_id,
-                head.escalation_id,
-                Attention.PERMISSION,
-                head.tool_name,
-            )
-        return HeadRequest(
-            head.session_id,
-            head.escalation_id,
-            Attention.ESCALATION,
-            head.what_was_asked,
+        return HeadRequest(head.session_id, head.escalation_id, head.what_was_asked)
+
+    def open_permission_escalations(self) -> list[PermissionEscalationPayload]:
+        """Return every open permission escalation, in numeric session order."""
+        return sorted(
+            self.permissions.entries, key=lambda p: session_sort_key(p.session_id)
         )
 
     def _badges_by_session(self) -> dict[str, tuple[Attention, ...]]:
-        """Distinct attention badges per session, from the three live stores."""
+        """Distinct attention badges per session, from the four live sources."""
         acc: dict[str, set[Attention]] = {}
         for entry in self.queue.entries:
-            kind = (
-                Attention.PERMISSION
-                if entry.raiser.component == "permission"
-                else Attention.ESCALATION
-            )
-            acc.setdefault(entry.session_id, set()).add(kind)
+            acc.setdefault(entry.session_id, set()).add(Attention.ESCALATION)
+        for prompt in self.permissions.entries:
+            acc.setdefault(prompt.session_id, set()).add(Attention.PERMISSION)
         for pending in self.proposals.values():
             acc.setdefault(pending.session_name, set()).add(Attention.PROPOSAL)
         for name in self._permission_prompt_pending:

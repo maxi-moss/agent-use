@@ -13,7 +13,9 @@
     {"op": "assert_surfaced", "escalation_id": "e1"},
     {"op": "assert_depth", "depth": 3, "waiting": ["s2", "s3"]},
     {"op": "permission_escalate", "session": "s1", "escalation_id": "p1", "tool_name": "Bash", "tool_input": {"command": "rm work"}, "raised_at": "2026-07-29T12:00:00+00:00", "expect": "ack"},
-    {"op": "assert_depth", "depth": 4, "waiting": ["s2", "s3", "s1"]},
+    {"op": "assert_surfaced", "escalation_id": "p1"},
+    {"op": "assert_open_permissions", "escalation_ids": ["p1"]},
+    {"op": "assert_depth", "depth": 3, "waiting": ["s2", "s3"]},
     {"op": "dispatch", "escalation_id": "e1", "decision": "go ahead", "expect": "dispatched"},
     {"op": "deliver", "session": "s1", "escalation_id": "e1"},
     {"op": "assert_surfaced", "escalation_id": "e2"},
@@ -22,8 +24,8 @@
     {"op": "assert_surfaced", "escalation_id": "e3"},
     {"op": "dispatch", "escalation_id": "e3", "decision": "go ahead", "expect": "dispatched"},
     {"op": "deliver", "session": "s3", "escalation_id": "e3"},
-    {"op": "assert_surfaced", "escalation_id": "p1"},
-    {"op": "retract", "session": "s1", "escalation_id": "p1", "reason": "answered in the pane"},
+    {"op": "permission_retract", "session": "s1", "escalation_id": "p1", "reason": "answered in the pane"},
+    {"op": "assert_open_permissions", "escalation_ids": []},
     {"op": "assert_depth", "depth": 0, "waiting": []},
     {"op": "assert_isolated"}
   ]
