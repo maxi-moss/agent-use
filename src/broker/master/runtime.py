@@ -25,6 +25,7 @@ from typing import Any, Literal
 
 from pydantic import ValidationError
 
+from broker import decision_log
 from broker.claude.settings import write_session_permissions
 from broker.claude.trust import seed_trust
 from broker.config import (
@@ -37,6 +38,7 @@ from broker.herdr import driver
 from broker.herdr.driver import HerdrError
 from broker.paths import BrokerPaths
 from broker.master import notifier
+from broker.master.outcome import SessionOutcome, build_outcome
 from broker.master.viewmodel import (
     Attention,
     CompletionArrived,
@@ -1162,6 +1164,29 @@ class MasterRuntime:
         self._set_state(session_id, status.state)
         self._note_task_activity(session_id, status.task_activity)
         return status
+
+    def build_session_outcome(self, session_id: str) -> SessionOutcome:
+        """Assemble a settled session's read-only outcome from its decision log.
+
+        Args:
+            session_id: Registry name of the session.
+
+        Returns:
+            The structured outcome the modal renders.
+
+        Raises:
+            KeyError: No such session.
+        """
+        record = self.registry.get(session_id)
+        # Off disk, not over the socket: an error/stopped session's broker
+        # process is already gone, so the file is the only source left.
+        rows = decision_log.read_rows(self.paths.session_decisions(session_id))
+        return build_outcome(
+            session_id=session_id,
+            title=record.title,
+            state=record.state,
+            rows=rows,
+        )
 
     async def get_decision_log(self, session_id: str) -> str:
         """Fetch a session's decision log as text.
