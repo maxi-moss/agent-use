@@ -80,6 +80,14 @@ class Dispatch(BaseModel):
     expect: Literal["dispatched", "refused"]
 
 
+class Deliver(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal["deliver"]
+    session: str
+    escalation_id: str
+
+
 class Attach(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -140,6 +148,7 @@ Step = Annotated[
     | PermissionEscalate
     | Retract
     | Dispatch
+    | Deliver
     | Attach
     | AssertSurfaced
     | AssertNeverSurfaced

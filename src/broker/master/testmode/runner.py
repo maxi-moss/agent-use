@@ -31,6 +31,7 @@ from broker.master.testmode.schemas import (
     AssertSurfaced,
     AssertUnreachable,
     Attach,
+    Deliver,
     Dispatch,
     Escalate,
     PermissionEscalate,
@@ -322,6 +323,16 @@ async def _run_step(
         else:
             passed = outcome.startswith("decision NOT dispatched")
         return StepResult(index=index, op=op, passed=passed, detail=outcome)
+
+    if isinstance(step, Deliver):
+        ctx.require_seeded(index, step.session)
+        broker = FakeBrokerClient(
+            runtime.master_socket_path, step.session, timeout_s=timeout_s
+        )
+        resp = await broker.deliver(step.escalation_id)
+        passed = resp.ok
+        detail = "delivered" if passed else f"delivery NACKed: {resp.payload}"
+        return StepResult(index=index, op=op, passed=passed, detail=detail)
 
     if isinstance(step, Attach):
         ctx.require_seeded(index, step.session)

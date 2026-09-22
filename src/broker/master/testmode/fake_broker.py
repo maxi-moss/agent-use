@@ -14,12 +14,14 @@ from pathlib import Path
 from broker.protocol import client
 from broker.protocol.constants import (
     SessionState,
+    T_DECISION_DELIVERED,
     T_ESCALATION,
     T_PERMISSION_ESCALATION,
     T_RETRACT,
     T_STATUS,
 )
 from broker.protocol.schemas import (
+    DecisionDeliveredPayload,
     Envelope,
     EscalationPayload,
     PermissionEscalationPayload,
@@ -58,10 +60,22 @@ class FakeBrokerClient:
             RetractPayload(escalation_id=escalation_id, reason=reason),
         )
 
+    async def deliver(self, escalation_id: str) -> Response:
+        """Confirm a dispatched decision reached the pane."""
+        return await self._send(
+            T_DECISION_DELIVERED,
+            DecisionDeliveredPayload(escalation_id=escalation_id),
+        )
+
     async def _send(
         self,
         msg_type: str,
-        payload: EscalationPayload | PermissionEscalationPayload | RetractPayload,
+        payload: (
+            EscalationPayload
+            | PermissionEscalationPayload
+            | RetractPayload
+            | DecisionDeliveredPayload
+        ),
     ) -> Response:
         """Wrap a payload in a fresh-id envelope and send it to the master."""
         env = Envelope(
