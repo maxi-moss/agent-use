@@ -486,14 +486,16 @@ class MasterRuntime:
             await server.serve_forever()
 
     async def _repopulate_from_brokers(self) -> None:
-        """Fill task-activity (and refresh state) from each surviving broker."""
+        """Refresh state, task-activity and any pending proposal from each surviving broker."""
         for name in sorted(self.registry.records, key=session_sort_key):
             if self.registry.records[name].state in _ABSORBING:
                 continue
             try:
-                await self.probe_status(name)
+                status = await self.probe_status(name)
             except PROBE_FAILURES:
                 continue
+            if status.pending_proposal is not None:
+                self._register_proposal(name, status.pending_proposal)
         self._publish_fleet()
 
     async def handle(self, env: Envelope) -> Response | None:
@@ -575,11 +577,8 @@ class MasterRuntime:
             return self._ack(env, ok=True)
         if env.type == T_PROMPT_PROPOSAL:
             p = PromptProposalPayload.model_validate(env.payload)
-            self.proposals[p.proposal_id] = PendingProposal(name, p)
             self._set_state(name, SessionState.AWAITING_APPROVAL)
-            self.emit(
-                ProposalArrived(name, p.proposal_id, render_proposal(p))
-            )
+            self._register_proposal(name, p)
             return self._ack(env, ok=True)
         if env.type == T_BUDGET_UPDATE:
             p = BudgetUpdatePayload.model_validate(env.payload)
@@ -1509,6 +1508,13 @@ class MasterRuntime:
             name: tuple(sorted(kinds, key=lambda a: a.value))
             for name, kinds in acc.items()
         }
+
+    def _register_proposal(self, name: str, payload: PromptProposalPayload) -> None:
+        """Store a pending proposal and surface it to the developer."""
+        self.proposals[payload.proposal_id] = PendingProposal(name, payload)
+        self.emit(
+            ProposalArrived(name, payload.proposal_id, render_proposal(payload))
+        )
 
     def _discard_proposals(self, name: str) -> None:
         """Drop any pending proposal a session left behind on settling or exit."""

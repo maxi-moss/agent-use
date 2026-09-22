@@ -205,6 +205,28 @@ class StatusSession:
         )
 
 
+class ProposalStatusSession:
+    """Session-socket handler reporting a pending proposal on status."""
+
+    def __init__(self, proposal: dict[str, Any] | None) -> None:
+        self.proposal = proposal
+
+    async def handler(self, env: Envelope) -> Response:
+        if env.type != T_STATUS:
+            return Response(id=env.id, ok=False)
+        return Response(
+            id=env.id,
+            ok=True,
+            payload={
+                "state": "awaiting_approval",
+                "pane_id": "w3:p2",
+                "permission_prompt": False,
+                "task_activity": "",
+                "pending_proposal": self.proposal,
+            },
+        )
+
+
 def escalation_dict(esc_id: str = "e1", session: str = "s1") -> dict[str, Any]:
     return {
         "escalation_id": esc_id,
@@ -898,6 +920,108 @@ async def test_repopulate_from_brokers_fills_task_activity_at_startup(
     finally:
         server.close()
         await server.wait_closed()
+
+
+async def test_repopulate_from_brokers_recovers_pending_proposal(
+    home: Path,
+) -> None:
+    cfg = BrokerConfig(model_id="test-model", broker_home=home)
+    registry = Registry.load(home / "registry.json")
+    registry.upsert(
+        SessionRecord(
+            name="s1",
+            socket_path=str(home / "s" / "s1.sock"),
+            cwd="/private/tmp",
+            anchor_pane="%1",
+            state=SessionState.AWAITING_APPROVAL,
+        )
+    )
+    # A broker still awaiting approval hands its proposal back on the probe, so
+    # a restarted master recovers what its memory-only map had lost.
+    stub = ProposalStatusSession(
+        {
+            "proposal_id": "pr1",
+            "proposed_prompt": "add a health endpoint",
+            "grounding_summary": "grounded against app.main",
+        }
+    )
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    posts: list[Any] = []
+    runtime = MasterRuntime(
+        posts.append,
+        registry,
+        EscalationQueue.load(home / "escalation-queue.json"),
+        cfg,
+        anchor_pane="%1",
+    )
+    try:
+        task = asyncio.create_task(runtime.serve())
+        for _ in range(200):
+            if "pr1" in runtime.proposals:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("startup never recovered the pending proposal")
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert runtime.proposals["pr1"].session_name == "s1"
+    arrived = [m for m in posts if isinstance(m, ProposalArrived)]
+    assert [(m.session_id, m.proposal_id) for m in arrived] == [("s1", "pr1")]
+    assert "add a health endpoint" in arrived[0].rendered
+
+
+async def test_repopulate_from_brokers_registers_nothing_when_no_proposal(
+    home: Path,
+) -> None:
+    cfg = BrokerConfig(model_id="test-model", broker_home=home)
+    registry = Registry.load(home / "registry.json")
+    registry.upsert(
+        SessionRecord(
+            name="s1",
+            socket_path=str(home / "s" / "s1.sock"),
+            cwd="/private/tmp",
+            anchor_pane="%1",
+            state=SessionState.DRIVING,
+        )
+    )
+    # No proposal pending: the probe defaults pending_proposal to None and the
+    # guard registers nothing rather than crashing on the absent payload.
+    stub = StatusSession(permission_prompt=False, task_activity="working")
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    posts: list[Any] = []
+    runtime = MasterRuntime(
+        posts.append,
+        registry,
+        EscalationQueue.load(home / "escalation-queue.json"),
+        cfg,
+        anchor_pane="%1",
+    )
+    try:
+        task = asyncio.create_task(runtime.serve())
+        for _ in range(200):
+            if any(
+                isinstance(m, FleetUpdated)
+                and any(row.task_activity == "working" for row in m.view.rows)
+                for m in posts
+            ):
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("startup never probed the broker")
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert runtime.proposals == {}
+    assert [m for m in posts if isinstance(m, ProposalArrived)] == []
 
 
 async def test_stop_session_retracts_a_queued_permission_escalation(

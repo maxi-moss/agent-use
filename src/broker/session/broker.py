@@ -19,6 +19,7 @@ import json
 import logging
 import uuid
 from collections.abc import Awaitable, Callable, Generator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -159,6 +160,14 @@ STATUS_RETRY_S = 1.0
 Job = Callable[[], Awaitable[None]]
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingApproval:
+    """The prompt proposal the broker is awaiting the developer's approval on."""
+
+    future: asyncio.Future[ApprovePromptPayload]
+    payload: PromptProposalPayload
+
+
 class FatalSessionError(Exception):
     def __init__(self, error_class: str, detail: str) -> None:
         """Record the machine-readable class and human detail of the failure."""
@@ -267,8 +276,7 @@ class SessionBroker:
         self.task_activity: str = ""
 
         self.session_bound = asyncio.Event()
-        self._approval: asyncio.Future[ApprovePromptPayload] | None = None
-        self._proposal_id: str | None = None
+        self._pending: _PendingApproval | None = None
         self.queue: asyncio.Queue[Job | None] = asyncio.Queue()
         self._shutdown = asyncio.Event()
 
@@ -472,12 +480,10 @@ class SessionBroker:
                 )
             except (RetrievalError, EmbeddingError, LLMCallError) as exc:
                 raise FatalSessionError(type(exc).__name__, str(exc)) from exc
-        self._proposal_id = uuid.uuid4().hex
         loop = asyncio.get_running_loop()
-        self._approval = loop.create_future()
-        self._set_state(SessionState.AWAITING_APPROVAL)
+        approval: asyncio.Future[ApprovePromptPayload] = loop.create_future()
         payload = PromptProposalPayload(
-            proposal_id=self._proposal_id,
+            proposal_id=uuid.uuid4().hex,
             proposed_prompt=grounding.proposal.prompt,
             grounding_summary=grounding.proposal.reasoning,
             retrieved=[
@@ -485,12 +491,15 @@ class SessionBroker:
                 for s in grounding.context.symbols
             ],
         )
+        self._pending = _PendingApproval(approval, payload)
+        self._set_state(SessionState.AWAITING_APPROVAL)
         await self._to_master(T_PROMPT_PROPOSAL, payload.model_dump())
         # Approval is synchronous and blocking — no timeout.
-        approved = await self._approval
+        approved = await approval
         self.approved_prompt = approved.prompt
         self.permission.set_intent(self._intent())
         await self._submit(approved.prompt)
+        self._pending = None
         self._set_state(SessionState.DRIVING)
 
     async def _status_sender(self) -> None:
@@ -830,9 +839,9 @@ class SessionBroker:
         if env.type == T_APPROVE_PROMPT:
             approved = ApprovePromptPayload.model_validate(env.payload)
             if (
-                self._approval is None
-                or self._approval.done()
-                or approved.proposal_id != self._proposal_id
+                self._pending is None
+                or self._pending.future.done()
+                or approved.proposal_id != self._pending.payload.proposal_id
             ):
                 logger.warning("stale approve_prompt ignored")
                 return Response(
@@ -843,7 +852,7 @@ class SessionBroker:
                         "reason_code": NACK_STALE_PROPOSAL,
                     },
                 )
-            self._approval.set_result(approved)
+            self._pending.future.set_result(approved)
             return Response(id=env.id, ok=True)
 
         if env.type == T_DISPATCH_DECISION:
@@ -890,6 +899,9 @@ class SessionBroker:
                     ),
                     permission_prompt=self._permission_prompt_pending,
                     task_activity=self.task_activity,
+                    pending_proposal=(
+                        self._pending.payload if self._pending is not None else None
+                    ),
                 ).model_dump(),
             )
 
