@@ -44,6 +44,7 @@ from broker.protocol.constants import (
     T_CLARIFY_ESCALATION,
     T_BUDGET_UPDATE,
     T_COMPLETION,
+    T_DECISION_UNDELIVERED,
     T_DISPATCH_DECISION,
     T_ESCALATION,
     T_FATAL_ERROR,
@@ -1116,6 +1117,7 @@ async def test_dispatch_delivers_decision_when_live(
         assert env.type == T_DISPATCH_DECISION
         assert env.payload["escalation_id"] == "e1"
         assert env.payload["response"] == "use option B"
+        # Advanced optimistically the instant the broker accepts.
         assert runtime.queue.active is None
         # Single authority: the master never invents DRIVING at dispatch —
         # the state stays until the broker reports its own transition.
@@ -1124,6 +1126,70 @@ async def test_dispatch_delivers_decision_when_live(
             await send(runtime, T_LIVE_STATUS, {"state": "driving"})
         ).ok
         assert runtime.registry.get("s1").state == "driving"
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_undelivered_decision_is_reported_loudly(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, posts = rt
+    stub = StubSession()
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
+        # Optimistic advance resolved e1 already; the failed delivery arrives
+        # after.
+        assert "dispatched" in await runtime.dispatch("e1", "use option B")
+        assert runtime.queue.active is None
+        surfaced_before = len(
+            [m for m in posts if isinstance(m, EscalationArrived)]
+        )
+        assert (
+            await send(
+                runtime,
+                T_DECISION_UNDELIVERED,
+                {
+                    "escalation_id": "e1",
+                    "detail": "session had already moved on",
+                },
+            )
+        ).ok
+        # The developer is told loudly rather than left believing it landed,
+        # and nothing is re-surfaced or mis-popped.
+        notices = [m.text for m in posts if isinstance(m, Notice)]
+        assert any("did NOT reach" in t and "e1" in t for t in notices)
+        assert (
+            len([m for m in posts if isinstance(m, EscalationArrived)])
+            == surfaced_before
+        )
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_fatal_error_retracts_a_live_escalation(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, posts = rt
+    stub = StubSession()
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
+        # A session that dies with a live escalation would otherwise wedge the
+        # head forever, undispatchable to a dead session.
+        assert (
+            await send(
+                runtime,
+                T_FATAL_ERROR,
+                {"error_class": "SubmitTimeout", "detail": "pane unresponsive"},
+            )
+        ).ok
+        assert runtime.registry.get("s1").state == "error"
+        assert runtime.queue.active is None
+        notices = [m.text for m in posts if isinstance(m, Notice)]
+        assert any("e1" in t and "retracted" in t for t in notices)
     finally:
         server.close()
         await server.wait_closed()

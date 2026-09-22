@@ -62,6 +62,7 @@ from broker.protocol.constants import (
     T_ASK_QUESTION,
     T_BUDGET_UPDATE,
     T_COMPLETION,
+    T_DECISION_UNDELIVERED,
     T_DISPATCH_DECISION,
     T_ESCALATION,
     T_FATAL_ERROR,
@@ -87,6 +88,7 @@ from broker.protocol.schemas import (
     AskQuestionDecisionPayload,
     AskQuestionRequestPayload,
     DecisionLogPayload,
+    DecisionUndeliveredPayload,
     DispatchDecisionPayload,
     Envelope,
     EscalationPayload,
@@ -1451,6 +1453,13 @@ class SessionBroker:
                 "error",
                 "stale dispatch_decision ignored",
                 decision.escalation_id,
+            )
+            await self._to_master(
+                T_DECISION_UNDELIVERED,
+                DecisionUndeliveredPayload(
+                    escalation_id=decision.escalation_id,
+                    detail="session had already moved past this escalation",
+                ).model_dump(),
             )
             return
         await self._submit(decision.response)

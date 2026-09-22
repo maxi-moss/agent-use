@@ -30,6 +30,7 @@ from broker.protocol.constants import (
     T_ASK_QUESTION,
     T_BUDGET_UPDATE,
     T_COMPLETION,
+    T_DECISION_UNDELIVERED,
     T_DISPATCH_DECISION,
     T_ESCALATION,
     T_FATAL_ERROR,
@@ -1423,7 +1424,9 @@ async def test_clarify_escalation_timeout_fails_loud_and_cancels_the_call(
     assert "clarify_failed" in await decision_log_text(harness)
 
 
-async def test_stale_dispatch_decision_is_ignored(harness: Harness) -> None:
+async def test_stale_dispatch_decision_is_reported_not_submitted(
+    harness: Harness,
+) -> None:
     await launch(harness)
     harness.run.calls.clear()
     await client.request(
@@ -1436,7 +1439,9 @@ async def test_stale_dispatch_decision_is_ignored(harness: Harness) -> None:
         ),
         timeout_s=5.0,
     )
-    await asyncio.sleep(0.1)
+    # Nothing reaches the pane, and the miss is reported loudly, never silent.
+    undelivered = await harness.master.wait_for(T_DECISION_UNDELIVERED)
+    assert undelivered.payload["escalation_id"] == "stale-id"
     assert harness.run.drive_calls() == []
 
 

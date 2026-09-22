@@ -67,6 +67,7 @@ from broker.protocol.constants import (
     T_CLARIFY_ESCALATION,
     T_BUDGET_UPDATE,
     T_COMPLETION,
+    T_DECISION_UNDELIVERED,
     T_DISPATCH_DECISION,
     T_ESCALATION,
     T_FATAL_ERROR,
@@ -89,6 +90,7 @@ from broker.protocol.schemas import (
     BudgetUpdatePayload,
     CompletionPayload,
     DecisionLogPayload,
+    DecisionUndeliveredPayload,
     DispatchDecisionPayload,
     Envelope,
     EscalationPayload,
@@ -545,6 +547,10 @@ class MasterRuntime:
             self.emit(
                 Notice(f"session {name} FATAL [{p.error_class}]: {p.detail}")
             )
+            # An errored session can no longer answer; its escalations would
+            # otherwise wedge the queue, undispatchable to a dead session.
+            await self._retract_stranded_escalation(name, "broker")
+            await self._retract_stranded_escalation(name, "permission")
             await self._notify(
                 notifier.notify_request,
                 f"Session {name} failed",
@@ -587,6 +593,9 @@ class MasterRuntime:
             self.registry.upsert(record)
             self._publish_fleet()
             return self._ack(env, ok=True)
+        if env.type == T_DECISION_UNDELIVERED:
+            p = DecisionUndeliveredPayload.model_validate(env.payload)
+            return await self._on_decision_undelivered(env, name, p)
         if env.type == T_LIVE_STATUS:
             p = LiveStatusPayload.model_validate(env.payload)
             rec = self.registry.records.get(name)
@@ -1018,6 +1027,8 @@ class MasterRuntime:
         if rejected is not None:
             self.emit(Notice(rejected))
             return rejected
+        # Resolve on the accept-ACK, not on pane delivery: a missed delivery
+        # comes back via T_DECISION_UNDELIVERED.
         self.queue.resolve(escalation_id)
         self._surfaced_id = None
         # No state write: DRIVING is the broker's transition to report, and
@@ -1025,6 +1036,27 @@ class MasterRuntime:
         self._publish_fleet()
         await self._surface_head()
         return f"decision dispatched to session {record.name}"
+
+    async def _on_decision_undelivered(
+        self, env: Envelope, name: str, p: DecisionUndeliveredPayload
+    ) -> Response:
+        """Surface a dispatched decision that failed to reach the pane.
+
+        Args:
+            env: The undelivered-decision envelope.
+            name: Session that reported the miss.
+            p: The escalation the decision answered and why it did not land.
+
+        Returns:
+            The ACK.
+        """
+        self.emit(
+            Notice(
+                f"decision for escalation {p.escalation_id} did NOT reach "
+                f"session {name}: {p.detail}"
+            )
+        )
+        return self._ack(env, ok=True)
 
     async def clarify_escalation(self, escalation_id: str, question: str) -> str:
         """Relay a read-only question about the live escalation to its broker.

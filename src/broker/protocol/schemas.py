@@ -116,6 +116,20 @@ class DispatchDecisionPayload(BaseModel):
     response: str
 
 
+class DecisionUndeliveredPayload(BaseModel):
+    """broker -> master: a dispatched decision did not reach the pane.
+
+    Sent only on failure. The escalation was resolved optimistically when the
+    dispatch ACK arrived; this brings the miss back loudly so the developer
+    never assumes a decision landed when it did not.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    escalation_id: str
+    detail: str = ""
+
+
 class SendPromptPayload(BaseModel):
     """master -> broker: relay a developer prompt into the session."""
 

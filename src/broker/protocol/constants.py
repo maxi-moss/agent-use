@@ -32,6 +32,7 @@ T_FATAL_ERROR = "fatal_error"
 T_RETRACT = "retract"
 T_PROMPT_PROPOSAL = "prompt_proposal"  # broker -> master
 T_BUDGET_UPDATE = "budget_update"  # broker -> master
+T_DECISION_UNDELIVERED = "decision_undelivered"  # broker -> master
 T_LIVE_STATUS = "live_status"  # broker -> master
 T_SESSION_ENDED = "session_ended"  # broker -> master: SessionEnd fired, exiting
 
