@@ -64,6 +64,7 @@ from broker.protocol.constants import (
     NACK_UNKNOWN_SESSION,
     SessionState,
     T_APPROVE_PROMPT,
+    T_CLARIFY_ESCALATION,
     T_BUDGET_UPDATE,
     T_COMPLETION,
     T_DISPATCH_DECISION,
@@ -83,6 +84,8 @@ from broker.protocol.constants import (
 )
 from broker.protocol.schemas import (
     ApprovePromptPayload,
+    ClarifyEscalationReplyPayload,
+    ClarifyEscalationRequestPayload,
     BudgetUpdatePayload,
     CompletionPayload,
     DecisionLogPayload,
@@ -117,6 +120,9 @@ def session_sort_key(name: str) -> tuple[int, str]:
 
 
 REQUEST_TIMEOUT_S = 10.0
+# The broker runs an LLM call before it can reply, so this is far longer than
+# REQUEST_TIMEOUT_S and must exceed the broker's own CLARIFY_TIMEOUT_S.
+CLARIFY_ESCALATION_TIMEOUT_S = 60.0
 STOP_WAIT_S = 10.0
 SOCKET_POLL_S = 0.1
 SOCKET_PROBE_TIMEOUT_S = 2.0
@@ -1020,6 +1026,61 @@ class MasterRuntime:
         self._publish_fleet()
         await self._surface_head()
         return f"decision dispatched to session {record.name}"
+
+    async def clarify_escalation(self, escalation_id: str, question: str) -> str:
+        """Relay a read-only question about the live escalation to its broker.
+
+        The escalation stays pending. The broker's answer is shown to the
+        developer verbatim (a Notice); this returns only an acknowledgement to
+        the tool loop, so the master never rewrites developer-facing text.
+
+        Args:
+            escalation_id: The escalation the question is about.
+            question: The developer's question, sent verbatim.
+
+        Returns:
+            An acknowledgement line, or a refusal naming why no answer was
+            obtained (not the head, a permission prompt, or the broker declined).
+        """
+        active = self.queue.active
+        if active is None or active.escalation_id != escalation_id:
+            msg = f"question NOT sent — escalation {escalation_id} is no longer live"
+            self.emit(Notice(msg))
+            return msg
+        if isinstance(active, PermissionEscalationPayload):
+            pane_id = self.pane_of(active.session_id)
+            msg = (
+                f"question NOT sent — escalation {escalation_id} is a permission "
+                f"prompt in session {active.session_id}. The developer answers it "
+                f"in pane {pane_id}."
+            )
+            self.emit(Notice(msg))
+            return msg
+        record = self.registry.get(active.session_id)
+        env = self._env(
+            T_CLARIFY_ESCALATION,
+            ClarifyEscalationRequestPayload(
+                escalation_id=escalation_id, question=question
+            ).model_dump(),
+        )
+        resp = await client.request(
+            Path(record.socket_path), env, timeout_s=CLARIFY_ESCALATION_TIMEOUT_S
+        )
+        if not resp.ok:
+            reason = resp.payload.get("error")
+            msg = (
+                f"no clarification from session {record.name} for escalation "
+                f"{escalation_id}"
+            )
+            if isinstance(reason, str) and reason:
+                msg = f"{msg}: {reason}"
+            self.emit(Notice(msg))
+            return msg
+        answer = ClarifyEscalationReplyPayload.model_validate(resp.payload).answer
+        self.emit(
+            Notice(f"Session {record.name} on escalation {escalation_id}:\n\n{answer}")
+        )
+        return f"clarification from session {record.name} shown to the developer"
 
     async def send_prompt(self, session_id: str, text: str) -> str:
         """Send a developer prompt straight to a session.

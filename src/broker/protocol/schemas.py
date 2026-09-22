@@ -145,6 +145,23 @@ class StatusPayload(BaseModel):
     task_activity: str = ""
 
 
+class ClarifyEscalationRequestPayload(BaseModel):
+    """master -> broker: a read-only question about a live escalation."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    escalation_id: str
+    question: str
+
+
+class ClarifyEscalationReplyPayload(BaseModel):
+    """broker -> master reply payload carrying a clarification answer."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    answer: str
+
+
 class RaiserIdentity(BaseModel):
     """Who raised an escalation: the one-at-a-time rule is per raiser."""
 

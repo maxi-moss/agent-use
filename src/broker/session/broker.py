@@ -2,9 +2,9 @@
 
 Structure:
 - `handle()` is the socket handler and does NO slow work: it replies, then
-  enqueues. The exceptions are permission_request and ask_question, answered
-  inline because a hook blocks on each — they must never queue behind an
-  unrelated turn triage.
+  enqueues. The exceptions are permission_request, ask_question, and
+  clarify_escalation, answered inline because the caller blocks on a single reply
+  on that connection — they must never queue behind an unrelated turn triage.
 - The serial event queue is the only place pane writes happen.
 - Classification input is `last_assistant_message` from the Stop payload,
   never the transcript tail. The watchdog reconciliation is the
@@ -57,6 +57,7 @@ from broker.protocol.constants import (
     NACK_WRONG_STATE,
     SessionState,
     T_APPROVE_PROMPT,
+    T_CLARIFY_ESCALATION,
     T_ASK_QUESTION,
     T_BUDGET_UPDATE,
     T_COMPLETION,
@@ -80,6 +81,8 @@ from broker.protocol.server import serve_unix
 from broker.protocol.schemas import (
     Alternative,
     ApprovePromptPayload,
+    ClarifyEscalationReplyPayload,
+    ClarifyEscalationRequestPayload,
     AskQuestionDecisionPayload,
     AskQuestionRequestPayload,
     DecisionLogPayload,
@@ -99,7 +102,7 @@ from broker.protocol.schemas import (
     SendPromptPayload,
     StatusPayload,
 )
-from broker.session import ask, decision_log
+from broker.session import ask, clarify, decision_log
 from broker.session.triage import (
     AnswerCall,
     CompleteCall,
@@ -133,6 +136,9 @@ ASK_DECISION_TIMEOUT_S = 20.0
 # updatedInput delivery is instantaneous when it works (duration_ms: 0
 # observed); this only fires when the mechanism broke or a hook was dropped.
 ASK_VERIFY_TIMEOUT_S = 30.0
+# Sits under the master's CLARIFY_ESCALATION_TIMEOUT_S so the broker's own deadline
+# expires first and it fails loud on its own terms.
+CLARIFY_TIMEOUT_S = 45.0
 
 # Forwarded to the claude binary at spawn. "auto" classifies each tool call and
 # still prompts on the risky ones, so the hook's escalation path survives;
@@ -146,6 +152,7 @@ PHRASE_GROUNDING = "constructing the prompt…"
 PHRASE_TRIAGE = "reviewing the latest turn…"
 PHRASE_PERMISSION = "reviewing a permission request…"
 PHRASE_ASK = "deciding a question…"
+PHRASE_CLARIFY = "answering a question about the escalation…"
 
 STATUS_RETRY_S = 1.0
 
@@ -266,6 +273,7 @@ class SessionBroker:
         self._shutdown = asyncio.Event()
 
         self._active_escalation: EscalationPayload | None = None
+        self._clarify_tasks: set[asyncio.Task[clarify.ClarifyCall]] = set()
         self._pending_ask_id: str | None = None
         self._ask_decisions: dict[str, AskQuestionDecisionPayload] = {}
         self._ask_expected: dict[str, dict[str, ask.AnswerValue]] = {}
@@ -682,6 +690,105 @@ class SessionBroker:
             decision=ASK_DECISION_ANSWER, updated_input=updated_input
         )
 
+    async def _on_clarify_escalation(self, env: Envelope) -> Response:
+        """Answer a read-only question about the live escalation, inline.
+
+        Reuses the broker's own LLM seam; never resolves the escalation or
+        writes to the pane. Bound to escalation liveness: a retract or dispatch
+        landing during the LLM call cancels it and the answer is dropped as
+        resolved in the pane. Each accepted connection is its own task, so this
+        await blocks only this connection.
+
+        Args:
+            env: Envelope carrying a ``ClarifyEscalationRequestPayload``.
+
+        Returns:
+            The answer reply, or an ``ok=False`` reply naming why no answer is
+            given (escalation not live, resolved under the call, or LLM error).
+        """
+        req = ClarifyEscalationRequestPayload.model_validate(env.payload)
+        active = self._active_escalation
+        if (
+            self.state != SessionState.ESCALATED
+            or active is None
+            or active.escalation_id != req.escalation_id
+        ):
+            return Response(
+                id=env.id,
+                ok=False,
+                payload={
+                    "error": "escalation no longer live",
+                    "reason_code": NACK_WRONG_STATE,
+                },
+            )
+        resolved = Response(
+            id=env.id,
+            ok=False,
+            payload={
+                "error": "escalation resolved in the pane",
+                "reason_code": NACK_WRONG_STATE,
+            },
+        )
+        assert self._llm_call is not None
+        try:
+            events = self._read_transcript()
+        except Exception as exc:
+            self._log(
+                "clarify_failed", f"{type(exc).__name__}: {exc}", req.escalation_id
+            )
+            return Response(
+                id=env.id, ok=False, payload={"error": f"{type(exc).__name__}: {exc}"}
+            )
+        task = asyncio.create_task(
+            clarify.clarify(
+                self._llm_call,
+                self.broker_cfg,
+                intent=self._intent(),
+                escalation=active,
+                question=req.question,
+                events=events,
+            )
+        )
+        self._clarify_tasks.add(task)
+        try:
+            with self._activity(PHRASE_CLARIFY):
+                async with asyncio.timeout(CLARIFY_TIMEOUT_S):
+                    result = await task
+        except asyncio.CancelledError:
+            # The task is cancelled either way; only the connection task's own
+            # cancellation (teardown) must propagate.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+            return resolved
+        except Exception as exc:
+            self._log(
+                "clarify_failed", f"{type(exc).__name__}: {exc}", req.escalation_id
+            )
+            return Response(
+                id=env.id, ok=False, payload={"error": f"{type(exc).__name__}: {exc}"}
+            )
+        finally:
+            # Discard only: awaiting `task` forwards this connection task's
+            # cancellation — the timeout's included — into it, so it is
+            # always finished by the time control reaches here.
+            self._clarify_tasks.discard(task)
+        # Backstop: a fatal error leaves ESCALATED without clearing
+        # _active_escalation, so it would not have cancelled the task.
+        live = self._active_escalation
+        if (
+            self.state != SessionState.ESCALATED
+            or live is None
+            or live.escalation_id != req.escalation_id
+        ):
+            return resolved
+        self._log("clarified", result.reasoning, result.answer)
+        return Response(
+            id=env.id,
+            ok=True,
+            payload=ClarifyEscalationReplyPayload(answer=result.answer).model_dump(),
+        )
+
     def _enqueue_ask_escalation(
         self,
         tool_input: dict[str, Any],
@@ -710,6 +817,9 @@ class SessionBroker:
 
         if env.type == T_ASK_QUESTION:
             return await self._on_ask_question(env)
+
+        if env.type == T_CLARIFY_ESCALATION:
+            return await self._on_clarify_escalation(env)
 
         if env.type == T_HOOK_EVENT:
             self.watchdog.reset()
@@ -1303,8 +1413,7 @@ class SessionBroker:
             return
         escalation_id = self._active_escalation.escalation_id
         self._log("retracted", "resolved in pane", escalation_id)
-        self._active_escalation = None
-        self._pending_ask_id = None
+        self._end_active_escalation()
         self._set_state(SessionState.DRIVING)
         await self._to_master(
             T_RETRACT,
@@ -1333,8 +1442,7 @@ class SessionBroker:
             )
             return
         await self._submit(decision.response)
-        self._active_escalation = None
-        self._pending_ask_id = None
+        self._end_active_escalation()
         self.budget_count = 0
         await self._to_master(T_BUDGET_UPDATE, {"count": 0})
         self._set_state(SessionState.DRIVING)
@@ -1350,8 +1458,7 @@ class SessionBroker:
             payload: The new task intent, grounded before anything is typed.
         """
         self._log("reactivated", "new task in the same session", payload.intent)
-        self._active_escalation = None
-        self._pending_ask_id = None
+        self._end_active_escalation()
         self.budget_count = 0
         await self._to_master(T_BUDGET_UPDATE, {"count": 0})
         await self._ground_and_submit(payload.intent)
@@ -1368,10 +1475,21 @@ class SessionBroker:
         await self._submit(prompt.text)
         self.budget_count = 0  # developer-relayed — resets
         await self._to_master(T_BUDGET_UPDATE, {"count": 0})
-        self._active_escalation = None
-        self._pending_ask_id = None
+        self._end_active_escalation()
         self._set_state(SessionState.DRIVING)
         self._log("developer_prompt", "relayed by master", prompt.text)
+
+    def _end_active_escalation(self) -> None:
+        """Clear the active escalation and cancel any clarification bound to it.
+
+        Every path that ends an escalation (dispatch, out-of-band retract,
+        developer prompt, reactivation) routes here, so an in-flight clarify
+        LLM call can never outlive the escalation it is about.
+        """
+        self._active_escalation = None
+        self._pending_ask_id = None
+        for task in self._clarify_tasks:
+            task.cancel()
 
     async def _reconcile(self) -> None:
         """Enqueue reconciliation work on watchdog expiry."""
