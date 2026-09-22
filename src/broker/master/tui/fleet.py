@@ -4,6 +4,7 @@
 from rich.text import Text
 from textual.widgets import Static
 
+from broker.master.outcome import OUTCOME_STATES
 from broker.master.viewmodel import Attention, FleetView, SessionRow
 from broker.protocol.constants import SessionState
 
@@ -111,5 +112,10 @@ class FleetSidebar(Static):
                 )
             for badge in _badge_labels(row):
                 out.append(f"{_INDENT}⚠ {badge}\n", style=warning)
+            if row.state in OUTCOME_STATES:
+                out.append(
+                    f"{_INDENT}/outcome {row.session_id} — view outcome\n",
+                    style=_MUTED,
+                )
             out.append("\n")
         return out

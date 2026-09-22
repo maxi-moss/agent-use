@@ -17,7 +17,7 @@ from anthropic.types import (
     ToolChoiceParam,
     ToolParam,
 )
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from broker import llm_timing
 from broker import prompts
@@ -36,14 +36,24 @@ class _HasTaskActivity(BaseModel):
     task_activity: str
 
 
-class AnswerCall(_HasTaskActivity):
+class _HasTaskSummary(BaseModel):
+    task_summary: str = Field(
+        description=(
+            "One short past-tense line for the completed-outcome history: what"
+            " you did this turn and why it mattered, e.g. 'Checked restart"
+            " behavior'. Developer-facing narrative, not the raw instruction."
+        )
+    )
+
+
+class AnswerCall(_HasTaskActivity, _HasTaskSummary):
     model_config = ConfigDict(extra="forbid")
 
     reasoning: str
     answer: str
 
 
-class EscalateCall(BaseModel):
+class EscalateCall(_HasTaskSummary):
     model_config = ConfigDict(extra="forbid")
 
     reasoning: str
@@ -56,11 +66,19 @@ class EscalateCall(BaseModel):
     what_would_change_my_mind: str
 
 
-class CompleteCall(_HasTaskActivity):
+class CompleteCall(_HasTaskActivity, _HasTaskSummary):
     model_config = ConfigDict(extra="forbid")
 
     reasoning: str
-    summary: str
+    headline: str = Field(
+        description=(
+            "The one-line outcome shown to the developer, e.g. 'Recovered the"
+            " session after broker loss'."
+        )
+    )
+    supporting: str = Field(
+        description="One sentence of the key evidence behind the headline."
+    )
 
 
 class NoActionCall(_HasTaskActivity):
@@ -99,7 +117,8 @@ TRIAGE_TOOLS: list[ToolParam] = [
     ),
     _tool(
         "complete",
-        "The task is finished. `summary` is shown to the developer verbatim.",
+        "The task is finished. `headline` and `supporting` are shown to the"
+        " developer as the outcome; `task_summary` is its final history line.",
         CompleteCall,
     ),
     _tool(

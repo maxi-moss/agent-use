@@ -19,14 +19,17 @@ from anthropic.types import (
 from rich.text import Text
 from textual import events
 from textual.containers import VerticalScroll
-from textual.widgets import Static
+from textual.widgets import RichLog, Static
 
+from broker import decision_log
+from broker.decision_log import DecisionKind
 from broker.config import BrokerConfig
 from broker.llm import TurnResult
 from broker.master.queue import EscalationQueue
-from broker.master.registry import Registry
+from broker.master.registry import Registry, SessionRecord
 from broker.master.tui.app import BrokerMasterApp
 from broker.master.tui.notice import AttentionNotice
+from broker.master.tui.outcome_modal import OutcomeModal
 from broker.master.tui.prompt_area import PromptArea
 from broker.master.viewmodel import (
     Attention,
@@ -107,6 +110,10 @@ def _chat_only_texts(app: BrokerMasterApp) -> list[str]:
         if isinstance(content, Text):
             texts.append(content.plain)
     return texts
+
+
+def _event_texts(app: BrokerMasterApp) -> list[str]:
+    return [strip.text for strip in app.query_one("#events", RichLog).lines]
 
 
 def _notice_text(app: BrokerMasterApp) -> str:
@@ -526,3 +533,100 @@ async def test_app_mounts_serves_and_unmounts_cleanly(home: Path) -> None:
         assert resp.ok is False
     # Clean unmount: registry persisted, no exception raised on the way out.
     assert (home / "registry.json").exists()
+
+
+async def test_slash_outcome_opens_modal_from_the_decision_log(home: Path) -> None:
+    app = make_app(home, GatedLLM())
+    app.registry.upsert(
+        SessionRecord(
+            name="s1",
+            socket_path=str(home / "s" / "s1.sock"),
+            cwd="/private/tmp",
+            anchor_pane="%1",
+            state=SessionState.COMPLETED,
+            title="Attach recovery",
+        )
+    )
+    log = app.runtime.paths.session_decisions("s1")
+    decision_log.append(
+        log, kind=DecisionKind.ANSWERED, reasoning="r", detail="use uv", task_summary="Chose uv"
+    )
+    decision_log.append(
+        log,
+        kind=DecisionKind.ESCALATION_RAISED,
+        reasoning="r",
+        detail="drop the column?",
+        task_summary="Asked before dropping a column",
+        escalation_id="e1",
+        what_was_asked="drop users.legacy?",
+    )
+    decision_log.append(
+        log, kind=DecisionKind.DISPATCHED, reasoning="d", detail="yes, drop it", escalation_id="e1"
+    )
+    decision_log.append(
+        log, kind=DecisionKind.ANSWERED, reasoning="r", detail="dropped", task_summary="Dropped it"
+    )
+    decision_log.append(
+        log,
+        kind=DecisionKind.COMPLETED,
+        reasoning="r",
+        detail="",
+        task_summary="Wrapped up",
+        headline="Recovered the session after broker loss",
+        supporting="The budget survived the restart",
+    )
+    completed = SessionRow(
+        session_id="s1",
+        state=SessionState.COMPLETED,
+        title="Attach recovery",
+        task_activity="",
+        broker_activity="",
+        budget_count=2,
+        budget_max=8,
+        badges=(),
+        pane_id=None,
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause(0.05)
+        app._emit(  # pyright: ignore[reportPrivateUsage]
+            FleetUpdated(_fleet_view((completed, _session_row("s2", ()))))
+        )
+        await pilot.pause()
+        assert "/outcome s1 — view outcome" in _fleet_text(app)
+        assert "/outcome s2" not in _fleet_text(app)
+        box = app.query_one("#box", PromptArea)
+        box.focus()
+        box.text = "/outcome s1"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, OutcomeModal)
+        assert len(app.screen_stack) == 2
+        headline = app.screen.query_one("#headline", Static).content
+        assert isinstance(headline, Text)
+        assert headline.plain == "Recovered the session after broker loss"
+        history = "\n".join(
+            content.plain
+            for widget in app.screen.query(Static)
+            if isinstance(content := widget.content, Text)
+        )
+        assert "Chose uv" in history
+        assert "Reason: Asked before dropping a column" in history
+        assert "Solution: Dropped it" in history
+        assert "yes, drop it" not in history  # raw developer words never shown
+        assert "Task completed" in history
+        await pilot.press("escape")
+        await pilot.pause()
+        assert len(app.screen_stack) == 1
+        # Gate paths: unknown or still-working sessions get an event line, no modal.
+        box.focus()
+        box.text = "/outcome s404"
+        await pilot.press("enter")
+        await pilot.pause()
+        box.focus()
+        box.text = "/outcome s2"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert len(app.screen_stack) == 1
+        lines = _event_texts(app)
+        assert any("no such session s404" in line for line in lines)
+        assert any("s2 has no outcome yet" in line for line in lines)

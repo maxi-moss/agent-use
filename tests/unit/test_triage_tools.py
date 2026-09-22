@@ -58,7 +58,7 @@ def test_no_ref_cycles() -> None:
 
 def test_escalate_tool_fields_match_escalation_payload() -> None:
     """The tool input + broker-filled fields == the wire payload. Drift pin."""
-    tool_fields = set(EscalateCall.model_fields) - {"reasoning"}
+    tool_fields = set(EscalateCall.model_fields) - {"reasoning", "task_summary"}
     payload_fields = set(EscalationPayload.model_fields) - {
         "escalation_id",
         "session_id",
@@ -76,6 +76,16 @@ def test_task_activity_on_non_escalate_triage_tools_only() -> None:
             assert "task_activity" not in props
         else:
             assert "task_activity" in props
+
+
+def test_task_summary_on_answer_escalate_complete_not_no_action() -> None:
+    for tool in TRIAGE_TOOLS:
+        schema = cast(dict[str, Any], tool["input_schema"])
+        props = cast(dict[str, Any], schema.get("properties", {}))
+        if tool["name"] == "no_action":
+            assert "task_summary" not in props
+        else:
+            assert "task_summary" in props
 
 
 def test_ask_and_triage_escalate_schemas_identical() -> None:

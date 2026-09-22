@@ -74,6 +74,7 @@ forbidden_modules = [
     "broker.logging_setup",
     "broker.paths",
     "broker.index",
+    "broker.decision_log",
 ]
 ignore_imports = ["broker.hook.** -> broker.protocol.constants"]
 

@@ -14,6 +14,8 @@ from typing import Any, cast
 import pytest
 from pydantic import ValidationError
 
+from broker import decision_log
+from broker.decision_log import DecisionKind
 from broker.config import BrokerConfig
 from broker.herdr import driver
 from broker.master.queue import EscalationQueue
@@ -1301,11 +1303,16 @@ async def test_completion_notifies_done(
     rt: tuple[MasterRuntime, list[Any]], recording_run: RecordingRun
 ) -> None:
     runtime, posts = rt
-    resp = await send(runtime, T_COMPLETION, {"summary": "did the thing"})
+    resp = await send(
+        runtime,
+        T_COMPLETION,
+        {"headline": "Recovered the session", "supporting": "budget survived"},
+    )
     assert resp.ok
     arrived = [m for m in posts if isinstance(m, CompletionArrived)]
     assert len(arrived) == 1
-    assert arrived[0].summary == "did the thing"  # verbatim
+    assert arrived[0].headline == "Recovered the session"  # verbatim
+    assert arrived[0].supporting == "budget survived"
     notify_calls = [
         c for c in recording_run.calls if c[1:3] == ["notification", "show"]
     ]
@@ -1313,6 +1320,40 @@ async def test_completion_notifies_done(
     argv = notify_calls[0]
     assert argv[argv.index("--sound") + 1] == "done"
     assert runtime.registry.get("s1").state == "completed"
+
+
+async def test_build_session_outcome_reads_log_off_disk(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    # No broker socket is ever contacted: the log file and registry suffice,
+    # which is what an error/stopped session (dead broker) relies on.
+    runtime, _ = rt
+    log = runtime.paths.session_decisions("s1")
+    decision_log.append(
+        log, kind=DecisionKind.ANSWERED, reasoning="r", detail="a", task_summary="Did A"
+    )
+    decision_log.append(
+        log,
+        kind=DecisionKind.COMPLETED,
+        reasoning="r",
+        detail="",
+        task_summary="Wrapped up",
+        headline="Recovered the session",
+        supporting="budget survived",
+    )
+    assert (
+        await send(
+            runtime,
+            T_COMPLETION,
+            {"headline": "Recovered the session", "supporting": "budget survived"},
+        )
+    ).ok
+    outcome = runtime.build_session_outcome("s1")
+    assert outcome.status == "completed"
+    assert outcome.headline == "Recovered the session"
+    assert [ev.label for ev in outcome.history] == ["Did A", "Task completed"]
+    with pytest.raises(KeyError):
+        runtime.build_session_outcome("ghost")
 
 
 async def test_session_ended_removes_from_fleet(
@@ -1417,7 +1458,9 @@ async def test_every_broker_message_type_is_acked(
         )
     ).ok
     assert (await send(runtime, T_BUDGET_UPDATE, {"count": 1})).ok
-    assert (await send(runtime, T_COMPLETION, {"summary": "s"})).ok
+    assert (
+        await send(runtime, T_COMPLETION, {"headline": "h", "supporting": "s"})
+    ).ok
     assert (
         await send(
             runtime, T_FATAL_ERROR, {"error_class": "X", "detail": "d"}
@@ -2015,7 +2058,9 @@ async def test_absorbing_state_ignores_late_pushes(
     rt: tuple[MasterRuntime, list[Any]], home: Path
 ) -> None:
     runtime, _ = rt
-    assert (await send(runtime, T_COMPLETION, {"summary": "done"})).ok
+    assert (
+        await send(runtime, T_COMPLETION, {"headline": "done", "supporting": "s"})
+    ).ok
     assert runtime.registry.get("s1").state == "completed"
     # A stale in-flight push carrying an older state arrives late: it must
     # not resurrect the settled session — but it is still ACKed.

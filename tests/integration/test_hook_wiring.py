@@ -57,12 +57,14 @@ ANSWER_RESULT = ToolCall(
         "reasoning": "grounded",
         "answer": "use oauth",
         "task_activity": "wiring up oauth",
+        "task_summary": "Chose oauth",
     },
 )
 ESCALATE_RESULT = ToolCall(
     name="escalate",
     input={
         "reasoning": "plan looks wrong",
+        "task_summary": "Questioned a stale plan",
         "situation": "the plan contradicts the code",
         "what_was_asked": "how to proceed",
         "what_is_at_stake": "architecture drift",
@@ -76,8 +78,10 @@ COMPLETE_RESULT = ToolCall(
     name="complete",
     input={
         "reasoning": "all done",
-        "summary": "task finished cleanly",
+        "headline": "task finished cleanly",
+        "supporting": "every check exits 0",
         "task_activity": "wrapping up",
+        "task_summary": "Finished the task",
     },
 )
 
@@ -625,7 +629,10 @@ async def test_full_loop_criteria_3_to_8(
     )
     await h.llm.results.put(COMPLETE_RESULT)
     completion = await h.master.wait_for(T_COMPLETION)
-    assert completion.payload == {"summary": "task finished cleanly"}
+    assert completion.payload == {
+        "headline": "task finished cleanly",
+        "supporting": "every check exits 0",
+    }
     await wait_state(h.broker, "completed")
     # The socket still answers status while completed.
     status = await client.request(

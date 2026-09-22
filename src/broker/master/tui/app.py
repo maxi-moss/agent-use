@@ -25,6 +25,7 @@ from textual.worker import Worker, WorkerState
 from broker.config import BrokerConfig
 from broker.llm import LLMCaller, TurnResult
 from broker.master.llm import MasterLLM
+from broker.master.outcome import OUTCOME_STATES
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry
 from broker.master.runtime import MasterRuntime
@@ -33,6 +34,7 @@ from broker.master.tui.chat_log import ChatMessage, ThinkingIndicator
 from broker.master.tui.fleet import FLEET_WIDTH, FleetSidebar
 from broker.master.tui.messages import LLMReply, ViewEventMessage
 from broker.master.tui.notice import AttentionNotice
+from broker.master.tui.outcome_modal import OutcomeModal
 from broker.master.tui.prompt_area import PromptArea
 from broker.master.viewmodel import (
     Attention,
@@ -88,6 +90,7 @@ class BrokerMasterApp(App[None]):
         # /proposal pastes one in; FleetUpdated prunes what is no longer live.
         self._head: EscalationArrived | PermissionEscalationArrived | None = None
         self._proposals: dict[str, str] = {}
+        self._last_view: FleetView | None = None
         self.runtime = MasterRuntime(
             self._emit, registry, queue, cfg, anchor_pane=anchor_pane
         )
@@ -152,6 +155,9 @@ class BrokerMasterApp(App[None]):
             return
         if text == "/proposal" or text.startswith("/proposal "):
             self._show_proposal(text[len("/proposal"):].strip() or None)
+            return
+        if text == "/outcome" or text.startswith("/outcome "):
+            self._show_outcome(text[len("/outcome"):].strip() or None)
             return
         box.disabled = True
         self._chat_block(text, role="user", label="you")
@@ -259,6 +265,7 @@ class BrokerMasterApp(App[None]):
     def on_view_event_message(self, message: ViewEventMessage) -> None:
         event = message.event
         if isinstance(event, FleetUpdated):
+            self._last_view = event.view
             self._prune_disclosures(event.view)
             self.query_one("#fleet-table", FleetSidebar).update_view(event.view)
             self.query_one("#notice", AttentionNotice).update_view(event.view)
@@ -281,7 +288,8 @@ class BrokerMasterApp(App[None]):
             )
         elif isinstance(event, CompletionArrived):
             self._chat_block(
-                f"Session {event.session_id} completed:\n{event.summary}"
+                f"Session {event.session_id} completed:\n"
+                f"{event.headline}\n{event.supporting}"
             )
             self._event_line(f"{event.session_id} completed")
         elif isinstance(event, Notice):
@@ -323,6 +331,23 @@ class BrokerMasterApp(App[None]):
             )
             return
         self._chat_block(rendered)
+
+    def _show_outcome(self, session_id: str | None) -> None:
+        """Open the read-only outcome modal for a completed/failed session."""
+        if session_id is None:
+            self._event_line("usage: /outcome sN")
+            return
+        rows = self._last_view.rows if self._last_view is not None else ()
+        row = next((r for r in rows if r.session_id == session_id), None)
+        if row is None:
+            self._event_line(f"no such session {session_id}")
+            return
+        if row.state not in OUTCOME_STATES:
+            self._event_line(
+                f"{session_id} has no outcome yet (state: {row.state})"
+            )
+            return
+        self.push_screen(OutcomeModal(self.runtime.build_session_outcome(session_id)))
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
