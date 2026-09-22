@@ -11,6 +11,11 @@ from enum import StrEnum
 
 from broker.protocol.constants import SessionState
 
+# Lifecycle states a session has settled into: the ones with an outcome to view.
+_SETTLED_STATES = frozenset(
+    {SessionState.COMPLETED, SessionState.ERROR, SessionState.STOPPED}
+)
+
 
 class Attention(StrEnum):
     """A kind of thing a session needs the developer for. Distinct badges, no
@@ -35,6 +40,11 @@ class SessionRow:
     budget_max: int
     badges: tuple[Attention, ...]
     pane_id: str | None
+
+    @property
+    def is_settled(self) -> bool:
+        """True when the session has reached a state with an outcome to view."""
+        return self.state in _SETTLED_STATES
 
 
 @dataclass(frozen=True, slots=True)

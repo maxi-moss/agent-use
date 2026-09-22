@@ -25,13 +25,12 @@ from textual.worker import Worker, WorkerState
 from broker.config import BrokerConfig
 from broker.llm import LLMCaller, TurnResult
 from broker.master.llm import MasterLLM
-from broker.master.outcome import OUTCOME_STATES
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry
 from broker.master.runtime import MasterRuntime
 from broker.master.testmode import load_scenario, run_scenario
 from broker.master.tui.chat_log import ChatMessage, ThinkingIndicator
-from broker.master.tui.fleet import FLEET_WIDTH, FleetSidebar
+from broker.master.tui.fleet import FLEET_WIDTH, FleetSidebar, SessionRowWidget
 from broker.master.tui.messages import LLMReply, ViewEventMessage
 from broker.master.tui.notice import AttentionNotice
 from broker.master.tui.outcome_modal import OutcomeModal
@@ -110,8 +109,7 @@ class BrokerMasterApp(App[None]):
 
     def compose(self) -> ComposeResult:
         with Horizontal():
-            with VerticalScroll(id="fleet"):
-                yield FleetSidebar(Text("Master — idle"), id="fleet-table")
+            yield FleetSidebar(id="fleet")
             with Vertical():
                 notice = AttentionNotice(Text(""), id="notice")
                 notice.display = False
@@ -267,7 +265,7 @@ class BrokerMasterApp(App[None]):
         if isinstance(event, FleetUpdated):
             self._last_view = event.view
             self._prune_disclosures(event.view)
-            self.query_one("#fleet-table", FleetSidebar).update_view(event.view)
+            self.query_one(FleetSidebar).update_view(event.view)
             self.query_one("#notice", AttentionNotice).update_view(event.view)
         elif isinstance(event, EscalationArrived):
             self._head = event
@@ -342,12 +340,18 @@ class BrokerMasterApp(App[None]):
         if row is None:
             self._event_line(f"no such session {session_id}")
             return
-        if row.state not in OUTCOME_STATES:
+        if not row.is_settled:
             self._event_line(
                 f"{session_id} has no outcome yet (state: {row.state})"
             )
             return
         self.push_screen(OutcomeModal(self.runtime.build_session_outcome(session_id)))
+
+    def on_session_row_widget_selected(
+        self, message: SessionRowWidget.Selected
+    ) -> None:
+        """A settled sidebar row was clicked: open its outcome."""
+        self._show_outcome(message.session_id)
 
     # ── helpers ──────────────────────────────────────────────────────────────
 

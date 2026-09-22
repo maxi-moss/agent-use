@@ -10,10 +10,6 @@ from typing import Literal
 from broker.decision_log import DecisionKind, DecisionRow
 from broker.protocol.constants import SessionState
 
-OUTCOME_STATES = frozenset(
-    {SessionState.COMPLETED, SessionState.ERROR, SessionState.STOPPED}
-)
-
 _NO_FOLLOW_UP = "(no recorded follow-up)"
 
 OutcomeStatus = Literal["completed", "error", "stopped", "other"]
