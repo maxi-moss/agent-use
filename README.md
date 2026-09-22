@@ -74,7 +74,7 @@ A session cannot be spawned for a repository without an index: grounding retriev
 uv run python -m broker.master --test-mode
 ```
 
-Test mode drives synthetic escalations through the **real** master — the real TUI, socket server, runtime handlers, and persisted queue. Everything above the socket is left out: no LLM, no hooks, no herdr, no Claude Code, no live sessions. So none of the startup requirements above apply — no API keys, nothing on `PATH` — and it never writes `~/.claude/settings.json`.
+Test mode drives synthetic escalations through the **real** master — the real TUI, socket server, runtime handlers, and persisted escalation queue and permission store. Everything above the socket is left out: no LLM, no hooks, no herdr, no Claude Code, no live sessions. So none of the startup requirements above apply — no API keys, nothing on `PATH` — and it never writes `~/.claude/settings.json`.
 
 Inside the TUI, `/inject <scenario>` runs one scenario from `tests/scenarios/*.json` and reports each step, ending in a `PASS`/`FAIL` summary. Run the master from the repo root, since `/inject` resolves scenario files relative to the working directory. `/inject` with an unknown or missing name prints the available scenarios.
 
