@@ -231,6 +231,7 @@ async def test_slash_escalation_pastes_the_head_disclosure_verbatim(
         )
         await pilot.pause()
         assert rendered not in _chat_only_texts(app)  # arrival stays off the chat
+        assert "s1 requested a decision: Queue policy" in _event_texts(app)
         box = app.query_one("#box", PromptArea)
         box.focus()
         box.text = "/escalation"
