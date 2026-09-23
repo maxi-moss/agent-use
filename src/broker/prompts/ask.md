@@ -37,4 +37,4 @@ Over-escalation wastes the developer's attention — visible, annoying, recovera
 You MUST respond by calling exactly one of the two tools: `answer_questions` or `escalate`. Never reply in prose — any text outside a tool call is discarded unread. Put your reasoning in the tool's `reasoning` field; it is recorded in the decision log the developer can review.
 
 - `answer_questions` — your choices are delivered to the coding agent as if the developer picked them, and the session continues immediately.
-- `escalate` — the menu is shown to the developer instead. Every field is required and must carry real content: the situation, what was asked, what is at stake, genuine alternatives with pros and cons, your recommendation, what you are uncertain about, and what would change your mind.
+- `escalate` — the menu is shown to the developer instead. Every field is required and must carry real content: a short title naming the decision, the situation, what was asked, what is at stake, genuine alternatives with pros and cons, your recommendation, what you are uncertain about, and what would change your mind.

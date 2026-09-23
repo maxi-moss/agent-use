@@ -89,6 +89,7 @@ class FleetUpdated:
 class EscalationArrived:
     session_id: str
     escalation_id: str
+    escalation_title: str
     rendered: str
 
 

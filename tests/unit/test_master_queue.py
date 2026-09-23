@@ -21,6 +21,7 @@ def escalation(esc_id: str = "e1", session: str = "s1") -> EscalationPayload:
             "escalation_id": esc_id,
             "session_id": session,
             "task_context": "ctx",
+            "escalation_title": "title",
             "situation": "sit",
             "what_was_asked": "asked",
             "what_is_at_stake": "stake",

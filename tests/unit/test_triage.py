@@ -69,6 +69,7 @@ EVENTS = [
 ESCALATE_INPUT: dict[str, Any] = {
     "reasoning": "irreversible",
     "task_summary": "Asked before an irreversible step",
+    "escalation_title": "Column drop",
     "situation": "wants to drop a column",
     "what_was_asked": "drop users.email?",
     "what_is_at_stake": "real data",

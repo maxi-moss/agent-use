@@ -90,6 +90,7 @@ def _escalation_payload(step: Escalate) -> EscalationPayload:
         escalation_id=eid,
         session_id=step.session,
         task_context=f"task context for {eid}",
+        escalation_title=f"title for {eid}",
         situation=f"situation for {eid}",
         what_was_asked=f"what was asked in {eid}",
         what_is_at_stake=f"what is at stake in {eid}",

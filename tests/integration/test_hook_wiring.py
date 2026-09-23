@@ -65,6 +65,7 @@ ESCALATE_RESULT = ToolCall(
     input={
         "reasoning": "plan looks wrong",
         "task_summary": "Questioned a stale plan",
+        "escalation_title": "Stale plan",
         "situation": "the plan contradicts the code",
         "what_was_asked": "how to proceed",
         "what_is_at_stake": "architecture drift",
@@ -550,6 +551,7 @@ async def test_full_loop_criteria_3_to_8(
         "escalation_id",
         "session_id",
         "task_context",
+        "escalation_title",
         "situation",
         "what_was_asked",
         "what_is_at_stake",
