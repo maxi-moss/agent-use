@@ -1507,6 +1507,9 @@ async def test_budget_exhaustion_converts_answer_to_escalation(
     assert escalation.payload["recommendation"] == "use oauth"
     assert harness.run.drive_calls() == []  # the answer was NOT submitted
     await wait_state(harness.broker, "escalated")
+    log = await decision_log_text(harness)
+    assert "Handed over when the autonomous answer budget ran out" in log
+    assert "Chose oauth" not in log  # the unsent answer's summary is not the Reason
 
 
 async def test_stop_failure_sends_fatal_error(harness: Harness) -> None:
