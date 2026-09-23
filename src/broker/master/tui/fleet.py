@@ -39,6 +39,7 @@ _BADGE_TEXT: dict[Attention, str] = {
     Attention.ESCALATION: "needs decision",
     Attention.PROPOSAL: "approve prompt",
     Attention.PERMISSION: "permission",
+    Attention.QUESTION: "question",
 }
 
 
@@ -51,11 +52,11 @@ def _one_line(text: str, width: int) -> str:
 
 
 def _badge_labels(row: SessionRow) -> list[str]:
-    """Return the row's badge labels, naming the pane on a permission badge."""
+    """Return the row's badge labels, naming the pane on a pane badge."""
     labels: list[str] = []
     for badge in row.badges:
         text = _BADGE_TEXT[badge]
-        if badge is Attention.PERMISSION and row.pane_id:
+        if badge in (Attention.PERMISSION, Attention.QUESTION) and row.pane_id:
             text = f"{text} · {row.pane_id}"
         labels.append(text)
     return labels
