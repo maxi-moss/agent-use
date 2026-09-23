@@ -1193,7 +1193,10 @@ class SessionBroker:
             ),
         )
         await self._raise_escalation(
-            payload, result.reasoning, events, task_summary=result.task_summary
+            payload,
+            result.reasoning,
+            events,
+            task_summary="Handed over when the autonomous answer budget ran out",
         )
 
     async def _ask_escalate(
