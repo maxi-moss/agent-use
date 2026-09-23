@@ -64,13 +64,38 @@ class EscalateCall(_HasTaskSummary):
             " one-line label."
         )
     )
-    situation: str
-    what_was_asked: str
-    what_is_at_stake: str
-    alternatives: list[Alternative]
-    recommendation: str
-    uncertainty: str
-    what_would_change_my_mind: str
+    situation: str = Field(
+        description=(
+            "What is happening in the session right now that led to this"
+            " decision: what the coding agent was doing and what it ran into."
+        )
+    )
+    what_was_asked: str = Field(
+        description=(
+            "The question or questions the developer must answer. When the"
+            " coding agent asked them, copy its questions verbatim."
+        )
+    )
+    what_is_at_stake: str = Field(
+        description="What goes wrong, and how badly, if the decision is wrong."
+    )
+    alternatives: list[Alternative] = Field(
+        description=(
+            "The genuine options open to the developer, each with its pros and"
+            " cons."
+        )
+    )
+    recommendation: str = Field(
+        description="The option you would choose, and why."
+    )
+    uncertainty: str = Field(
+        description="What you are unsure about in this analysis or recommendation."
+    )
+    what_would_change_my_mind: str = Field(
+        description=(
+            "What fact or evidence would make you recommend a different option."
+        )
+    )
 
 
 class CompleteCall(_HasTaskActivity, _HasTaskSummary):

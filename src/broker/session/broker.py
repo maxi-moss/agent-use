@@ -1117,7 +1117,7 @@ class SessionBroker:
         Args:
             escalation_title: Short title naming the decision.
             situation: What is happening that needs a decision.
-            what_was_asked: The question, verbatim.
+            what_was_asked: The question or questions the developer must answer.
             what_is_at_stake: Consequences of getting it wrong.
             alternatives: The options open to the developer.
             recommendation: The broker's suggested option.
