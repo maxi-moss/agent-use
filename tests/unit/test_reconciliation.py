@@ -1,5 +1,5 @@
 """reconcile_registry classification harness: a real registry, queue and
-permission store on disk under /private/tmp, driver.pane_read monkeypatched, the live-broker case
+pane store on disk under /private/tmp, driver.pane_read monkeypatched, the live-broker case
 served by a real serve_unix socket."""
 
 import asyncio
@@ -11,7 +11,7 @@ import pytest
 
 from broker.herdr import driver
 from broker.herdr.driver import HerdrError
-from broker.master.permission_escalations import PermissionEscalations
+from broker.master.pane_escalations import PaneEscalations
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry, SessionRecord
 from broker.master.runtime import reconcile_registry
@@ -20,6 +20,7 @@ from broker.protocol.schemas import (
     Envelope,
     EscalationPayload,
     PermissionEscalationPayload,
+    QuestionEscalationPayload,
     Response,
 )
 from broker.protocol.server import serve_unix
@@ -57,8 +58,8 @@ def _queue(home: Path) -> EscalationQueue:
     return EscalationQueue.load(home / "escalation-queue.json")
 
 
-def _permissions(home: Path) -> PermissionEscalations:
-    return PermissionEscalations.load(home / "permission-escalations.json")
+def _panes(home: Path) -> PaneEscalations:
+    return PaneEscalations.load(home / "pane-escalations.json")
 
 
 def _broker_escalation(esc_id: str, session: str) -> EscalationPayload:
@@ -67,19 +68,21 @@ def _broker_escalation(esc_id: str, session: str) -> EscalationPayload:
             "escalation_id": esc_id,
             "session_id": session,
             "task_context": "ctx",
-            "escalation_title": "title",
-            "situation": "sit",
-            "what_was_asked": "asked",
-            "what_is_at_stake": "stake",
-            "alternatives": [{"option": "a", "pros": "p", "cons": "c"}],
-            "recommendation": "rec",
-            "uncertainty": "unc",
-            "what_would_change_my_mind": "change",
+            "disclosure": {
+                "escalation_title": "title",
+                "situation": "sit",
+                "what_was_asked": "asked",
+                "what_is_at_stake": "stake",
+                "alternatives": [{"option": "a", "pros": "p", "cons": "c"}],
+                "recommendation": "rec",
+                "uncertainty": "unc",
+                "what_would_change_my_mind": "change",
+            },
         }
     )
 
 
-def _permission_escalation(
+def _permission_pane(
     esc_id: str, session: str
 ) -> PermissionEscalationPayload:
     return PermissionEscalationPayload.model_validate(
@@ -92,6 +95,17 @@ def _permission_escalation(
             "reason": "reason",
             "raised_at": "2026-08-06T12:00:00+00:00",
         }
+    )
+
+
+def _question_escalation(esc_id: str, session: str) -> QuestionEscalationPayload:
+    return QuestionEscalationPayload(
+        escalation_id=esc_id,
+        session_id=session,
+        task_context="ctx",
+        menu="",
+        first_question="",
+        reason="reason",
     )
 
 
@@ -110,7 +124,7 @@ async def test_live_broker_left_alone(home: Path) -> None:
 
     server = await serve_unix(home / "s" / "s1.sock", handler)
     try:
-        warnings = await reconcile_registry(registry, _queue(home), _permissions(home))
+        warnings = await reconcile_registry(registry, _queue(home), _panes(home))
     finally:
         server.close()
         await server.wait_closed()
@@ -128,7 +142,7 @@ async def test_live_pane_marked_unmanaged(
         return "visible pane text"
 
     monkeypatch.setattr(driver, "pane_read", fake_pane_read)
-    warnings = await reconcile_registry(registry, _queue(home), _permissions(home))
+    warnings = await reconcile_registry(registry, _queue(home), _panes(home))
     assert len(warnings) == 1
     assert "unmanaged" in warnings[0]
     assert "attach_session" in warnings[0]
@@ -141,22 +155,24 @@ async def test_dead_pane_removed_and_retracts(
     registry = _registry_with_s1(home)
     queue = _queue(home)
     queue.accept(_broker_escalation("e1", "s1"))
-    permissions = _permissions(home)
-    permissions.accept(_permission_escalation("p1", "s1"))
+    panes = _panes(home)
+    panes.accept(_permission_pane("p1", "s1"))
+    panes.accept(_question_escalation("q1", "s1"))
     _fail_pane_read(monkeypatch, HerdrError("pane_not_found", "no such pane"))
-    warnings = await reconcile_registry(registry, queue, permissions)
+    warnings = await reconcile_registry(registry, queue, panes)
     # A session whose pane is gone is finished: removed here and on reload, so
     # it can never be handed back to the master as a routing candidate.
     assert "s1" not in registry.records
     assert "s1" not in Registry.load(home / "registry.json").records
-    # Both kinds retracted from their PERSISTED stores, so nothing the runtime
+    # Every kind retracted from its PERSISTED store, so nothing the runtime
     # re-announces on startup can belong to a dead session.
     assert _queue(home).depth == 0
-    assert _permissions(home).entries == ()
+    assert _panes(home).entries == ()
     retraction_lines = [w for w in warnings if "retracted" in w]
     assert any("e1" in w for w in retraction_lines)
     assert any("p1" in w for w in retraction_lines)
-    assert len(retraction_lines) == 2
+    assert any("q1" in w for w in retraction_lines)
+    assert len(retraction_lines) == 3
     assert any("gone — removed" in w for w in warnings)
 
 
@@ -166,15 +182,15 @@ async def test_inconclusive_probe_never_marks_dead(
     registry = _registry_with_s1(home)
     queue = _queue(home)
     queue.accept(_broker_escalation("e1", "s1"))
-    permissions = _permissions(home)
-    permissions.accept(_permission_escalation("p1", "s1"))
+    panes = _panes(home)
+    panes.accept(_permission_pane("p1", "s1"))
     _fail_pane_read(monkeypatch, HerdrError("unknown", "herdr hiccup"))
-    warnings = await reconcile_registry(registry, queue, permissions)
+    warnings = await reconcile_registry(registry, queue, panes)
     # A wrong `unmanaged` costs the developer a glance; a wrong `dead` throws
     # away queued decisions and open prompts.
     assert Registry.load(home / "registry.json").get("s1").state == "unmanaged"
     assert _queue(home).depth == 1
-    assert len(_permissions(home).entries) == 1
+    assert len(_panes(home).entries) == 1
     assert len(warnings) == 1
     assert "herdr hiccup" in warnings[0]
 
@@ -191,7 +207,7 @@ def test_missing_pane_id_marked_unmanaged(
     # Run through asyncio.run on a fresh loop, exactly as main() does before
     # the TUI builds its own.
     warnings = asyncio.run(
-        reconcile_registry(registry, _queue(home), _permissions(home))
+        reconcile_registry(registry, _queue(home), _panes(home))
     )
     assert len(warnings) == 1
     # The probe-was-attempted failure would read "inconclusive" here, because

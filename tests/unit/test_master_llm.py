@@ -24,7 +24,7 @@ from broker.master.llm import (
     ClarifyEscalationArgs,
     MasterLLM,
 )
-from broker.master.permission_escalations import PermissionEscalations
+from broker.master.pane_escalations import PaneEscalations
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry, SessionRecord
 from broker.paths import BrokerPaths
@@ -35,11 +35,13 @@ from broker.master.runtime import (
     render_escalation,
     render_permission_escalation,
     render_proposal,
+    render_question_escalation,
 )
 from broker.protocol.schemas import (
     EscalationPayload,
     PermissionEscalationPayload,
     PromptProposalPayload,
+    QuestionEscalationPayload,
 )
 
 
@@ -49,9 +51,9 @@ class RecordingRuntime(MasterRuntime):
     def __init__(self, registry: Registry, cfg: BrokerConfig) -> None:
         paths = BrokerPaths(cfg.broker_home)
         queue = EscalationQueue.load(paths.escalation_queue)
-        permissions = PermissionEscalations.load(paths.permission_escalations)
+        panes = PaneEscalations.load(paths.pane_escalations)
         super().__init__(
-            lambda _msg: None, registry, queue, permissions, cfg, anchor_pane="%1"
+            lambda _msg: None, registry, queue, panes, cfg, anchor_pane="%1"
         )
         self.spawned: list[tuple[str, str]] = []
         self.dispatched: list[tuple[str, str]] = []
@@ -106,19 +108,36 @@ ESCALATION = EscalationPayload.model_validate(
         "escalation_id": "e1",
         "session_id": "s1",
         "task_context": "ctx",
-        "escalation_title": "title",
-        "situation": "sit",
-        "what_was_asked": "asked",
-        "what_is_at_stake": "stake",
-        "alternatives": [{"option": "B", "pros": "p", "cons": "c"}],
-        "recommendation": "rec",
-        "uncertainty": "unc",
-        "what_would_change_my_mind": "change",
+        "disclosure": {
+            "escalation_title": "title",
+            "situation": "sit",
+            "what_was_asked": "asked",
+            "what_is_at_stake": "stake",
+            "alternatives": [{"option": "B", "pros": "p", "cons": "c"}],
+            "recommendation": "rec",
+            "uncertainty": "unc",
+            "what_would_change_my_mind": "change",
+        },
     }
 )
 
 WAITING_ESCALATION = ESCALATION.model_copy(
-    update={"escalation_id": "e2", "session_id": "s2", "what_was_asked": "later"}
+    update={
+        "escalation_id": "e2",
+        "session_id": "s2",
+        "disclosure": ESCALATION.disclosure.model_copy(
+            update={"what_was_asked": "later"}
+        ),
+    }
+)
+
+QUESTION_ESCALATION = QuestionEscalationPayload(
+    escalation_id="q1",
+    session_id="s2",
+    task_context="ctx",
+    menu="Which layout? [Layout]",
+    first_question="Which layout?",
+    reason="the layout is irreversible",
 )
 
 PERMISSION_ESCALATION = PermissionEscalationPayload.model_validate(
@@ -241,11 +260,11 @@ async def test_escalation_block_is_byte_identical(
     assert render_escalation(ESCALATION) in texts
 
 
-async def test_open_permission_escalation_reaches_llm_context(
+async def test_open_permission_pane_reaches_llm_context(
     runtime: RecordingRuntime,
 ) -> None:
     runtime.queue.accept(ESCALATION)
-    runtime.permissions.accept(PERMISSION_ESCALATION)
+    runtime.panes.accept(PERMISSION_ESCALATION)
     fake = FakeLLM([TurnResult(text="ok")])
     master = make_master(runtime, fake)
     await master.handle_developer_message("what is s1 waiting on?")
@@ -259,6 +278,23 @@ async def test_open_permission_escalation_reaches_llm_context(
         )
         in texts
     )
+
+
+async def test_question_escalation_is_its_own_block_never_the_active_one(
+    runtime: RecordingRuntime,
+) -> None:
+    runtime.queue.accept(ESCALATION)
+    runtime.panes.accept(QUESTION_ESCALATION)
+    fake = FakeLLM([TurnResult(text="ok")])
+    master = make_master(runtime, fake)
+    await master.handle_developer_message("what is waiting?")
+    texts = _block_texts(fake.calls[0])
+    rendered = render_question_escalation(QUESTION_ESCALATION, runtime.pane_of("s2"))
+    header = texts.index("# Open question escalation — session s2")
+    assert texts[header + 1] == rendered
+    active = texts.index("# Active escalation")
+    assert texts[active + 1] == render_escalation(ESCALATION)
+    assert texts.count(rendered) == 1
 
 
 async def test_llm_context_carries_only_the_surfaced_head(

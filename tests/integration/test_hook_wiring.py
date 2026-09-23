@@ -547,10 +547,9 @@ async def test_full_loop_criteria_3_to_8(
     )
     await h.llm.results.put(ESCALATE_RESULT)
     escalation = await h.master.wait_for(T_ESCALATION)
+    for field_name in ("escalation_id", "session_id", "task_context"):
+        assert field_name in escalation.payload
     for field_name in (
-        "escalation_id",
-        "session_id",
-        "task_context",
         "escalation_title",
         "situation",
         "what_was_asked",
@@ -560,7 +559,7 @@ async def test_full_loop_criteria_3_to_8(
         "uncertainty",
         "what_would_change_my_mind",
     ):
-        assert field_name in escalation.payload
+        assert field_name in escalation.payload["disclosure"]
     await wait_state(h.broker, "escalated")
 
     # ── developer decision reaches the session and is acted on ────────────────
@@ -603,7 +602,7 @@ async def test_full_loop_criteria_3_to_8(
     await h.llm.results.put(ANSWER_RESULT)  # would answer, but budget is spent
     handover = await h.master.wait_for(T_ESCALATION, count=2)
     # The would-be answer is carried verbatim as the recommendation.
-    assert handover.payload["recommendation"] == "use oauth"
+    assert handover.payload["disclosure"]["recommendation"] == "use oauth"
     await wait_state(h.broker, "escalated")
     assert h.run.drive_calls() == []  # halted: nothing written to the pane
 

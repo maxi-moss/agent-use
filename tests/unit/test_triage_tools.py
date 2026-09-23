@@ -1,9 +1,9 @@
-"""Strict-tool schema derivation pins (drift pin vs EscalationPayload)."""
+"""Strict-tool schema derivation pins (drift pin vs EscalationDisclosure)."""
 
 import json
 from typing import Any, cast
 
-from broker.protocol.schemas import EscalationPayload
+from broker.protocol.schemas import EscalationDisclosure
 from broker.session.ask import ASK_TOOLS
 from broker.session.triage import (
     GROUNDING_TOOLS,
@@ -56,15 +56,10 @@ def test_no_ref_cycles() -> None:
             )
 
 
-def test_escalate_tool_fields_match_escalation_payload() -> None:
-    """The tool input + broker-filled fields == the wire payload. Drift pin."""
+def test_escalate_tool_fields_match_escalation_disclosure() -> None:
+    """The tool input minus broker-only fields == the wire disclosure. Drift pin."""
     tool_fields = set(EscalateCall.model_fields) - {"reasoning", "task_summary"}
-    payload_fields = set(EscalationPayload.model_fields) - {
-        "escalation_id",
-        "session_id",
-        "task_context",
-    }
-    assert tool_fields == payload_fields
+    assert tool_fields == set(EscalationDisclosure.model_fields)
 
 
 def test_task_activity_on_non_escalate_triage_tools_only() -> None:
