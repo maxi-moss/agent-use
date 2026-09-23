@@ -30,6 +30,7 @@ ESCALATION = EscalationPayload.model_validate(
         "escalation_id": "e1",
         "session_id": "s1",
         "task_context": "add a login page",
+        "escalation_title": "TITLE-TEXT",
         "situation": "SITUATION-TEXT",
         "what_was_asked": "ASKED-TEXT",
         "what_is_at_stake": "STAKE-TEXT",

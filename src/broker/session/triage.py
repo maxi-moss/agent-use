@@ -57,6 +57,13 @@ class EscalateCall(_HasTaskSummary):
     model_config = ConfigDict(extra="forbid")
 
     reasoning: str
+    escalation_title: str = Field(
+        description=(
+            "A short noun-phrase title naming the decision, e.g. 'Queue"
+            " replacement policy'. Shown to the developer as the escalation's"
+            " one-line label."
+        )
+    )
     situation: str
     what_was_asked: str
     what_is_at_stake: str

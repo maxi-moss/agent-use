@@ -278,7 +278,8 @@ class BrokerMasterApp(App[None]):
         elif isinstance(event, EscalationArrived):
             self._head = event
             self._event_line(
-                f"escalation {event.escalation_id} from {event.session_id}"
+                f"{event.session_id} requested a decision: "
+                f"{event.escalation_title}"
             )
         elif isinstance(event, PermissionEscalationArrived):
             self._permissions[event.session_id] = event.rendered

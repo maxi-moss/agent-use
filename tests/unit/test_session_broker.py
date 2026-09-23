@@ -129,6 +129,7 @@ ESCALATE_RESULT = ToolCall(
     input={
         "reasoning": "plan looks wrong",
         "task_summary": "Questioned a stale plan",
+        "escalation_title": "Stale plan",
         "situation": "the plan contradicts the code",
         "what_was_asked": "how to proceed",
         "what_is_at_stake": "architecture drift",

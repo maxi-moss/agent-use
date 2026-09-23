@@ -26,6 +26,7 @@ CFG = BrokerConfig(broker_home=Path("/private/tmp/unused"))
 ESCALATE_INPUT: dict[str, Any] = {
     "reasoning": "irreversible",
     "task_summary": "Asked before an irreversible step",
+    "escalation_title": "Production database choice",
     "situation": "the menu picks a production database",
     "what_was_asked": "which database",
     "what_is_at_stake": "real data",

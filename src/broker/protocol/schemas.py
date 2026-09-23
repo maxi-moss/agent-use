@@ -228,6 +228,7 @@ class EscalationPayload(BaseModel):
     escalation_id: str
     session_id: str
     task_context: str
+    escalation_title: str
     situation: str
     what_was_asked: str
     what_is_at_stake: str

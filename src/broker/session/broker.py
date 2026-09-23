@@ -1069,6 +1069,7 @@ class SessionBroker:
                 )
         elif isinstance(result, EscalateCall):
             payload = self._new_escalation(
+                escalation_title=result.escalation_title,
                 situation=result.situation,
                 what_was_asked=result.what_was_asked,
                 what_is_at_stake=result.what_is_at_stake,
@@ -1102,6 +1103,7 @@ class SessionBroker:
     def _new_escalation(
         self,
         *,
+        escalation_title: str,
         situation: str,
         what_was_asked: str,
         what_is_at_stake: str,
@@ -1113,6 +1115,7 @@ class SessionBroker:
         """Build an escalation carrying this session's identifying preamble.
 
         Args:
+            escalation_title: Short title naming the decision.
             situation: What is happening that needs a decision.
             what_was_asked: The question, verbatim.
             what_is_at_stake: Consequences of getting it wrong.
@@ -1128,6 +1131,7 @@ class SessionBroker:
             escalation_id=uuid.uuid4().hex,
             session_id=self.cfg.name,
             task_context=self._intent(),
+            escalation_title=escalation_title,
             situation=situation,
             what_was_asked=what_was_asked,
             what_is_at_stake=what_is_at_stake,
@@ -1155,6 +1159,7 @@ class SessionBroker:
             events: Transcript events used to baseline out-of-band resolution.
         """
         payload = self._new_escalation(
+            escalation_title="Autonomous answer budget exhausted",
             situation=(
                 f"Autonomous answer budget exhausted: {self.budget_count} "
                 "consecutive autonomous answers without developer contact. "
@@ -1215,6 +1220,7 @@ class SessionBroker:
         )
         if esc is None:
             payload = self._new_escalation(
+                escalation_title="Pending AskUserQuestion menu",
                 situation=f"AskUserQuestion pending — {pane_note}",
                 what_was_asked=rendered,
                 what_is_at_stake=(
@@ -1231,6 +1237,7 @@ class SessionBroker:
             )
         else:
             payload = self._new_escalation(
+                escalation_title=esc.escalation_title,
                 situation=esc.situation + "\n\n" + pane_note,
                 what_was_asked=esc.what_was_asked,
                 what_is_at_stake=esc.what_is_at_stake,
@@ -1366,6 +1373,7 @@ class SessionBroker:
         """
         self._log(DecisionKind.ASK_VERIFY_FAILED, reason, tool_use_id)
         payload = self._new_escalation(
+            escalation_title="AskUserQuestion answer verification failed",
             situation=(
                 "AskUserQuestion answer verification failed — " + reason
                 + f" Check pane {self.pane_id or '?'} and the session's "

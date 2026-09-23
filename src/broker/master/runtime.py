@@ -328,6 +328,9 @@ def render_escalation(p: EscalationPayload) -> str:
     lines = [
         f"Escalation {p.escalation_id} — session {p.session_id}",
         "",
+        "## Title",
+        p.escalation_title,
+        "",
         "## Task context",
         p.task_context,
         "",
@@ -791,7 +794,10 @@ class MasterRuntime:
         self._surfaced_id = head.escalation_id
         self.emit(
             EscalationArrived(
-                head.session_id, head.escalation_id, render_escalation(head)
+                head.session_id,
+                head.escalation_id,
+                head.escalation_title,
+                render_escalation(head),
             )
         )
         await self._notify(

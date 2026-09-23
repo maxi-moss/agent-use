@@ -48,7 +48,8 @@ def render_disclosure(p: EscalationPayload) -> str:
 
     Returns:
         The escalation's analysis as a plain block. Omits the id/session
-        header (the broker knows both) and task_context (carried as intent).
+        header (the broker knows both), task_context (carried as intent) and
+        the title.
     """
     lines = [
         "## Situation",

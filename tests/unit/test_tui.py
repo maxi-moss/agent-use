@@ -227,7 +227,7 @@ async def test_slash_escalation_pastes_the_head_disclosure_verbatim(
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
         app._emit(  # pyright: ignore[reportPrivateUsage]
-            EscalationArrived("s1", "e1", rendered)
+            EscalationArrived("s1", "e1", "Queue policy", rendered)
         )
         await pilot.pause()
         assert rendered not in _chat_only_texts(app)  # arrival stays off the chat
@@ -248,7 +248,7 @@ async def test_slash_escalation_forgets_a_head_the_fleet_no_longer_names(
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
         app._emit(  # pyright: ignore[reportPrivateUsage]
-            EscalationArrived("s1", "e1", rendered)
+            EscalationArrived("s1", "e1", "Queue policy", rendered)
         )
         app._emit(  # pyright: ignore[reportPrivateUsage]
             FleetUpdated(_fleet_view((_session_row("s1", ()),)))

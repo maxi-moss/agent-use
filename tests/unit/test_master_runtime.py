@@ -239,6 +239,7 @@ def escalation_dict(esc_id: str = "e1", session: str = "s1") -> dict[str, Any]:
         "escalation_id": esc_id,
         "session_id": session,
         "task_context": "ctx-task-value",
+        "escalation_title": "title-value",
         "situation": "situation-value",
         "what_was_asked": "asked-value",
         "what_is_at_stake": "stake-value",
