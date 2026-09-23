@@ -50,7 +50,7 @@ uv run python -m broker.master
 
 Session brokers are never launched by hand — the master spawns them.
 
-The TUI's left pane is a live fleet dashboard: one block per session with its state, budget, current intent, a ⚠ when it is sitting on a native permission prompt, and what its broker is doing right now. The header line shows the master's own activity. It is display only — nothing on it enters any LLM context.
+The TUI's left pane is a live fleet dashboard: one block per session with its state, budget, current intent, a ⚠ when it is sitting on a native permission prompt or AskUserQuestion menu, and what its broker is doing right now. The header line shows the master's own activity. It is display only — nothing on it enters any LLM context.
 
 Configuration is optional. Defaults live in `BrokerConfig` (`src/broker/config.py`) and are overlaid with `$BROKER_HOME/config.json` if present; `$BROKER_HOME` defaults to `~/.broker` and is where sockets, the session registry, and logs are kept. `src/broker/paths.py` defines where each of those lives and is the only place that builds a path inside it.
 
@@ -74,7 +74,7 @@ A session cannot be spawned for a repository without an index: grounding retriev
 uv run python -m broker.master --test-mode
 ```
 
-Test mode drives synthetic escalations through the **real** master — the real TUI, socket server, runtime handlers, and persisted escalation queue and permission store. Everything above the socket is left out: no LLM, no hooks, no herdr, no Claude Code, no live sessions. So none of the startup requirements above apply — no API keys, nothing on `PATH` — and it never writes `~/.claude/settings.json`.
+Test mode drives synthetic escalations through the **real** master — the real TUI, socket server, runtime handlers, and persisted escalation queue and pane-escalation store. Everything above the socket is left out: no LLM, no hooks, no herdr, no Claude Code, no live sessions. So none of the startup requirements above apply — no API keys, nothing on `PATH` — and it never writes `~/.claude/settings.json`.
 
 Inside the TUI, `/inject <scenario>` runs one scenario from `tests/scenarios/*.json` and reports each step, ending in a `PASS`/`FAIL` summary. Run the master from the repo root, since `/inject` resolves scenario files relative to the working directory. `/inject` with an unknown or missing name prints the available scenarios.
 

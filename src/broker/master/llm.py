@@ -37,7 +37,7 @@ from broker.llm import (
 from broker.master.runtime import (
     MasterRuntime,
     render_escalation,
-    render_permission_escalation,
+    render_pane_escalation,
     render_proposal,
 )
 
@@ -381,7 +381,7 @@ class MasterLLM:
 
     def _assemble(self, developer_message: str) -> list[MessageParam]:
         """Fresh per turn: registry summary, the single active
-        escalation (verbatim block), every open permission escalation and
+        escalation (verbatim block), every open pane escalation and
         pending prompt proposal (verbatim blocks), a bounded window of recent
         turns, then the developer's message."""
         blocks: list[TextBlockParam] = [
@@ -397,18 +397,18 @@ class MasterLLM:
             # Byte-identical to the runtime rendering — its own block, so
             # nothing is prepended to or reflowed around the broker's words.
             blocks.append({"type": "text", "text": render_escalation(active)})
-        for prompt in self.runtime.open_permission_escalations():
+        for prompt in self.runtime.open_pane_escalations():
             blocks.append(
                 {
                     "type": "text",
-                    "text": "# Open permission escalation — session "
+                    "text": f"# Open {prompt.kind} escalation — session "
                     + prompt.session_id,
                 }
             )
             blocks.append(
                 {
                     "type": "text",
-                    "text": render_permission_escalation(
+                    "text": render_pane_escalation(
                         prompt, self.runtime.pane_of(prompt.session_id)
                     ),
                 }

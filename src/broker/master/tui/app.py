@@ -25,7 +25,7 @@ from textual.worker import Worker, WorkerState
 from broker.config import BrokerConfig
 from broker.llm import LLMCaller, TurnResult
 from broker.master.llm import MasterLLM
-from broker.master.permission_escalations import PermissionEscalations
+from broker.master.pane_escalations import PaneEscalations
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry
 from broker.master.runtime import MasterRuntime
@@ -43,10 +43,11 @@ from broker.master.viewmodel import (
     FleetUpdated,
     FleetView,
     Notice,
-    PermissionEscalationArrived,
+    PaneEscalationArrived,
     ProposalArrived,
     ViewEvent,
 )
+from broker.protocol.constants import PaneKind
 
 
 class BrokerMasterApp(App[None]):
@@ -72,7 +73,7 @@ class BrokerMasterApp(App[None]):
         cfg: BrokerConfig,
         registry: Registry,
         queue: EscalationQueue,
-        permissions: PermissionEscalations,
+        panes: PaneEscalations,
         llm_call: LLMCaller[TurnResult],
         *,
         anchor_pane: str,
@@ -89,14 +90,14 @@ class BrokerMasterApp(App[None]):
         # widgets.
         self._scenario_posts: list[ViewEvent] = []
         # Disclosures are held here, off the chat, until /escalation,
-        # /permission or /proposal pastes one in; FleetUpdated prunes what is
-        # no longer live.
+        # /permission, /question or /proposal pastes one in; FleetUpdated
+        # prunes what is no longer live.
         self._head: EscalationArrived | None = None
-        self._permissions: dict[str, str] = {}
+        self._panes: dict[PaneKind, dict[str, str]] = {kind: {} for kind in PaneKind}
         self._proposals: dict[str, str] = {}
         self._last_view: FleetView | None = None
         self.runtime = MasterRuntime(
-            self._emit, registry, queue, permissions, cfg, anchor_pane=anchor_pane
+            self._emit, registry, queue, panes, cfg, anchor_pane=anchor_pane
         )
         self.master_llm = MasterLLM(llm_call, self.runtime, cfg)
         self._server_task: asyncio.Task[None] | None = None
@@ -157,7 +158,20 @@ class BrokerMasterApp(App[None]):
             self._show_escalation()
             return
         if text == "/permission" or text.startswith("/permission "):
-            self._show_permission(text[len("/permission"):].strip() or None)
+            self._show_pane(
+                PaneKind.PERMISSION,
+                text[len("/permission"):].strip() or None,
+                noun="permission prompt",
+                command="/permission",
+            )
+            return
+        if text == "/question" or text.startswith("/question "):
+            self._show_pane(
+                PaneKind.QUESTION,
+                text[len("/question"):].strip() or None,
+                noun="question",
+                command="/question",
+            )
             return
         if text == "/proposal" or text.startswith("/proposal "):
             self._show_proposal(text[len("/proposal"):].strip() or None)
@@ -281,10 +295,10 @@ class BrokerMasterApp(App[None]):
                 f"{event.session_id} requested a decision: "
                 f"{event.escalation_title}"
             )
-        elif isinstance(event, PermissionEscalationArrived):
-            self._permissions[event.session_id] = event.rendered
+        elif isinstance(event, PaneEscalationArrived):
+            self._panes[event.kind][event.session_id] = event.rendered
             self._event_line(
-                f"permission escalation {event.escalation_id} from "
+                f"{event.kind} escalation {event.escalation_id} from "
                 f"{event.session_id}"
             )
         elif isinstance(event, ProposalArrived):
@@ -313,10 +327,11 @@ class BrokerMasterApp(App[None]):
             head is None or head.escalation_id != self._head.escalation_id
         ):
             self._head = None
-        prompting = {p.session_id for p in view.permissions}
-        self._permissions = {
-            sid: text for sid, text in self._permissions.items() if sid in prompting
-        }
+        for kind, held in self._panes.items():
+            open_ids = {p.session_id for p in view.panes if p.kind == kind}
+            self._panes[kind] = {
+                sid: text for sid, text in held.items() if sid in open_ids
+            }
         proposing = {r.session_id for r in view.rows if Attention.PROPOSAL in r.badges}
         self._proposals = {
             sid: text for sid, text in self._proposals.items() if sid in proposing
@@ -329,14 +344,11 @@ class BrokerMasterApp(App[None]):
             return
         self._chat_block(self._head.rendered)
 
-    def _show_permission(self, session_id: str | None) -> None:
-        """Paste an open permission prompt's disclosure into the chat, verbatim."""
-        self._paste_held(
-            self._permissions,
-            session_id,
-            noun="permission prompt",
-            command="/permission",
-        )
+    def _show_pane(
+        self, kind: PaneKind, session_id: str | None, *, noun: str, command: str
+    ) -> None:
+        """Paste an open pane escalation's disclosure into the chat, verbatim."""
+        self._paste_held(self._panes[kind], session_id, noun=noun, command=command)
 
     def _show_proposal(self, session_id: str | None) -> None:
         """Paste a pending proposal into the chat, verbatim."""

@@ -21,14 +21,16 @@ def escalation(esc_id: str = "e1", session: str = "s1") -> EscalationPayload:
             "escalation_id": esc_id,
             "session_id": session,
             "task_context": "ctx",
-            "escalation_title": "title",
-            "situation": "sit",
-            "what_was_asked": "asked",
-            "what_is_at_stake": "stake",
-            "alternatives": [{"option": "A", "pros": "pro", "cons": "con"}],
-            "recommendation": "rec",
-            "uncertainty": "unc",
-            "what_would_change_my_mind": "change",
+            "disclosure": {
+                "escalation_title": "title",
+                "situation": "sit",
+                "what_was_asked": "asked",
+                "what_is_at_stake": "stake",
+                "alternatives": [{"option": "A", "pros": "pro", "cons": "con"}],
+                "recommendation": "rec",
+                "uncertainty": "unc",
+                "what_would_change_my_mind": "change",
+            },
         }
     )
 

@@ -26,18 +26,19 @@ T_CLARIFY_ESCALATION = "clarify_escalation"
 
 # Master-socket message types
 T_ESCALATION = "escalation"
-T_PERMISSION_ESCALATION = "permission_escalation"
+# raiser -> master: a native prompt the developer answers in the pane
+T_PANE_ESCALATION = "pane_escalation"
 T_COMPLETION = "completion"
 T_FATAL_ERROR = "fatal_error"
 T_ESCALATION_RETRACT = "escalation_retract"  # broker -> master: resolved out of band
-# permission module -> master: prompt is gone
-T_PERMISSION_RETRACT = "permission_retract"
+T_PANE_RETRACT = "pane_retract"  # raiser -> master: the native prompt closed
 T_PROMPT_PROPOSAL = "prompt_proposal"  # broker -> master
 T_BUDGET_UPDATE = "budget_update"  # broker -> master
 T_DECISION_DELIVERED = "decision_delivered"  # broker -> master
 T_DECISION_UNDELIVERED = "decision_undelivered"  # broker -> master
 T_LIVE_STATUS = "live_status"  # broker -> master
 T_SESSION_ENDED = "session_ended"  # broker -> master: SessionEnd fired, exiting
+T_PROMPT_UNDELIVERED = "prompt_undelivered"  # broker -> master
 
 # Machine-readable refusal reasons carried alongside the human-readable error
 # string on a negative Response. Closed set: a sender that cannot tell a
@@ -57,6 +58,16 @@ DECISION_ESCALATED = "escalated"
 # ask_question reply decisions — "answer" carries updated_input for the hook
 # to print; anything else (escalated / timeout / malformed) prints nothing.
 ASK_DECISION_ANSWER = "answer"
+
+
+class PaneKind(StrEnum):
+    """Which native prompt a pane escalation reports.
+
+    Lives here because the view model may import only this module.
+    """
+
+    PERMISSION = "permission"
+    QUESTION = "question"
 
 
 class SessionState(StrEnum):

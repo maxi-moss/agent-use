@@ -2,9 +2,9 @@
 
 One escalation is live per session; the head is the one surfaced to the
 developer. Order is the file's list order — every mutation persists before it
-returns, so a pending escalation survives a master restart. Permission
+returns, so a pending escalation survives a master restart. Pane
 escalations are never queued here: they live in
-``broker.master.permission_escalations``.
+``broker.master.pane_escalations``.
 """
 
 import json

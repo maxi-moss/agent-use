@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from broker.config import BrokerConfig
-from broker.master.permission_escalations import PermissionEscalations
+from broker.master.pane_escalations import PaneEscalations
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry
 from broker.master.runtime import MasterRuntime
@@ -36,10 +36,10 @@ async def rt(home: Path) -> AsyncIterator[tuple[MasterRuntime, list[Any]]]:
     cfg = BrokerConfig(model_id="test-model", broker_home=home)
     registry = Registry.load(home / "registry.json")
     queue = EscalationQueue.load(home / "escalation-queue.json")
-    permissions = PermissionEscalations.load(home / "permission-escalations.json")
+    panes = PaneEscalations.load(home / "pane-escalations.json")
     posts: list[Any] = []
     runtime = MasterRuntime(
-        posts.append, registry, queue, permissions, cfg, anchor_pane="%1"
+        posts.append, registry, queue, panes, cfg, anchor_pane="%1"
     )
     task = asyncio.create_task(runtime.serve())
     for _ in range(200):
@@ -91,6 +91,10 @@ async def test_dispatch_race(rt: tuple[MasterRuntime, list[Any]]) -> None:
 
 async def test_duplicate_escalation(rt: tuple[MasterRuntime, list[Any]]) -> None:
     await _run(rt, "duplicate-escalation")
+
+
+async def test_question_parallel(rt: tuple[MasterRuntime, list[Any]]) -> None:
+    await _run(rt, "question-parallel")
 
 
 async def test_broker_death(rt: tuple[MasterRuntime, list[Any]]) -> None:

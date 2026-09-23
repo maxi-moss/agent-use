@@ -1,17 +1,18 @@
 """AttentionNotice: the pinned strip above the master chat naming what needs
-the developer right now — the decision-queue head, every open permission prompt
+the developer right now — the decision-queue head, every open pane escalation
 and any proposals awaiting approval. It renders from FleetView alone and hides
 itself when nothing is waiting; the disclosures themselves enter the chat only
-on /escalation, /permission or /proposal."""
+on /escalation, /permission, /question or /proposal."""
 
 from rich.text import Text
 from textual.widgets import Static
 
-from broker.master.viewmodel import Attention, FleetView
+from broker.master.viewmodel import Attention, FleetView, PaneRequest
+from broker.protocol.constants import PaneKind
 
 
 class AttentionNotice(Static):
-    """One line for the queue head, one per open permission prompt, one per
+    """One line for the queue head, one per open pane escalation, one per
     pending proposal."""
 
     DEFAULT_CSS = """
@@ -35,17 +36,7 @@ class AttentionNotice(Static):
         head_line = AttentionNotice._head_line(view)
         if head_line is not None:
             lines.append(head_line)
-        for prompt in view.permissions:
-            pane = next(
-                (r.pane_id for r in view.rows if r.session_id == prompt.session_id),
-                None,
-            )
-            where = f"pane {pane}" if pane else "its pane"
-            lines.append(
-                f"⚠ {prompt.session_id} permission prompt for {prompt.tool_name}"
-                f" — answer it in {where}; /permission {prompt.session_id}"
-                " shows why"
-            )
+        lines += [AttentionNotice._pane_line(view, p) for p in view.panes]
         for row in view.rows:
             if Attention.PROPOSAL in row.badges:
                 lines.append(
@@ -53,6 +44,24 @@ class AttentionNotice(Static):
                     f" — /proposal {row.session_id} shows it"
                 )
         return lines
+
+    @staticmethod
+    def _pane_line(view: FleetView, request: PaneRequest) -> str:
+        pane = next(
+            (r.pane_id for r in view.rows if r.session_id == request.session_id),
+            None,
+        )
+        where = f"pane {pane}" if pane else "its pane"
+        sid = request.session_id
+        if request.kind == PaneKind.PERMISSION:
+            return (
+                f"⚠ {sid} permission prompt for {request.label}"
+                f" — answer it in {where}; /permission {sid} shows why"
+            )
+        return (
+            f"⚠ {sid} question: {request.label}"
+            f" — answer it in {where}; /question {sid} shows it"
+        )
 
     @staticmethod
     def _head_line(view: FleetView) -> str | None:

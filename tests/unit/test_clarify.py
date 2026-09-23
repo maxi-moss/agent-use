@@ -30,17 +30,19 @@ ESCALATION = EscalationPayload.model_validate(
         "escalation_id": "e1",
         "session_id": "s1",
         "task_context": "add a login page",
-        "escalation_title": "TITLE-TEXT",
-        "situation": "SITUATION-TEXT",
-        "what_was_asked": "ASKED-TEXT",
-        "what_is_at_stake": "STAKE-TEXT",
-        "alternatives": [
-            {"option": "OPTION-A", "pros": "PROS-A", "cons": "CONS-A"},
-            {"option": "OPTION-B", "pros": "PROS-B", "cons": "CONS-B"},
-        ],
-        "recommendation": "RECOMMENDATION-TEXT",
-        "uncertainty": "UNCERTAINTY-TEXT",
-        "what_would_change_my_mind": "CHANGE-MIND-TEXT",
+        "disclosure": {
+            "escalation_title": "TITLE-TEXT",
+            "situation": "SITUATION-TEXT",
+            "what_was_asked": "ASKED-TEXT",
+            "what_is_at_stake": "STAKE-TEXT",
+            "alternatives": [
+                {"option": "OPTION-A", "pros": "PROS-A", "cons": "CONS-A"},
+                {"option": "OPTION-B", "pros": "PROS-B", "cons": "CONS-B"},
+            ],
+            "recommendation": "RECOMMENDATION-TEXT",
+            "uncertainty": "UNCERTAINTY-TEXT",
+            "what_would_change_my_mind": "CHANGE-MIND-TEXT",
+        },
     }
 )
 
@@ -129,7 +131,7 @@ async def test_context_places_disclosure_and_question_in_working() -> None:
     content = cast(list[dict[str, Any]], fake.calls[0]["messages"][0]["content"])
     assert len(content) == 3
     working = content[2]["text"]
-    assert render_disclosure(ESCALATION) in working
+    assert render_disclosure(ESCALATION.disclosure) in working
     assert QUESTION in working
     assert "cache_control" not in content[2]
     # The transcript block keeps its breakpoint: repeat questions on the same
@@ -139,7 +141,7 @@ async def test_context_places_disclosure_and_question_in_working() -> None:
 
 
 def test_render_disclosure_includes_analysis() -> None:
-    text = render_disclosure(ESCALATION)
+    text = render_disclosure(ESCALATION.disclosure)
     for expected in (
         "SITUATION-TEXT",
         "ASKED-TEXT",

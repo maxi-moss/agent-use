@@ -28,8 +28,8 @@ from broker.protocol.constants import (
     DECISION_ESCALATED,
     NACK_MALFORMED,
     NACK_SLOT_OCCUPIED,
-    T_PERMISSION_ESCALATION,
-    T_PERMISSION_RETRACT,
+    T_PANE_ESCALATION,
+    T_PANE_RETRACT,
 )
 from broker.protocol.schemas import Envelope, Response
 from broker.protocol.server import serve_unix
@@ -91,7 +91,7 @@ class StubMaster:
 
     async def __call__(self, env: Envelope) -> Response | None:
         self.received.append(env)
-        if self.nack is not None and env.type == T_PERMISSION_ESCALATION:
+        if self.nack is not None and env.type == T_PANE_ESCALATION:
             return Response(id=env.id, ok=False, payload=dict(self.nack))
         return Response(id=env.id, ok=True)
 
@@ -229,13 +229,13 @@ async def test_signals_1_2_4_retract(
     llm = FakeLLM(ESCALATE)
     async with _module(home, llm) as (module, master, _):
         assert await module.decide("Bash", PUSH_INPUT, []) == DECISION_ESCALATED
-        raised = await master.wait_for(T_PERMISSION_ESCALATION)
+        raised = await master.wait_for(T_PANE_ESCALATION)
         signal(module)
-        retract = await master.wait_for(T_PERMISSION_RETRACT)
+        retract = await master.wait_for(T_PANE_RETRACT)
         # A second signal has nothing left to resolve.
         signal(module)
         await asyncio.sleep(SETTLE_S)
-        assert len(master.of_type(T_PERMISSION_RETRACT)) == 1
+        assert len(master.of_type(T_PANE_RETRACT)) == 1
     assert retract.payload["escalation_id"] == raised.payload["escalation_id"]
     assert retract.payload["reason"]
 
@@ -244,10 +244,10 @@ async def test_unrelated_tool_completion_does_not_retract(home: Path) -> None:
     llm = FakeLLM(ESCALATE)
     async with _module(home, llm) as (module, master, _):
         await module.decide("Bash", PUSH_INPUT, [])
-        await master.wait_for(T_PERMISSION_ESCALATION)
+        await master.wait_for(T_PANE_ESCALATION)
         module.note_tool_completed("Read", READ_INPUT)
         await asyncio.sleep(SETTLE_S)
-        assert master.of_type(T_PERMISSION_RETRACT) == []
+        assert master.of_type(T_PANE_RETRACT) == []
 
 
 async def test_second_escalation_supersedes_the_first(home: Path) -> None:
@@ -260,17 +260,17 @@ async def test_second_escalation_supersedes_the_first(home: Path) -> None:
     llm = FakeLLM(ESCALATE, ESCALATE_2)
     async with _module(home, llm) as (module, master, log):
         assert await module.decide("Bash", PUSH_INPUT, []) == DECISION_ESCALATED
-        first = await master.wait_for(T_PERMISSION_ESCALATION)
+        first = await master.wait_for(T_PANE_ESCALATION)
         assert await module.decide("Bash", DEPLOY_INPUT, []) == DECISION_ESCALATED
-        second = await master.wait_for(T_PERMISSION_ESCALATION, count=2)
-        retract = await master.wait_for(T_PERMISSION_RETRACT)
+        second = await master.wait_for(T_PANE_ESCALATION, count=2)
+        retract = await master.wait_for(T_PANE_RETRACT)
         await asyncio.sleep(SETTLE_S)
     assert retract.payload["escalation_id"] == first.payload["escalation_id"]
     assert second.payload["tool_input"] == DEPLOY_INPUT
     # The slot is one-per-session, so the retraction has to land first or the
     # replacement is refused for capacity by the escalation it replaces.
     order = [e.type for e in master.received]
-    assert order.index(T_PERMISSION_RETRACT) < order.index(T_PERMISSION_ESCALATION, 1)
+    assert order.index(T_PANE_RETRACT) < order.index(T_PANE_ESCALATION, 1)
     written = entries(log)
     assert [e["reason"] for e in written] == ["publishes to a remote", "deploys"]
 
@@ -285,11 +285,11 @@ async def test_slot_occupied_nack_is_routine(home: Path) -> None:
     llm = FakeLLM(ESCALATE, ESCALATE_2)
     async with _module(home, llm, master=master) as (module, _, log):
         assert await module.decide("Bash", PUSH_INPUT, []) == DECISION_ESCALATED
-        await master.wait_for(T_PERMISSION_ESCALATION)
+        await master.wait_for(T_PANE_ESCALATION)
         await asyncio.sleep(SETTLE_S)  # the refusal lands and frees the slot
         assert await module.decide("Bash", DEPLOY_INPUT, []) == DECISION_ESCALATED
         # A refused raise is not a live escalation, so the next one still goes.
-        await master.wait_for(T_PERMISSION_ESCALATION, count=2)
+        await master.wait_for(T_PANE_ESCALATION, count=2)
     written = entries(log)
     assert [e["reason"] for e in written] == ["publishes to a remote", "deploys"]
 
@@ -325,9 +325,9 @@ async def test_non_capacity_nack_still_frees_the_slot(home: Path) -> None:
     llm = FakeLLM(ESCALATE)
     async with _module(home, llm, master=master) as (module, _, _log):
         assert await module.decide("Bash", PUSH_INPUT, []) == DECISION_ESCALATED
-        await master.wait_for(T_PERMISSION_ESCALATION)
+        await master.wait_for(T_PANE_ESCALATION)
         await asyncio.sleep(SETTLE_S)
         # Nothing reached the developer, so there is nothing to retract.
         module.note_session_ended()
         await asyncio.sleep(SETTLE_S)
-        assert master.of_type(T_PERMISSION_RETRACT) == []
+        assert master.of_type(T_PANE_RETRACT) == []

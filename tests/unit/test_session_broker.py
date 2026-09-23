@@ -24,6 +24,7 @@ from broker.permission import PermissionModule
 from broker.permission.llm import ToolCall as PermissionToolCall
 from broker.protocol import client
 from broker.protocol.constants import (
+    NACK_PROTOCOL_VIOLATION,
     NACK_WRONG_STATE,
     T_APPROVE_PROMPT,
     T_CLARIFY_ESCALATION,
@@ -40,9 +41,13 @@ from broker.protocol.constants import (
     T_GET_PERMISSION_LOG,
     T_HOOK_EVENT,
     T_LIVE_STATUS,
+    T_PANE_ESCALATION,
+    T_PANE_RETRACT,
     T_PERMISSION_REQUEST,
     T_PROMPT_PROPOSAL,
+    T_PROMPT_UNDELIVERED,
     T_REACTIVATE,
+    T_SEND_PROMPT,
     T_SESSION_ENDED,
     T_SHUTDOWN,
     T_STATUS,
@@ -102,6 +107,10 @@ COLOR_TOOL_INPUT: dict[str, Any] = {
         }
     ]
 }
+COLOR_MENU = (
+    "## Question 1 (single-select): Pick a color [Color]\n"
+    "- Blue (Recommended): calm\n- Red: loud"
+)
 ANSWER_QUESTIONS_RESULT = ToolCall(
     name="answer_questions",
     input={
@@ -289,12 +298,23 @@ class StubMaster:
         # Message types whose NEXT delivery is refused (dropped connection),
         # each consumed on first use — models one failed ACK.
         self.fail_types: set[str] = set()
+        # Message types the master answers ok=False, recorded all the same.
+        self.nack_types: set[str] = set()
 
     async def __call__(self, env: Envelope) -> Response | None:
         if env.type in self.fail_types:
             self.fail_types.discard(env.type)
             raise ConnectionError("scripted delivery failure")
         self.received.append(env)
+        if env.type in self.nack_types:
+            return Response(
+                id=env.id,
+                ok=False,
+                payload={
+                    "error": "scripted refusal",
+                    "reason_code": NACK_PROTOCOL_VIOLATION,
+                },
+            )
         return Response(id=env.id, ok=True)
 
     def of_type(self, msg_type: str) -> list[Envelope]:
@@ -742,6 +762,49 @@ async def test_session_end_reports_terminal_and_exits(
         await harness.run_task
 
 
+async def test_launch_failure_is_reported_to_the_master(harness: Harness) -> None:
+    await client.notify(
+        harness.sock,
+        hook_env(
+            "SessionStart",
+            {"session_id": "cc-1", "transcript_path": str(harness.transcript)},
+        ),
+    )
+    await harness.llm.results.put(
+        ToolCall(
+            name="propose_prompt",
+            input={"reasoning": "grounded in cwd", "prompt": "GROUNDED PROMPT"},
+        )
+    )
+    proposal = await harness.master.wait_for(T_PROMPT_PROPOSAL)
+    # A menu opens while the developer is still deciding on the proposal.
+    resp = await client.request(
+        harness.sock,
+        ask_question_env("toolu_during_approval", COLOR_TOOL_INPUT),
+        timeout_s=5.0,
+    )
+    assert resp.payload["decision"] == "escalated"
+    harness.run.calls.clear()
+    await client.request(
+        harness.sock,
+        Envelope(
+            id=uuid.uuid4().hex,
+            type=T_APPROVE_PROMPT,
+            session_id="s1",
+            payload={
+                "proposal_id": proposal.payload["proposal_id"],
+                "prompt": "APPROVED PROMPT",
+            },
+        ),
+        timeout_s=5.0,
+    )
+    # An approved prompt that never reached the pane must not vanish into a
+    # crashed broker's stderr.
+    fatal = await harness.master.wait_for(T_FATAL_ERROR)
+    assert fatal.payload["error_class"] == "PaneOccupiedError"
+    assert harness.run.drive_calls() == []
+
+
 async def test_ground_and_reactivate_call_set_intent(harness: Harness) -> None:
     spy = harness.spy_permission()
     await launch(harness)
@@ -849,7 +912,10 @@ async def test_escalation_sent_then_broker_is_quiescent(
     )
     await harness.llm.results.put(ESCALATE_RESULT)
     escalation = await harness.master.wait_for(T_ESCALATION)
-    assert escalation.payload["situation"] == "the plan contradicts the code"
+    assert (
+        escalation.payload["disclosure"]["situation"]
+        == "the plan contradicts the code"
+    )
     assert escalation.payload["task_context"] == "APPROVED PROMPT"
     await wait_state(harness.broker, "escalated")
     harness.run.calls.clear()
@@ -862,49 +928,148 @@ async def test_escalation_sent_then_broker_is_quiescent(
     assert harness.broker.state == "escalated"
 
 
-async def test_ask_question_escalates_and_retracts_on_answer(
+def append_menu(
+    h: Harness,
+    tool_use_id: str,
+    *,
+    answers: dict[str, str] | None = None,
+    answered: bool = True,
+) -> None:
+    """Append an AskUserQuestion call, and optionally its answer, to the transcript."""
+    records: list[dict[str, Any]] = [
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "AskUserQuestion",
+                        "id": tool_use_id,
+                        "input": COLOR_TOOL_INPUT,
+                    }
+                ]
+            },
+        }
+    ]
+    if answered:
+        answer: dict[str, Any] = {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": "answered in the pane",
+                    }
+                ],
+            },
+        }
+        if answers is not None:
+            answer["toolUseResult"] = {"answers": answers}
+        records.append(answer)
+    with h.transcript.open("a") as f:
+        for record in records:
+            f.write(json.dumps(record) + "\n")
+
+
+def append_user_prompt(h: Harness, text: str) -> None:
+    """Append a developer-typed prompt to the transcript."""
+    record = {
+        "type": "user",
+        "origin": {"kind": "human"},
+        "message": {"role": "user", "content": text},
+    }
+    with h.transcript.open("a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+async def open_escalated_menu(h: Harness, tool_use_id: str = "toolu_open") -> Envelope:
+    """Have the ask LLM escalate a menu; return the question escalation raised."""
+    await h.llm.results.put(ESCALATE_RESULT)
+    resp = await client.request(
+        h.sock, ask_question_env(tool_use_id, COLOR_TOOL_INPUT), timeout_s=5.0
+    )
+    assert resp.payload["decision"] == "escalated"
+    return await h.master.wait_for(T_PANE_ESCALATION)
+
+
+async def send_prompt(h: Harness, text: str) -> Response:
+    return await client.request(
+        h.sock,
+        Envelope(
+            id=uuid.uuid4().hex,
+            type=T_SEND_PROMPT,
+            session_id="s1",
+            payload={"text": text},
+        ),
+        timeout_s=5.0,
+    )
+
+
+async def test_escalated_menu_is_a_pane_escalation_and_stays_driving(
     harness: Harness,
 ) -> None:
     await launch(harness)
-    await harness.llm.results.put(ESCALATE_RESULT)
-    resp = await client.request(
-        harness.sock,
-        ask_question_env(PENDING_ASK_ID, COLOR_TOOL_INPUT),
-        timeout_s=5.0,
-    )
-    assert resp.ok is True
-    assert resp.payload["decision"] == "escalated"
-    escalation = await harness.master.wait_for(T_ESCALATION)
-    # Wrap, never rewrite: the LLM's situation text survives verbatim and the
-    # pane note is appended.
-    assert escalation.payload["situation"].startswith(
-        "the plan contradicts the code"
-    )
-    assert escalation.payload["situation"].endswith(
-        "The native menu is on screen in pane w3:p2 — answer it directly in "
-        "that pane."
-    )
-    assert escalation.payload["what_was_asked"] == "how to proceed"
-    assert escalation.payload["uncertainty"] == "whether the plan is stale"
-    await wait_state(harness.broker, "escalated")
+    raised = await open_escalated_menu(harness)
+    payload = raised.payload
+    assert payload["kind"] == "question"
+    assert payload["session_id"] == "s1"
+    assert payload["task_context"] == "APPROVED PROMPT"
+    assert payload["menu"] == COLOR_MENU
+    assert payload["first_question"] == "Pick a color"
+    assert payload["reason"] == "plan looks wrong"
+    # Wrap, never rewrite: the ask LLM's analysis travels verbatim.
+    assert payload["analysis"]["situation"] == "the plan contradicts the code"
+    assert payload["analysis"]["uncertainty"] == "whether the plan is stale"
+    # The turn is still in progress, blocked on the picker — not a decision.
+    assert harness.broker.state == "driving"
+    assert harness.master.of_type(T_ESCALATION) == []
     # A duplicate ask for the same tool_use_id gets the cached decision with
-    # zero extra LLM calls, and must not re-escalate.
+    # zero extra LLM calls, and must not raise a second escalation.
     calls_before = len(harness.llm.calls)
     dup = await client.request(
         harness.sock,
-        ask_question_env(PENDING_ASK_ID, COLOR_TOOL_INPUT),
+        ask_question_env("toolu_open", COLOR_TOOL_INPUT),
         timeout_s=5.0,
     )
-    assert dup.payload == resp.payload
+    assert dup.payload["decision"] == "escalated"
     assert len(harness.llm.calls) == calls_before
     await asyncio.sleep(0.1)
-    assert len(harness.master.of_type(T_ESCALATION)) == 1
-    # The transcript contains the paired answer -> next hook event retracts.
+    assert len(harness.master.of_type(T_PANE_ESCALATION)) == 1
+
+
+async def test_menu_answered_in_pane_retracts_and_resets_budget(
+    harness: Harness,
+) -> None:
+    await launch(harness)
+    harness.broker.budget_count = 3
+    raised = await open_escalated_menu(harness)
+    # A hook event before the answer lands leaves the escalation open.
     await client.notify(harness.sock, hook_env("PostToolUse", {}))
-    retract = await harness.master.wait_for(T_ESCALATION_RETRACT)
-    assert retract.payload["escalation_id"] == escalation.payload["escalation_id"]
-    assert retract.payload["reason"] == "resolved in pane"
-    await wait_state(harness.broker, "driving")
+    await asyncio.sleep(0.1)
+    assert harness.master.of_type(T_PANE_RETRACT) == []
+    append_menu(harness, "toolu_open", answers={"Pick a color": "Red"})
+    await client.notify(harness.sock, hook_env("PostToolUse", {}))
+    retract = await harness.master.wait_for(T_PANE_RETRACT)
+    assert retract.payload == {
+        "escalation_id": raised.payload["escalation_id"],
+        "reason": "answered in pane",
+    }
+    budget = await harness.master.wait_for(T_BUDGET_UPDATE)
+    assert budget.payload == {"count": 0}
+    assert harness.broker.budget_count == 0
+    assert harness.broker.state == "driving"
+
+
+async def test_rejected_menu_retracts(harness: Harness) -> None:
+    await launch(harness)
+    # The fixture transcript already records a REJECTED answer for this id.
+    raised = await open_escalated_menu(harness, PENDING_ASK_ID)
+    await client.notify(harness.sock, hook_env("UserPromptSubmit", {}))
+    retract = await harness.master.wait_for(T_PANE_RETRACT)
+    assert retract.payload["escalation_id"] == raised.payload["escalation_id"]
+    assert retract.payload["reason"] == "answered in pane"
 
 
 async def test_ask_question_answered_injects_and_updates_budget(
@@ -980,8 +1145,9 @@ async def test_ask_question_invalid_twice_escalates(harness: Harness) -> None:
         timeout_s=5.0,
     )
     assert resp.payload["decision"] == "escalated"
-    escalation = await harness.master.wait_for(T_ESCALATION)
-    assert "AnswerValidationError" in escalation.payload["uncertainty"]
+    escalation = await harness.master.wait_for(T_PANE_ESCALATION)
+    assert "AnswerValidationError" in escalation.payload["reason"]
+    assert escalation.payload["analysis"] is None
 
 
 async def test_ask_question_llm_failure_escalates(harness: Harness) -> None:
@@ -993,8 +1159,8 @@ async def test_ask_question_llm_failure_escalates(harness: Harness) -> None:
         timeout_s=5.0,
     )
     assert resp.payload["decision"] == "escalated"
-    escalation = await harness.master.wait_for(T_ESCALATION)
-    assert "LLMCallError" in escalation.payload["uncertainty"]
+    escalation = await harness.master.wait_for(T_PANE_ESCALATION)
+    assert "LLMCallError" in escalation.payload["reason"]
 
 
 async def test_ask_question_malformed_payload_escalates(
@@ -1008,8 +1174,10 @@ async def test_ask_question_malformed_payload_escalates(
         timeout_s=5.0,
     )
     assert resp.payload["decision"] == "escalated"
-    escalation = await harness.master.wait_for(T_ESCALATION)
-    assert "unusable question payload" in escalation.payload["uncertainty"]
+    escalation = await harness.master.wait_for(T_PANE_ESCALATION)
+    assert "unusable question payload" in escalation.payload["reason"]
+    assert escalation.payload["menu"] == ""
+    assert escalation.payload["first_question"] == ""
     assert len(harness.llm.calls) == calls_before  # no LLM call
 
 
@@ -1025,8 +1193,8 @@ async def test_ask_question_budget_exhausted_escalates_without_llm(
         timeout_s=5.0,
     )
     assert resp.payload["decision"] == "escalated"
-    escalation = await harness.master.wait_for(T_ESCALATION)
-    assert "budget exhausted" in escalation.payload["uncertainty"]
+    escalation = await harness.master.wait_for(T_PANE_ESCALATION)
+    assert "budget exhausted" in escalation.payload["reason"]
     assert len(harness.llm.calls) == calls_before  # no LLM call
 
 
@@ -1044,8 +1212,11 @@ async def test_ask_question_in_non_driving_state_skips_escalation(
     assert resp.payload["decision"] == "escalated"
     assert len(harness.llm.calls) == calls_before
     await asyncio.sleep(0.1)
-    assert harness.master.of_type(T_ESCALATION) == []  # no second raise
+    assert harness.master.of_type(T_PANE_ESCALATION) == []  # nothing raised
     assert "ask_skipped" in await decision_log_text(harness)
+    # The picker is still open in the pane, so nothing may be typed over it.
+    resp = await send_prompt(harness, "hello")
+    assert resp.ok is False
 
 
 async def test_ask_verified_on_matching_post_tool_use(harness: Harness) -> None:
@@ -1104,7 +1275,7 @@ async def test_ask_verify_mismatch_escalates_without_auto_retract(
         ),
     )
     escalation = await harness.master.wait_for(T_ESCALATION)
-    assert "different answers" in escalation.payload["situation"]
+    assert "different answers" in escalation.payload["disclosure"]["situation"]
     await wait_state(harness.broker, "escalated")
     # The answer already exists in the session; id-existence resolution would
     # self-retract this before the developer saw it. It must stay raised.
@@ -1117,7 +1288,7 @@ async def test_ask_verify_mismatch_escalates_without_auto_retract(
     assert harness.broker.state == "escalated"
 
 
-async def test_ask_verify_backstop_escalates_then_retracts_on_answer(
+async def test_late_injected_answer_retracts_without_budget_reset(
     harness: Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("broker.session.broker.ASK_VERIFY_TIMEOUT_S", 0.1)
@@ -1128,45 +1299,28 @@ async def test_ask_verify_backstop_escalates_then_retracts_on_answer(
         ask_question_env("toolu_backstop", COLOR_TOOL_INPUT),
         timeout_s=5.0,
     )
-    # No PostToolUse arrives and the transcript never records the answer.
-    escalation = await harness.master.wait_for(T_ESCALATION)
-    assert "no answer was recorded" in escalation.payload["situation"]
-    await wait_state(harness.broker, "escalated")
-    # The developer answers the still-open menu in the pane: the answer id
-    # appears in the transcript and the escalation auto-retracts.
-    question_record = {
-        "type": "assistant",
-        "message": {
-            "content": [
-                {
-                    "type": "tool_use",
-                    "name": "AskUserQuestion",
-                    "id": "toolu_backstop",
-                    "input": COLOR_TOOL_INPUT,
-                }
-            ]
-        },
-    }
-    answer_record = {
-        "type": "user",
-        "message": {
-            "role": "user",
-            "content": [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": "toolu_backstop",
-                    "content": "answered in the pane",
-                }
-            ],
-        },
-    }
-    with harness.transcript.open("a") as f:
-        f.write(json.dumps(question_record) + "\n")
-        f.write(json.dumps(answer_record) + "\n")
+    await harness.master.wait_for(T_BUDGET_UPDATE)
+    assert harness.broker.budget_count == 1
+    # No PostToolUse arrives and the transcript never records the answer: the
+    # menu may still be in the pane, so it is shown as a question escalation.
+    escalation = await harness.master.wait_for(T_PANE_ESCALATION)
+    assert "no answer was recorded" in escalation.payload["reason"]
+    assert escalation.payload["menu"] == COLOR_MENU
+    assert escalation.payload["analysis"] is None
+    assert harness.broker.state == "driving"
+    # The broker's own answer lands late: that is not developer contact.
+    append_menu(
+        harness, "toolu_backstop", answers={"Pick a color": "Blue (Recommended)"}
+    )
     await client.notify(harness.sock, hook_env("PostToolUse", {}))
-    retract = await harness.master.wait_for(T_ESCALATION_RETRACT)
-    assert retract.payload["escalation_id"] == escalation.payload["escalation_id"]
-    await wait_state(harness.broker, "driving")
+    retract = await harness.master.wait_for(T_PANE_RETRACT)
+    assert retract.payload == {
+        "escalation_id": escalation.payload["escalation_id"],
+        "reason": "the broker's answer was recorded late",
+    }
+    await asyncio.sleep(0.1)
+    assert len(harness.master.of_type(T_BUDGET_UPDATE)) == 1
+    assert harness.broker.budget_count == 1
 
 
 async def test_ask_verify_backstop_read_failure_escalates_without_auto_retract(
@@ -1184,7 +1338,9 @@ async def test_ask_verify_backstop_read_failure_escalates_without_auto_retract(
     # never vanish into the task.
     harness.transcript.unlink()
     escalation = await harness.master.wait_for(T_ESCALATION)
-    assert "verification itself failed" in escalation.payload["situation"]
+    assert (
+        "verification itself failed" in escalation.payload["disclosure"]["situation"]
+    )
     await wait_state(harness.broker, "escalated")
     # The broker is flying blind, so an answer id in the transcript must not
     # self-retract this before the developer saw it.
@@ -1242,31 +1398,44 @@ async def test_stop_that_resolves_an_escalation_still_triages_its_turn(
     # Stop carrying the question they left open. Retracting without triaging
     # it strands the pane: no further hook is coming to trigger one.
     await launch(harness)
-    await harness.llm.results.put(ESCALATE_RESULT)
-    resp = await client.request(
-        harness.sock,
-        ask_question_env(PENDING_ASK_ID, COLOR_TOOL_INPUT),
-        timeout_s=5.0,
-    )
-    assert resp.payload["decision"] == "escalated"
-    escalation = await harness.master.wait_for(T_ESCALATION)
-    await wait_state(harness.broker, "escalated")
+    escalation_id = await escalate_via_stop(harness)
     harness.run.calls.clear()
-
+    append_user_prompt(harness, "use oauth, obviously")
     await harness.llm.results.put(ANSWER_RESULT)
     await client.notify(
         harness.sock,
         hook_env("Stop", {"last_assistant_message": "Which auth provider?"}),
     )
     retract = await harness.master.wait_for(T_ESCALATION_RETRACT)
-    assert retract.payload["escalation_id"] == escalation.payload["escalation_id"]
-    await harness.master.wait_for(T_BUDGET_UPDATE)
+    assert retract.payload["escalation_id"] == escalation_id
+    await harness.master.wait_for(T_BUDGET_UPDATE, count=2)
     assert harness.run.drive_calls() == [
         ["herdr", "agent", "prompt", "s1", "use oauth"],
     ]
     triage_call = harness.llm.calls[-1]
     content = cast(list[dict[str, Any]], triage_call["messages"][0]["content"])
     assert "Which auth provider?" in content[-1]["text"]
+
+
+async def test_stop_releases_an_answered_menu_before_triaging(
+    harness: Harness,
+) -> None:
+    await launch(harness)
+    await open_escalated_menu(harness, PENDING_ASK_ID)  # answered in the fixture
+    harness.run.calls.clear()
+    await harness.llm.results.put(ANSWER_RESULT)
+    await client.notify(
+        harness.sock,
+        hook_env("Stop", {"last_assistant_message": "Which auth provider?"}),
+    )
+    await harness.master.wait_for(T_PANE_RETRACT)
+    async with asyncio.timeout(5.0):
+        while not harness.run.drive_calls():
+            await asyncio.sleep(0.01)
+    assert harness.run.drive_calls() == [
+        ["herdr", "agent", "prompt", "s1", "use oauth"],
+    ]
+    assert harness.master.of_type(T_FATAL_ERROR) == []
 
 
 async def test_dispatch_decision_submits_and_resets_budget(
@@ -1372,33 +1541,24 @@ async def test_clarify_escalation_not_escalated_refused(harness: Harness) -> Non
 
 async def test_clarify_escalation_cancelled_by_retract(harness: Harness) -> None:
     await launch(harness)
-    await harness.llm.results.put(ESCALATE_RESULT)
-    resp = await client.request(
-        harness.sock,
-        ask_question_env(PENDING_ASK_ID, COLOR_TOOL_INPUT),
-        timeout_s=5.0,
-    )
-    assert resp.payload["decision"] == "escalated"
-    escalation = await harness.master.wait_for(T_ESCALATION)
-    await wait_state(harness.broker, "escalated")
+    escalation_id = await escalate_via_stop(harness)
     calls_before = len(harness.llm.calls)
     harness.llm.never_resolve = True
     asking = asyncio.create_task(
         client.request(
             harness.sock,
-            clarify_escalation_env(
-                escalation.payload["escalation_id"], "what did it try?"
-            ),
+            clarify_escalation_env(escalation_id, "what did it try?"),
             timeout_s=5.0,
         )
     )
     async with asyncio.timeout(5.0):
         while len(harness.llm.calls) == calls_before:
             await asyncio.sleep(0.01)
-    # The transcript already holds the paired answer: this hook retracts.
-    await client.notify(harness.sock, hook_env("PostToolUse", {}))
+    # The developer answers in the pane: this hook retracts.
+    append_user_prompt(harness, "try B")
+    await client.notify(harness.sock, hook_env("UserPromptSubmit", {}))
     retract = await harness.master.wait_for(T_ESCALATION_RETRACT)
-    assert retract.payload["escalation_id"] == escalation.payload["escalation_id"]
+    assert retract.payload["escalation_id"] == escalation_id
     answer = await asking
     assert answer.ok is False
     assert answer.payload["error"] == "escalation resolved in the pane"
@@ -1502,9 +1662,10 @@ async def test_budget_exhaustion_converts_answer_to_escalation(
     )
     await harness.llm.results.put(ANSWER_RESULT)
     escalation = await harness.master.wait_for(T_ESCALATION)
-    assert "budget exhausted" in escalation.payload["situation"].lower()
+    disclosure = escalation.payload["disclosure"]
+    assert "budget exhausted" in disclosure["situation"].lower()
     # The prepared answer becomes the recommendation, verbatim (handover).
-    assert escalation.payload["recommendation"] == "use oauth"
+    assert disclosure["recommendation"] == "use oauth"
     assert harness.run.drive_calls() == []  # the answer was NOT submitted
     await wait_state(harness.broker, "escalated")
     log = await decision_log_text(harness)
@@ -1794,3 +1955,196 @@ async def test_shutdown_cancels_the_status_sender_cleanly(
     # a sender parked in its wait() would hang this forever.
     async with asyncio.timeout(5.0):
         await h.run_task
+
+
+async def test_send_prompt_refused_while_a_native_prompt_is_open(
+    harness: Harness,
+) -> None:
+    await launch(harness)
+    await open_escalated_menu(harness)
+    harness.run.calls.clear()
+    resp = await send_prompt(harness, "hello")
+    assert resp.ok is False
+    assert resp.payload["reason_code"] == NACK_WRONG_STATE
+    assert "an AskUserQuestion menu" in resp.payload["error"]
+    assert "w3:p2" in resp.payload["error"]
+    append_menu(harness, "toolu_open", answers={"Pick a color": "Red"})
+    await client.notify(harness.sock, hook_env("PostToolUse", {}))
+    await harness.master.wait_for(T_PANE_RETRACT)
+    await client.notify(
+        harness.sock,
+        hook_env("Notification", {"notification_type": "permission_prompt"}),
+    )
+    await wait_live(harness.master, lambda p: p["permission_prompt"] is True)
+    resp = await send_prompt(harness, "hello")
+    assert resp.ok is False
+    assert "a permission prompt" in resp.payload["error"]
+    await asyncio.sleep(0.1)
+    assert harness.run.drive_calls() == []
+
+
+async def test_menu_opening_after_accept_leaves_the_prompt_undelivered(
+    harness: Harness,
+) -> None:
+    await launch(harness)
+    gate = asyncio.Event()
+
+    async def held() -> None:
+        await gate.wait()
+
+    harness.broker.queue.put_nowait(held)
+    harness.run.calls.clear()
+    assert (await send_prompt(harness, "hello")).ok is True
+    # A menu opens while the accepted prompt waits its turn on the queue.
+    resp = await client.request(
+        harness.sock,
+        ask_question_env("toolu_late", {"questions": []}),
+        timeout_s=5.0,
+    )
+    assert resp.payload["decision"] == "escalated"
+    gate.set()
+    undelivered = await harness.master.wait_for(T_PROMPT_UNDELIVERED)
+    assert "an AskUserQuestion menu" in undelivered.payload["detail"]
+    await harness.master.wait_for(T_PANE_ESCALATION)
+    assert harness.run.drive_calls() == []
+    assert harness.master.of_type(T_FATAL_ERROR) == []
+    assert harness.broker.state == "driving"
+
+
+async def test_send_prompt_supersedes_a_decision_escalation(
+    harness: Harness,
+) -> None:
+    await launch(harness)
+    escalation_id = await escalate_via_stop(harness)
+    harness.run.calls.clear()
+    assert (await send_prompt(harness, "do it my way")).ok is True
+    # The master would otherwise keep the stale head blocking the queue and
+    # refuse this session's next escalation as a protocol violation.
+    retract = await harness.master.wait_for(T_ESCALATION_RETRACT)
+    assert retract.payload == {
+        "escalation_id": escalation_id,
+        "reason": "superseded by a developer prompt",
+    }
+    budget = await harness.master.wait_for(T_BUDGET_UPDATE)
+    assert budget.payload == {"count": 0}
+    assert harness.run.drive_calls() == [
+        ["herdr", "agent", "prompt", "s1", "do it my way"],
+    ]
+    await wait_state(harness.broker, "driving")
+
+
+async def test_out_of_band_resolution_resets_the_budget(harness: Harness) -> None:
+    await launch(harness)
+    harness.broker.budget_count = 4
+    escalation_id = await escalate_via_stop(harness)
+    append_user_prompt(harness, "go with a")
+    await client.notify(harness.sock, hook_env("UserPromptSubmit", {}))
+    retract = await harness.master.wait_for(T_ESCALATION_RETRACT)
+    assert retract.payload["escalation_id"] == escalation_id
+    budget = await harness.master.wait_for(T_BUDGET_UPDATE)
+    assert budget.payload == {"count": 0}
+    assert harness.broker.budget_count == 0
+    await wait_state(harness.broker, "driving")
+
+
+async def test_refused_decision_escalation_is_fatal(harness: Harness) -> None:
+    await launch(harness)
+    harness.master.nack_types.add(T_ESCALATION)
+    await client.notify(
+        harness.sock, hook_env("Stop", {"last_assistant_message": "proceed how?"})
+    )
+    await harness.llm.results.put(ESCALATE_RESULT)
+    fatal = await harness.master.wait_for(T_FATAL_ERROR)
+    # Quiescent behind an escalation nobody was shown is the silent failure.
+    assert fatal.payload["error_class"] == "MasterRefusedError"
+    assert "scripted refusal" in fatal.payload["detail"]
+    await wait_state(harness.broker, "error")
+
+
+async def test_refused_question_escalation_keeps_the_picker_claimed(
+    harness: Harness,
+) -> None:
+    await launch(harness)
+    harness.master.nack_types.add(T_PANE_ESCALATION)
+    await open_escalated_menu(harness)
+    async with asyncio.timeout(5.0):
+        while "question escalation refused" not in await decision_log_text(harness):
+            await asyncio.sleep(0.01)
+    assert harness.broker.state == "driving"
+    assert harness.master.of_type(T_FATAL_ERROR) == []
+    # The menu is still in the pane: nothing may be typed over it.
+    assert (await send_prompt(harness, "hello")).ok is False
+    append_menu(harness, "toolu_open", answers={"Pick a color": "Red"})
+    await client.notify(harness.sock, hook_env("PostToolUse", {}))
+    async with asyncio.timeout(5.0):
+        while not (await send_prompt(harness, "hello")).ok:
+            await asyncio.sleep(0.01)
+    # The master never held it, so there is nothing to retract.
+    assert harness.master.of_type(T_PANE_RETRACT) == []
+
+
+async def test_reconcile_never_classifies_while_a_native_prompt_is_open(
+    harness: Harness,
+) -> None:
+    await launch(harness)
+    await open_escalated_menu(harness)
+    harness.run.calls.clear()
+    calls_before = len(harness.llm.calls)
+    harness.broker.queue.put_nowait(
+        harness.broker._reconcile_job  # pyright: ignore[reportPrivateUsage]
+    )
+    await asyncio.sleep(0.2)
+    assert len(harness.llm.calls) == calls_before
+    assert harness.run.drive_calls() == []
+    # Once the menu is answered, the same reconcile does classify.
+    append_menu(harness, "toolu_open", answers={"Pick a color": "Red"})
+    await harness.llm.results.put(ANSWER_RESULT)
+    harness.broker.queue.put_nowait(
+        harness.broker._reconcile_job  # pyright: ignore[reportPrivateUsage]
+    )
+    await harness.master.wait_for(T_PANE_RETRACT)
+    async with asyncio.timeout(5.0):
+        while len(harness.llm.calls) == calls_before:
+            await asyncio.sleep(0.01)
+
+
+async def test_permission_prompt_not_reported_while_a_menu_is_open(
+    harness: Harness,
+) -> None:
+    await launch(harness)
+    await open_escalated_menu(harness)
+    # The picker's own permission check can raise this notification.
+    await client.notify(
+        harness.sock,
+        hook_env("Notification", {"notification_type": "permission_prompt"}),
+    )
+    await asyncio.sleep(0.1)
+    resp = await client.request(
+        harness.sock,
+        Envelope(id=uuid.uuid4().hex, type=T_STATUS, session_id="s1"),
+        timeout_s=5.0,
+    )
+    assert resp.payload["permission_prompt"] is False
+    assert all(
+        e.payload["permission_prompt"] is False
+        for e in harness.master.of_type(T_LIVE_STATUS)
+    )
+
+
+async def test_a_newer_menu_retracts_the_one_it_replaced_first(
+    harness: Harness,
+) -> None:
+    await launch(harness)
+    first = await open_escalated_menu(harness, "toolu_first")
+    await harness.llm.results.put(ESCALATE_RESULT)
+    await client.request(
+        harness.sock, ask_question_env("toolu_second", COLOR_TOOL_INPUT), timeout_s=5.0
+    )
+    second = await harness.master.wait_for(T_PANE_ESCALATION, count=2)
+    retract = harness.master.of_type(T_PANE_RETRACT)
+    assert [r.payload["escalation_id"] for r in retract] == [
+        first.payload["escalation_id"]
+    ]
+    # Retract before raise: the master holds one question per session.
+    order = [e.id for e in harness.master.received]
+    assert order.index(retract[0].id) < order.index(second.id)

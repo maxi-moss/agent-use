@@ -2,8 +2,8 @@
 
 Pydantic models are the single source of truth for tool inputs; JSON schemas
 are DERIVED (model_json_schema) then strictified. The escalate tool's field
-set is pinned against EscalationPayload by a unit test so the wire schema and
-the tool schema cannot drift apart.
+set is pinned against EscalationDisclosure by a unit test so the wire schema
+and the tool schema cannot drift apart.
 """
 
 import logging
@@ -25,7 +25,7 @@ from broker.config import BrokerConfig
 from broker.index.render import fit_to_budget, render_relevant_code
 from broker.index.schemas import GroundingContext
 from broker.llm import LLMCaller, LLMCallError, ToolCall, strict_tool
-from broker.protocol.schemas import Alternative
+from broker.protocol.schemas import Alternative, EscalationDisclosure
 from broker.transcript.adapter import render
 from broker.transcript.schemas import TranscriptEvent
 
@@ -95,6 +95,20 @@ class EscalateCall(_HasTaskSummary):
         description=(
             "What fact or evidence would make you recommend a different option."
         )
+    )
+
+
+def disclosure_of(call: EscalateCall) -> EscalationDisclosure:
+    """Return the developer-facing disclosure an escalate call carries."""
+    return EscalationDisclosure(
+        escalation_title=call.escalation_title,
+        situation=call.situation,
+        what_was_asked=call.what_was_asked,
+        what_is_at_stake=call.what_is_at_stake,
+        alternatives=call.alternatives,
+        recommendation=call.recommendation,
+        uncertainty=call.uncertainty,
+        what_would_change_my_mind=call.what_would_change_my_mind,
     )
 
 

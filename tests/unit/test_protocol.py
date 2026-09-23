@@ -66,7 +66,7 @@ def test_status_payload_extension_is_additive() -> None:
     assert StatusPayload.model_validate_json(new.model_dump_json()) == new
 
 
-def test_permission_escalation_rejects_every_missing_field() -> None:
+def test_permission_pane_rejects_every_missing_field() -> None:
     """Dropping any field must fail: a partial one cannot be acted on."""
     assert PermissionEscalationPayload.model_validate(
         COMPLETE_PERMISSION_ESCALATION

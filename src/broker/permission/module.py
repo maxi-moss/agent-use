@@ -29,13 +29,13 @@ from broker.protocol.constants import (
     DECISION_ALLOW,
     DECISION_ESCALATED,
     NACK_SLOT_OCCUPIED,
-    T_PERMISSION_ESCALATION,
-    T_PERMISSION_RETRACT,
+    T_PANE_ESCALATION,
+    T_PANE_RETRACT,
 )
 from broker.protocol.schemas import (
     Envelope,
+    PaneRetractPayload,
     PermissionEscalationPayload,
-    PermissionRetractPayload,
     PermissionSuggestion,
     Response,
 )
@@ -286,7 +286,7 @@ class PermissionModule:
         """
         if superseded is not None:
             await self._send_retract(
-                PermissionRetractPayload(
+                PaneRetractPayload(
                     escalation_id=superseded.escalation_id,
                     reason=_RETRACT_SUPERSEDED,
                 )
@@ -301,7 +301,7 @@ class PermissionModule:
             reason: Why it no longer needs the developer.
         """
         self._live = None
-        payload = PermissionRetractPayload(
+        payload = PaneRetractPayload(
             escalation_id=live.escalation_id, reason=reason
         )
         self._spawn(self._send_retract(payload))
@@ -325,7 +325,7 @@ class PermissionModule:
             payload: The escalation to raise.
         """
         response = await self._send(
-            T_PERMISSION_ESCALATION, payload.model_dump(), payload.escalation_id
+            T_PANE_ESCALATION, payload.model_dump(), payload.escalation_id
         )
         if response is not None and response.ok:
             return
@@ -347,14 +347,14 @@ class PermissionModule:
         # claimed — a later call has to be free to raise.
         self._release(payload.escalation_id)
 
-    async def _send_retract(self, payload: PermissionRetractPayload) -> None:
+    async def _send_retract(self, payload: PaneRetractPayload) -> None:
         """Send one retraction; a failed send leaves nothing to undo.
 
         Args:
             payload: The retraction to send.
         """
         await self._send(
-            T_PERMISSION_RETRACT, payload.model_dump(), payload.escalation_id
+            T_PANE_RETRACT, payload.model_dump(), payload.escalation_id
         )
 
     async def _send(

@@ -4,11 +4,11 @@ Every model here is extra="ignore", never extra="forbid": an unknown wire field
 means a newer peer, not a typo. Config models are the strict half of that pair.
 """
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
-from broker.protocol.constants import PROTOCOL_VERSION, SessionState
+from broker.protocol.constants import PROTOCOL_VERSION, PaneKind, SessionState
 
 
 class Envelope(BaseModel):
@@ -220,14 +220,11 @@ class Alternative(BaseModel):
     cons: str
 
 
-class EscalationPayload(BaseModel):
-    """broker -> master structured escalation object."""
+class EscalationDisclosure(BaseModel):
+    """The broker's analysis of a decision, as the developer reads it."""
 
     model_config = ConfigDict(extra="ignore")
 
-    escalation_id: str
-    session_id: str
-    task_context: str
     escalation_title: str
     situation: str
     what_was_asked: str
@@ -236,6 +233,17 @@ class EscalationPayload(BaseModel):
     recommendation: str
     uncertainty: str
     what_would_change_my_mind: str
+
+
+class EscalationPayload(BaseModel):
+    """broker -> master: a decision the developer answers in the master chat."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    escalation_id: str
+    session_id: str
+    task_context: str
+    disclosure: EscalationDisclosure
 
 
 class PermissionEscalationPayload(BaseModel):
@@ -247,6 +255,7 @@ class PermissionEscalationPayload(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
+    kind: Literal[PaneKind.PERMISSION] = PaneKind.PERMISSION
     escalation_id: str
     session_id: str
     tool_name: str
@@ -257,6 +266,32 @@ class PermissionEscalationPayload(BaseModel):
     permission_suggestions: list[PermissionSuggestion] = Field(
         default_factory=list[PermissionSuggestion]
     )
+
+
+class QuestionEscalationPayload(BaseModel):
+    """broker -> master: an AskUserQuestion menu the developer answers in the pane."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    kind: Literal[PaneKind.QUESTION] = PaneKind.QUESTION
+    escalation_id: str
+    session_id: str
+    task_context: str
+    # Both empty when the tool input was unusable.
+    menu: str  # rendered by the broker, shown verbatim
+    first_question: str
+    reason: str  # why the broker did not answer the menu itself
+    analysis: EscalationDisclosure | None = None
+
+
+PaneEscalationPayload = Annotated[
+    PermissionEscalationPayload | QuestionEscalationPayload,
+    Field(discriminator="kind"),
+]
+
+PANE_ESCALATION_ADAPTER: TypeAdapter[PaneEscalationPayload] = TypeAdapter(
+    PaneEscalationPayload
+)
 
 
 class PermissionLogPayload(BaseModel):
@@ -294,13 +329,21 @@ class EscalationRetractPayload(BaseModel):
     reason: str
 
 
-class PermissionRetractPayload(BaseModel):
-    """permission module -> master: a permission prompt that is no longer open."""
+class PaneRetractPayload(BaseModel):
+    """raiser -> master: a pane escalation whose native prompt is no longer open."""
 
     model_config = ConfigDict(extra="ignore")
 
     escalation_id: str
     reason: str
+
+
+class PromptUndeliveredPayload(BaseModel):
+    """broker -> master: an accepted developer prompt that never reached the pane."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    detail: str
 
 
 class ApprovePromptPayload(BaseModel):
