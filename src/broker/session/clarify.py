@@ -13,7 +13,7 @@ from broker import llm_timing
 from broker import prompts
 from broker.config import BrokerConfig
 from broker.llm import LLMCaller, LLMCallError, ToolCall, strict_tool
-from broker.protocol.schemas import EscalationPayload
+from broker.protocol.schemas import EscalationDisclosure, EscalationPayload
 from broker.session.triage import FORCED_ONE, assemble_context
 from broker.transcript.schemas import TranscriptEvent
 
@@ -40,16 +40,14 @@ CLARIFY_TOOLS = [
 _CLARIFY_PROMPT = prompts.load("clarify")
 
 
-def render_disclosure(p: EscalationPayload) -> str:
-    """Render a raised escalation as prompt text for the clarify call.
+def render_disclosure(p: EscalationDisclosure) -> str:
+    """Render a raised escalation's disclosure as prompt text for the clarify call.
 
     Args:
-        p: The escalation the broker raised and still holds.
+        p: The disclosure of the escalation the broker raised and still holds.
 
     Returns:
-        The escalation's analysis as a plain block. Omits the id/session
-        header (the broker knows both), task_context (carried as intent) and
-        the title.
+        The analysis as a plain block. Omits the title.
     """
     lines = [
         "## Situation",
@@ -108,7 +106,7 @@ async def clarify(
     """
     working = (
         "# The escalation the developer is asking about\n"
-        + render_disclosure(escalation)
+        + render_disclosure(escalation.disclosure)
         + "\n\n# The developer's question (answer THIS)\n"
         + question
     )
