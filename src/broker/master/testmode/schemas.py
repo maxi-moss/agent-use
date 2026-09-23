@@ -8,7 +8,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from broker.protocol.constants import SessionState
+from broker.protocol.constants import PaneKind, SessionState
 
 
 class ScenarioError(Exception):
@@ -62,6 +62,16 @@ class PermissionEscalate(BaseModel):
     expect: str = "ack"
 
 
+class QuestionEscalate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal["question_escalate"]
+    session: str
+    escalation_id: str
+    question: str
+    expect: str = "ack"
+
+
 class EscalationRetract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -71,10 +81,10 @@ class EscalationRetract(BaseModel):
     reason: str
 
 
-class PermissionRetract(BaseModel):
+class PaneRetract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    op: Literal["permission_retract"]
+    op: Literal["pane_retract"]
     session: str
     escalation_id: str
     reason: str
@@ -129,11 +139,12 @@ class AssertDepth(BaseModel):
     waiting: list[str] = Field(default_factory=list[str])
 
 
-class AssertOpenPermissions(BaseModel):
+class AssertOpenPanes(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    op: Literal["assert_open_permissions"]
-    escalation_ids: list[str] = Field(default_factory=list[str])
+    op: Literal["assert_open_panes"]
+    kind: PaneKind
+    session_ids: list[str] = Field(default_factory=list[str])
 
 
 class AssertIsolated(BaseModel):
@@ -162,15 +173,16 @@ Step = Annotated[
     | StopFakeSocket
     | Escalate
     | PermissionEscalate
+    | QuestionEscalate
     | EscalationRetract
-    | PermissionRetract
+    | PaneRetract
     | Dispatch
     | Deliver
     | Attach
     | AssertSurfaced
     | AssertNeverSurfaced
     | AssertDepth
-    | AssertOpenPermissions
+    | AssertOpenPanes
     | AssertIsolated
     | AssertNoDispatchWrite
     | AssertUnreachable,

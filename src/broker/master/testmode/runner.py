@@ -18,7 +18,8 @@ from pydantic import ValidationError
 from broker.master.viewmodel import (
     EscalationArrived,
     FleetUpdated,
-    PermissionEscalationArrived,
+    FleetView,
+    PaneEscalationArrived,
 )
 from broker.master.registry import SessionRecord
 from broker.master.runtime import MasterRuntime
@@ -28,7 +29,7 @@ from broker.master.testmode.schemas import (
     AssertIsolated,
     AssertNeverSurfaced,
     AssertNoDispatchWrite,
-    AssertOpenPermissions,
+    AssertOpenPanes,
     AssertSurfaced,
     AssertUnreachable,
     Attach,
@@ -36,8 +37,9 @@ from broker.master.testmode.schemas import (
     Dispatch,
     Escalate,
     EscalationRetract,
+    PaneRetract,
     PermissionEscalate,
-    PermissionRetract,
+    QuestionEscalate,
     Scenario,
     ScenarioError,
     ScenarioReport,
@@ -50,8 +52,10 @@ from broker.paths import BrokerPaths
 from broker.protocol.constants import T_DISPATCH_DECISION
 from broker.protocol.schemas import (
     Alternative,
+    EscalationDisclosure,
     EscalationPayload,
     PermissionEscalationPayload,
+    QuestionEscalationPayload,
     Response,
 )
 
@@ -90,20 +94,22 @@ def _escalation_payload(step: Escalate) -> EscalationPayload:
         escalation_id=eid,
         session_id=step.session,
         task_context=f"task context for {eid}",
-        escalation_title=f"title for {eid}",
-        situation=f"situation for {eid}",
-        what_was_asked=f"what was asked in {eid}",
-        what_is_at_stake=f"what is at stake in {eid}",
-        alternatives=[
-            Alternative(
-                option=f"option a for {eid}",
-                pros=f"pros for {eid}",
-                cons=f"cons for {eid}",
-            )
-        ],
-        recommendation=f"recommendation for {eid}",
-        uncertainty=f"uncertainty for {eid}",
-        what_would_change_my_mind=f"what would change my mind for {eid}",
+        disclosure=EscalationDisclosure(
+            escalation_title=f"title for {eid}",
+            situation=f"situation for {eid}",
+            what_was_asked=f"what was asked in {eid}",
+            what_is_at_stake=f"what is at stake in {eid}",
+            alternatives=[
+                Alternative(
+                    option=f"option a for {eid}",
+                    pros=f"pros for {eid}",
+                    cons=f"cons for {eid}",
+                )
+            ],
+            recommendation=f"recommendation for {eid}",
+            uncertainty=f"uncertainty for {eid}",
+            what_would_change_my_mind=f"what would change my mind for {eid}",
+        ),
     )
 
 
@@ -121,12 +127,28 @@ def _permission_payload(step: PermissionEscalate) -> PermissionEscalationPayload
     )
 
 
+def _question_payload(step: QuestionEscalate) -> QuestionEscalationPayload:
+    """Build a fully-populated question escalation from a step."""
+    eid = step.escalation_id
+    return QuestionEscalationPayload(
+        escalation_id=eid,
+        session_id=step.session,
+        task_context=f"task context for {eid}",
+        menu=(
+            f"## Question 1 (single-select): {step.question} [header for {eid}]\n"
+            f"- option a for {eid}: "
+        ),
+        first_question=step.question,
+        reason=f"reason for {eid}",
+    )
+
+
 def _surfaced_ids(posts: list[Any]) -> set[str]:
     """Return the ids of every escalation surfaced so far."""
     return {
         m.escalation_id
         for m in posts
-        if isinstance(m, (EscalationArrived, PermissionEscalationArrived))
+        if isinstance(m, (EscalationArrived, PaneEscalationArrived))
     }
 
 
@@ -303,7 +325,15 @@ async def _run_step(
         broker = FakeBrokerClient(
             runtime.master_socket_path, step.session, timeout_s=timeout_s
         )
-        resp = await broker.permission_escalate(_permission_payload(step))
+        resp = await broker.pane_escalate(_permission_payload(step))
+        return _check_expect(index, op, step.expect, resp)
+
+    if isinstance(step, QuestionEscalate):
+        ctx.require_seeded(index, step.session)
+        broker = FakeBrokerClient(
+            runtime.master_socket_path, step.session, timeout_s=timeout_s
+        )
+        resp = await broker.pane_escalate(_question_payload(step))
         return _check_expect(index, op, step.expect, resp)
 
     if isinstance(step, EscalationRetract):
@@ -316,12 +346,12 @@ async def _run_step(
         detail = "retracted" if passed else f"retract NACKed: {resp.payload}"
         return StepResult(index=index, op=op, passed=passed, detail=detail)
 
-    if isinstance(step, PermissionRetract):
+    if isinstance(step, PaneRetract):
         ctx.require_seeded(index, step.session)
         broker = FakeBrokerClient(
             runtime.master_socket_path, step.session, timeout_s=timeout_s
         )
-        resp = await broker.permission_retract(step.escalation_id, step.reason)
+        resp = await broker.pane_retract(step.escalation_id, step.reason)
         passed = resp.ok
         detail = "retracted" if passed else f"retract NACKed: {resp.payload}"
         return StepResult(index=index, op=op, passed=passed, detail=detail)
@@ -403,31 +433,34 @@ async def _run_step(
         )
         return StepResult(index=index, op=op, passed=passed, detail=detail)
 
-    if isinstance(step, AssertOpenPermissions):
-        want_ids = step.escalation_ids
+    if isinstance(step, AssertOpenPanes):
+        want_sessions = step.session_ids
 
-        def permissions_match() -> bool:
+        def open_sessions(view: FleetView) -> list[str]:
+            return [p.session_id for p in view.panes if p.kind == step.kind]
+
+        def panes_match() -> bool:
             latest = _latest(posts, FleetUpdated)
-            return latest is not None and [
-                p.escalation_id for p in latest.view.permissions
-            ] == want_ids
+            return latest is not None and open_sessions(latest.view) == want_sessions
 
-        passed = await _poll_until(permissions_match, timeout_s)
+        passed = await _poll_until(panes_match, timeout_s)
         latest = _latest(posts, FleetUpdated)
         seen = (
-            f"open={[p.escalation_id for p in latest.view.permissions]}"
+            f"open {step.kind}={open_sessions(latest.view)}"
             if latest is not None
             else "no fleet view posted"
         )
-        detail = seen if passed else f"expected open={want_ids}, saw {seen}"
+        detail = (
+            seen
+            if passed
+            else f"expected open {step.kind}={want_sessions}, saw {seen}"
+        )
         return StepResult(index=index, op=op, passed=passed, detail=detail)
 
     if isinstance(step, AssertIsolated):
         violations: list[str] = []
         for m in posts:
-            if not isinstance(
-                m, (EscalationArrived, PermissionEscalationArrived)
-            ):
+            if not isinstance(m, (EscalationArrived, PaneEscalationArrived)):
                 continue
             if m.session_id not in m.rendered:
                 violations.append(

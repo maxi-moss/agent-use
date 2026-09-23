@@ -1,8 +1,8 @@
 """Synthetic peers that speak the real NDJSON protocol.
 
-``FakeBrokerClient`` raises and retracts escalations and permission
-escalations over the master socket through the same
-``protocol.client.request`` a session broker and its permission module use.
+``FakeBrokerClient`` raises and retracts decision and pane escalations over
+the master socket through the same ``protocol.client.request`` a session
+broker and its permission module use.
 ``FakeSessionSocket`` binds a session socket that records every envelope it
 receives and ACKs it, standing in for a broker's listening end.
 """
@@ -18,8 +18,8 @@ from broker.protocol.constants import (
     T_DECISION_DELIVERED,
     T_ESCALATION,
     T_ESCALATION_RETRACT,
-    T_PERMISSION_ESCALATION,
-    T_PERMISSION_RETRACT,
+    T_PANE_ESCALATION,
+    T_PANE_RETRACT,
     T_STATUS,
 )
 from broker.protocol.schemas import (
@@ -27,8 +27,8 @@ from broker.protocol.schemas import (
     Envelope,
     EscalationPayload,
     EscalationRetractPayload,
-    PermissionEscalationPayload,
-    PermissionRetractPayload,
+    PaneEscalationPayload,
+    PaneRetractPayload,
     Response,
     StatusPayload,
 )
@@ -50,11 +50,9 @@ class FakeBrokerClient:
         """Raise a broker escalation and return the master's reply."""
         return await self._send(T_ESCALATION, payload)
 
-    async def permission_escalate(
-        self, payload: PermissionEscalationPayload
-    ) -> Response:
-        """Raise a permission escalation and return the master's reply."""
-        return await self._send(T_PERMISSION_ESCALATION, payload)
+    async def pane_escalate(self, payload: PaneEscalationPayload) -> Response:
+        """Raise a pane escalation and return the master's reply."""
+        return await self._send(T_PANE_ESCALATION, payload)
 
     async def escalation_retract(self, escalation_id: str, reason: str) -> Response:
         """Withdraw a broker escalation and return the master's reply."""
@@ -63,11 +61,11 @@ class FakeBrokerClient:
             EscalationRetractPayload(escalation_id=escalation_id, reason=reason),
         )
 
-    async def permission_retract(self, escalation_id: str, reason: str) -> Response:
-        """Withdraw a permission escalation and return the master's reply."""
+    async def pane_retract(self, escalation_id: str, reason: str) -> Response:
+        """Withdraw a pane escalation and return the master's reply."""
         return await self._send(
-            T_PERMISSION_RETRACT,
-            PermissionRetractPayload(escalation_id=escalation_id, reason=reason),
+            T_PANE_RETRACT,
+            PaneRetractPayload(escalation_id=escalation_id, reason=reason),
         )
 
     async def deliver(self, escalation_id: str) -> Response:
@@ -82,9 +80,9 @@ class FakeBrokerClient:
         msg_type: str,
         payload: (
             EscalationPayload
-            | PermissionEscalationPayload
+            | PaneEscalationPayload
             | EscalationRetractPayload
-            | PermissionRetractPayload
+            | PaneRetractPayload
             | DecisionDeliveredPayload
         ),
     ) -> Response:
