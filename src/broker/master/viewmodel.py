@@ -9,7 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
-from broker.protocol.constants import SessionState
+from broker.protocol.constants import PaneKind, SessionState
 
 # Lifecycle states a session has settled into: the ones with an outcome to view.
 _SETTLED_STATES = frozenset(
@@ -24,6 +24,7 @@ class Attention(StrEnum):
     ESCALATION = "escalation"
     PROPOSAL = "proposal"
     PERMISSION = "permission"
+    QUESTION = "question"
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,26 +59,28 @@ class HeadRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class PermissionRequest:
-    """One open native permission prompt, answered in its session's pane."""
+class PaneRequest:
+    """One open native prompt, answered in its session's pane. ``label`` is the
+    tool name of a permission prompt, or the first question of a menu."""
 
+    kind: PaneKind
     session_id: str
     escalation_id: str
-    tool_name: str
+    label: str
 
 
 @dataclass(frozen=True, slots=True)
 class FleetView:
     """The whole sidebar in one value: master activity, one row per session
     (numeric id order), the decision-escalation queue summary, and every open
-    permission prompt (numeric session order)."""
+    pane escalation (numeric session order, then kind)."""
 
     master_activity: str | None
     rows: tuple[SessionRow, ...]
     queue_depth: int
     waiting: tuple[str, ...]
     head: HeadRequest | None
-    permissions: tuple[PermissionRequest, ...]
+    panes: tuple[PaneRequest, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +97,8 @@ class EscalationArrived:
 
 
 @dataclass(frozen=True, slots=True)
-class PermissionEscalationArrived:
+class PaneEscalationArrived:
+    kind: PaneKind
     session_id: str
     escalation_id: str
     rendered: str
@@ -128,7 +132,7 @@ class SessionStatusChanged:
 ViewEvent = (
     FleetUpdated
     | EscalationArrived
-    | PermissionEscalationArrived
+    | PaneEscalationArrived
     | ProposalArrived
     | CompletionArrived
     | Notice
