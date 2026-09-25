@@ -43,7 +43,7 @@ Every session is an interactive Claude Code process in its own terminal pane, wi
 - Comments should be used conservatively and only when absolutely necessary. Never comment on a previous state of the code or the change that produced it — a comment that only makes sense to someone who saw the diff is noise.
 - Do not design code for backwards compatibility. When a change replaces how something works, migrate every call site and delete the old path in the same change — don't leave both live. Only keep the old path when the developer asks for it by name.
 - Never import inside functions. Import at module top level.
-- The session, permission, master, and index-embedding stacks are duplicated on purpose — tool schemas, clients, timeouts. Never factor them together, not even across providers; a shared helper is how one surface's model gets silently re-pinned to another's.
+- There are three inference stacks, duplicated on purpose — tool schemas, clients, timeouts: session and master (sharing `broker/llm.py`), permission, and index-embedding. Never factor them together, not even across providers; a shared helper is how one surface's model gets silently re-pinned to another's. Session and master share stack by design; nothing else joins it.
 
 ## When writing docs
 
