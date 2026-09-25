@@ -620,7 +620,7 @@ async def test_fleet_panel_updates_and_worker_clears_master_activity(
     llm = GatedLLM(reply="ok", gated=True)
     app = make_app(home, llm)
     async with app.run_test() as pilot:
-        # serve() publishes the initial snapshot once the socket is up.
+        # start() publishes the initial snapshot once the socket is up.
         for _ in range(100):
             await pilot.pause(0.05)
             if "Master — idle" in _fleet_text(app):

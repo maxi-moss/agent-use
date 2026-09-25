@@ -127,7 +127,7 @@ def main() -> None:
 
         llm_call = bind_call_turn(build_client())
 
-    # 4. Runtime and app built before run; runtime.serve() starts in on_mount.
+    # 4. Runtime and app built before run; the runtime starts in on_mount.
     app = BrokerMasterApp(
         cfg,
         registry,

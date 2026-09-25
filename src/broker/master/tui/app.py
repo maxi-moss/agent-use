@@ -1,8 +1,8 @@
 """BrokerMasterApp — the developer's chat TUI.
 
 Structural rules encoded here:
-- The socket server is a plain asyncio task: created in on_mount, cancelled
-  and awaited in on_unmount (never action_quit — bypassed by App.exit()).
+- The runtime is started in on_mount and closed in on_unmount (never
+  action_quit — bypassed by App.exit()).
 - The LLM turn runs under a worker with an explicit group ("llm"),
   exclusive=True, exit_on_error=False; the prompt box is re-enabled in
   on_worker_state_changed, never at the worker body's end.
@@ -11,8 +11,6 @@ Structural rules encoded here:
   are displayed verbatim (thin-master rule).
 """
 
-import asyncio
-import contextlib
 from pathlib import Path
 from typing import cast
 
@@ -100,7 +98,6 @@ class BrokerMasterApp(App[None]):
             self._emit, registry, queue, panes, cfg, anchor_pane=anchor_pane
         )
         self.master_llm = MasterLLM(llm_call, self.runtime, cfg)
-        self._server_task: asyncio.Task[None] | None = None
 
     @property
     def test_mode(self) -> bool:
@@ -132,18 +129,13 @@ class BrokerMasterApp(App[None]):
                 )
 
     async def on_mount(self) -> None:
-        self._server_task = asyncio.create_task(self.runtime.serve())
+        self.runtime.start()
         for warning in self.startup_warnings:
             self._event_line(f"warning: {warning}")
         self.query_one("#box", PromptArea).focus()
 
     async def on_unmount(self) -> None:
-        if self._server_task is not None:
-            self._server_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._server_task
-            self._server_task = None
-        self.registry.save()
+        await self.runtime.aclose()
 
     # ── developer input → LLM worker ─────────────────────────────────────────
 

@@ -2,7 +2,6 @@
 runtime server; driver.subprocess.run monkeypatched; emit = recording list."""
 
 import asyncio
-import contextlib
 import json
 import subprocess
 import tempfile
@@ -336,7 +335,7 @@ async def rt(
     runtime = MasterRuntime(
         posts.append, registry, queue, panes, cfg, anchor_pane="%1"
     )
-    task = asyncio.create_task(runtime.serve())
+    runtime.start()
     for _ in range(200):
         if runtime.master_socket_path.exists():
             break
@@ -344,9 +343,7 @@ async def rt(
     else:
         raise TimeoutError("master socket never bound")
     yield runtime, posts
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
+    await runtime.aclose()
 
 
 async def send(
@@ -976,16 +973,14 @@ async def test_startup_resurfaces_the_persisted_head_and_open_prompts(
         cfg,
         anchor_pane="%1",
     )
-    task = asyncio.create_task(runtime.serve())
+    runtime.start()
     for _ in range(200):
         if runtime.master_socket_path.exists():
             break
         await asyncio.sleep(0.01)
     else:
         raise TimeoutError("master socket never bound")
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
+    await runtime.aclose()
     arrived = [m for m in posts if isinstance(m, EscalationArrived)]
     assert len(arrived) == 1
     assert arrived[0].escalation_id == "e1"
@@ -1070,7 +1065,7 @@ async def test_repopulate_from_brokers_fills_task_activity_at_startup(
         anchor_pane="%1",
     )
     try:
-        task = asyncio.create_task(runtime.serve())
+        runtime.start()
 
         def repopulated() -> bool:
             fleets = [m for m in posts if isinstance(m, FleetUpdated)]
@@ -1087,9 +1082,7 @@ async def test_repopulate_from_brokers_fills_task_activity_at_startup(
             raise AssertionError(
                 "startup never repopulated task_activity from the broker"
             )
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        await runtime.aclose()
     finally:
         server.close()
         await server.wait_closed()
@@ -1129,16 +1122,14 @@ async def test_repopulate_from_brokers_recovers_pending_proposal(
         anchor_pane="%1",
     )
     try:
-        task = asyncio.create_task(runtime.serve())
+        runtime.start()
         for _ in range(200):
             if "pr1" in runtime.proposals:
                 break
             await asyncio.sleep(0.01)
         else:
             raise AssertionError("startup never recovered the pending proposal")
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        await runtime.aclose()
     finally:
         server.close()
         await server.wait_closed()
@@ -1177,7 +1168,7 @@ async def test_repopulate_from_brokers_registers_nothing_when_no_proposal(
         anchor_pane="%1",
     )
     try:
-        task = asyncio.create_task(runtime.serve())
+        runtime.start()
         for _ in range(200):
             if any(
                 isinstance(m, FleetUpdated)
@@ -1188,9 +1179,7 @@ async def test_repopulate_from_brokers_registers_nothing_when_no_proposal(
             await asyncio.sleep(0.01)
         else:
             raise AssertionError("startup never probed the broker")
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        await runtime.aclose()
     finally:
         server.close()
         await server.wait_closed()
@@ -1212,7 +1201,7 @@ async def test_fleet_view_tracks_the_queue_and_open_prompts_separately(
         return (view.queue_depth, view.waiting, prompts)
 
     try:
-        assert state() == (0, (), ())  # serve() announces the loaded stores
+        assert state() == (0, (), ())  # start() announces the loaded stores
         assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
         assert state() == (1, (), ())
         assert (

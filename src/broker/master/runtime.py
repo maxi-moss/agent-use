@@ -576,10 +576,34 @@ class MasterRuntime:
         self._task_activity: dict[str, str] = {}
         self._permission_prompt_pending: set[str] = set()
         self._master_activity: str | None = None
+        self._serve_task: asyncio.Task[None] | None = None
+
+    # ── lifecycle ────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        """Start serving the master socket in a background task.
+
+        Raises:
+            RuntimeError: The runtime is already serving.
+        """
+        if self._serve_task is not None:
+            raise RuntimeError("MasterRuntime.start called while already serving")
+        self._serve_task = asyncio.create_task(self._serve())
+
+    async def aclose(self) -> None:
+        """Stop serving and persist the registry."""
+        task, self._serve_task = self._serve_task, None
+        try:
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        finally:
+            self.registry.save()
 
     # ── socket server ────────────────────────────────────────────────────────
 
-    async def serve(self) -> None:
+    async def _serve(self) -> None:
         """Bind the master socket and serve until cancelled."""
         # A head or open pane escalation loaded from disk has never been
         # announced in this process, so each is announced here, exactly once.

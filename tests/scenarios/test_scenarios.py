@@ -3,7 +3,6 @@ by fake broker clients over the wire. No subprocess spawns and no LLM — the
 post sink is a plain list, exactly as the runtime unit harness does it."""
 
 import asyncio
-import contextlib
 import tempfile
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
@@ -39,7 +38,7 @@ async def rt(home: Path) -> AsyncIterator[tuple[MasterRuntime, list[Any]]]:
     runtime = MasterRuntime(
         posts.append, registry, queue, panes, cfg, anchor_pane="%1"
     )
-    task = asyncio.create_task(runtime.serve())
+    runtime.start()
     for _ in range(200):
         if runtime.master_socket_path.exists():
             break
@@ -47,9 +46,7 @@ async def rt(home: Path) -> AsyncIterator[tuple[MasterRuntime, list[Any]]]:
     else:
         raise TimeoutError("master socket never bound")
     yield runtime, posts
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
+    await runtime.aclose()
 
 
 async def _run(
