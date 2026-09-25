@@ -51,7 +51,7 @@ from broker.master.viewmodel import (
     PaneRequest,
     ProposalArrived,
     SessionRow,
-    SessionStatusChanged,
+    SessionStateChanged,
 )
 from broker.master.pane_escalations import PaneEscalations, PaneProtocolViolation
 from broker.master.queue import EscalationProtocolViolation, EscalationQueue
@@ -530,7 +530,7 @@ def _render_retrieved(s: RetrievedSymbol) -> str:
 class PendingProposal:
     """A prompt proposal awaiting the developer's approval."""
 
-    session_name: str
+    session_id: str
     payload: PromptProposalPayload
 
 
@@ -679,6 +679,7 @@ class MasterRuntime:
             p = PromptProposalPayload.model_validate(env.payload)
             self._set_state(name, SessionState.AWAITING_APPROVAL)
             self._register_proposal(name, p)
+            self._publish_fleet()
             return self._ack(env, ok=True)
         if env.type == T_BUDGET_UPDATE:
             p = BudgetUpdatePayload.model_validate(env.payload)
@@ -948,7 +949,7 @@ class MasterRuntime:
         record.pid = proc.pid
         self._procs[name] = proc
         self.registry.upsert(record)
-        self.emit(SessionStatusChanged(name, record.state))
+        self.emit(SessionStateChanged(name, record.state))
         self._publish_fleet()
         return f"spawned session {name} (pid {proc.pid}) in {cwd_path}"
 
@@ -968,6 +969,7 @@ class MasterRuntime:
             A confirmation line naming the session and the new broker's pid.
 
         Raises:
+            KeyError: The session ended while this call was in flight.
             ValueError: The registry does not know the session's pane, Claude
                 session id or transcript path.
             RuntimeError: A broker is still answering on the session socket.
@@ -977,12 +979,15 @@ class MasterRuntime:
         # left with its old broker killed and no replacement.
         adopt = _adoption_fields(record)
         await self.stop_session(session_id)
+        record = self.registry.get(session_id)  # KeyError if ended meanwhile
         await self._require_socket_free(record)
+        record = self.registry.get(session_id)  # KeyError if ended meanwhile
         record.intent = intent
         record.approved_prompt = None  # superseded; set again on approval
         record.title = ""
         record.budget_count = 0
         proc = await self._spawn_broker(record, adopt=adopt)
+        record = self.registry.get(session_id)  # KeyError if ended meanwhile
         record.pid = proc.pid
         self._procs[session_id] = proc
         self.registry.upsert(record)
@@ -1029,17 +1034,23 @@ class MasterRuntime:
                 f"session {session_id}: a broker is still answering on "
                 f"{record.socket_path} — refusing to attach"
             )
+        # ``record`` stays bound to the same registry object throughout (a
+        # concurrent upsert mutates it in place); each re-`get` below is only
+        # a liveness check, so the ``approved_prompt`` narrowing above holds.
+        self.registry.get(session_id)  # KeyError if ended meanwhile
         # The dead broker's stranded escalations, of both kinds: a decision
         # dispatched to one would be discarded, and a live entry would refuse
         # the resumed broker's first raise. It re-raises if the situation
         # still holds.
         await self._retract_stranded_escalation(session_id)
+        self.registry.get(session_id)  # KeyError if ended meanwhile
         self._retract_stranded_pane_escalations(session_id)
         resume = ResumedTask(
             approved_prompt=record.approved_prompt,
             completed=record.state == SessionState.COMPLETED,
         )
         proc = await self._spawn_broker(record, adopt=adopt, resume=resume)
+        self.registry.get(session_id)  # KeyError if ended meanwhile
         record.pid = proc.pid
         self._procs[session_id] = proc
         self.registry.upsert(record)
@@ -1097,7 +1108,7 @@ class MasterRuntime:
             msg = f"unknown proposal {proposal_id!r} — nothing approved"
             self.emit(Notice(msg))
             return msg
-        name = pending.session_name
+        name = pending.session_id
         record = self.registry.get(name)
         env = self._env(
             T_APPROVE_PROMPT,
@@ -1583,9 +1594,11 @@ class MasterRuntime:
             resume=resume,
         )
         # By module string, never by import — keeps the module boundary
-        # structural.
+        # structural. -I isolates the subprocess from the master's cwd and
+        # PYTHONPATH.
         return await asyncio.create_subprocess_exec(
             sys.executable,
+            "-I",
             "-m",
             "broker.session",
             "--config-json",
@@ -1714,7 +1727,7 @@ class MasterRuntime:
             self._task_activity.pop(name, None)
             self._permission_prompt_pending.discard(name)
             self._discard_proposals(name)
-        self.emit(SessionStatusChanged(name, state))
+        self.emit(SessionStateChanged(name, state))
         self._publish_fleet()
         return True
 
@@ -1800,7 +1813,7 @@ class MasterRuntime:
             )
             acc.setdefault(prompt.session_id, set()).add(badge)
         for pending in self.proposals.values():
-            acc.setdefault(pending.session_name, set()).add(Attention.PROPOSAL)
+            acc.setdefault(pending.session_id, set()).add(Attention.PROPOSAL)
         for name in self._permission_prompt_pending:
             acc.setdefault(name, set()).add(Attention.PERMISSION)
         return {
@@ -1809,7 +1822,8 @@ class MasterRuntime:
         }
 
     def _register_proposal(self, name: str, payload: PromptProposalPayload) -> None:
-        """Store a pending proposal and surface it to the developer."""
+        """Store a pending proposal, discarding any the session already had, and surface it to the developer."""
+        self._discard_proposals(name)
         self.proposals[payload.proposal_id] = PendingProposal(name, payload)
         self.emit(
             ProposalArrived(name, payload.proposal_id, render_proposal(payload))
@@ -1818,7 +1832,7 @@ class MasterRuntime:
     def _discard_proposals(self, name: str) -> None:
         """Drop any pending proposal a session left behind on settling or exit."""
         for pid in [
-            pid for pid, p in self.proposals.items() if p.session_name == name
+            pid for pid, p in self.proposals.items() if p.session_id == name
         ]:
             del self.proposals[pid]
 

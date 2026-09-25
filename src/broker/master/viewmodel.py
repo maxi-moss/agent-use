@@ -124,7 +124,7 @@ class Notice:
 
 
 @dataclass(frozen=True, slots=True)
-class SessionStatusChanged:
+class SessionStateChanged:
     session_id: str
     state: SessionState
 
@@ -136,7 +136,7 @@ ViewEvent = (
     | ProposalArrived
     | CompletionArrived
     | Notice
-    | SessionStatusChanged
+    | SessionStateChanged
 )
 
 EventSink = Callable[[ViewEvent], None]

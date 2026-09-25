@@ -421,7 +421,7 @@ class MasterLLM:
                 {
                     "type": "text",
                     "text": "# Prompt proposal awaiting approval — session "
-                    + pending.session_name,
+                    + pending.session_id,
                 }
             )
             blocks.append(
