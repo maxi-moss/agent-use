@@ -25,9 +25,17 @@ logger = logging.getLogger(__name__)
 
 Handler = Callable[[Envelope], Awaitable[Response | None]]
 
+# Every sender writes immediately after connecting, so this must exceed only
+# that write latency, not a full request/reply round trip.
+READ_TIMEOUT_S = 5.0
+
 
 async def serve_unix(
-    path: Path, handler: Handler, *, limit: int = MAX_LINE_BYTES
+    path: Path,
+    handler: Handler,
+    *,
+    limit: int = MAX_LINE_BYTES,
+    read_timeout_s: float = READ_TIMEOUT_S,
 ) -> asyncio.Server:
     """Bind an NDJSON line server on ``path`` and start accepting.
 
@@ -37,6 +45,8 @@ async def serve_unix(
         handler: Called with each validated envelope; a returned response is
             written back as one line, ``None`` sends nothing.
         limit: Maximum bytes the stream reader buffers for a single line.
+        read_timeout_s: Deadline for each line read; a peer that misses it is
+            closed.
 
     Returns:
         The listening server.
@@ -45,7 +55,9 @@ async def serve_unix(
     if path.exists():
         path.unlink()  # stale file from an unclean exit; free and safe
     server = await asyncio.start_unix_server(
-        lambda reader, writer: _serve_connection(handler, reader, writer),
+        lambda reader, writer: _serve_connection(
+            handler, reader, writer, read_timeout_s
+        ),
         path=str(path),
         limit=limit,
     )
@@ -57,6 +69,7 @@ async def _serve_connection(
     handler: Handler,
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
+    read_timeout_s: float,
 ) -> None:
     """Read and dispatch envelopes from one connection until the peer closes.
 
@@ -65,11 +78,19 @@ async def _serve_connection(
             written back as one line, ``None`` sends nothing.
         reader: Read stream for the accepted connection.
         writer: Write stream for the accepted connection.
+        read_timeout_s: Deadline for each line read; a peer that misses it is
+            closed.
     """
     try:
         while True:
             try:
-                line = await reader.readline()
+                async with asyncio.timeout(read_timeout_s):
+                    line = await reader.readline()
+            except TimeoutError:
+                logger.warning(
+                    "no line within %.1fs; closing connection", read_timeout_s
+                )
+                return
             except (asyncio.LimitOverrunError, ValueError):
                 # Oversized line: close this connection, keep serving.
                 logger.warning("oversized line; closing connection")

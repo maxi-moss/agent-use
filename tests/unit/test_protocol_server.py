@@ -107,3 +107,18 @@ async def test_request_timeout_raises(sock_dir: Path) -> None:
     finally:
         server.close()
         await server.wait_closed()
+
+
+async def test_silent_peer_closed(sock_dir: Path) -> None:
+    handler = RecordingHandler()
+    sock_path = sock_dir / "s.sock"
+    server = await serve_unix(sock_path, handler, read_timeout_s=0.2)
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(sock_path))
+        line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+        assert line == b""  # closed for missing the read deadline, no reply
+        writer.close()
+        assert handler.received == []
+    finally:
+        server.close()
+        await server.wait_closed()
