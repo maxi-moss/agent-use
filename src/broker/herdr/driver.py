@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, cast
 
-from broker.herdr.schemas import AgentStartResult, HerdrStatus, PaneInfo
+from broker.herdr.schemas import AgentInfo, HerdrStatus, PaneInfo
 
 HERDR = "herdr"
 
@@ -225,6 +225,26 @@ def pane_split(
     return PaneInfo.model_validate(_parse_json(stdout))
 
 
+def _agent_info(unwrapped: Any, what: str) -> AgentInfo:
+    """Parse the nested ``agent`` object out of an unwrapped herdr result.
+
+    Args:
+        unwrapped: Result already stripped of any ``result`` envelope.
+        what: Noun for the error message, e.g. ``"agent start"``.
+
+    Returns:
+        The parsed agent info.
+
+    Raises:
+        HerdrError: No ``agent`` object was present.
+    """
+    if isinstance(unwrapped, dict):
+        agent = cast(dict[str, Any], unwrapped).get("agent")
+        if isinstance(agent, dict):
+            return AgentInfo.model_validate(agent)
+    raise HerdrError("unexpected_result", f"{what} returned no agent object")
+
+
 def agent_start(
     name: str,
     *,
@@ -232,7 +252,7 @@ def agent_start(
     pane_id: str,
     timeout_ms: int,
     agent_args: list[str] | None = None,
-) -> AgentStartResult:
+) -> AgentInfo:
     """Start an agent in an existing pane.
 
     Args:
@@ -243,10 +263,11 @@ def agent_start(
         agent_args: Arguments forwarded to the agent binary after ``--``.
 
     Returns:
-        The parsed start result, unwrapped from any ``result`` envelope.
+        The started agent's info, parsed from the nested ``agent`` object.
 
     Raises:
         ValueError: The name, kind or pane id fails validation.
+        HerdrError: The result carried no ``agent`` object.
     """
     _check_agent_name(name)
     _check_identifier(pane_id, "pane id")
@@ -261,10 +282,10 @@ def agent_start(
     if agent_args:
         argv += ["--", *agent_args]
     stdout = _run(argv, timeout_s=timeout_ms / 1000 + _HERDR_WAIT_GRACE_S)
-    return AgentStartResult.model_validate(_unwrap_result(_parse_json(stdout)))
+    return _agent_info(_unwrap_result(_parse_json(stdout)), "agent start")
 
 
-def agent_get(target: str, *, timeout_s: float) -> dict[str, Any]:
+def agent_get(target: str, *, timeout_s: float) -> AgentInfo:
     """Read ``herdr agent get <target>``.
 
     Args:
@@ -272,38 +293,14 @@ def agent_get(target: str, *, timeout_s: float) -> dict[str, Any]:
         timeout_s: Wall-clock limit for the subprocess.
 
     Returns:
-        The unwrapped result dict.
+        The parsed agent info.
 
     Raises:
-        HerdrError: The result unwrapped to something other than an object.
+        HerdrError: The result carried no ``agent`` object.
     """
     _check_identifier(target, "agent target")
     stdout = _run([HERDR, "agent", "get", target], timeout_s)
-    unwrapped = _unwrap_result(_parse_json(stdout))
-    if isinstance(unwrapped, dict):
-        return cast(dict[str, Any], unwrapped)
-    raise HerdrError(
-        "unexpected_result", f"agent get returned {type(unwrapped).__name__}"
-    )
-
-
-def agent_status(info: dict[str, Any]) -> str:
-    """Extract ``agent_status`` from an unwrapped ``agent get`` result.
-
-    Unreadable or missing values degrade to ``"unknown"``.
-
-    Args:
-        info: Unwrapped result dict, as returned by :func:`agent_get`.
-
-    Returns:
-        The status string, or ``"unknown"`` when it is absent or not a string.
-    """
-    agent = info.get("agent")
-    if isinstance(agent, dict):
-        status = cast(dict[str, Any], agent).get("agent_status")
-        if isinstance(status, str):
-            return status
-    return "unknown"
+    return _agent_info(_unwrap_result(_parse_json(stdout)), "agent get")
 
 
 def agent_running(name: str, *, timeout_s: float) -> bool:

@@ -80,8 +80,10 @@ def test_pane_split_argv_and_pane_id(fake: Any) -> None:
     assert info.pane_id == "w3:p2"
 
 
-def test_agent_start_with_session(fake: Any) -> None:
-    run = fake(stdout=(FIXTURES / "agent_start_with_session.json").read_text())
+def test_agent_start_parses_nested_agent(fake: Any) -> None:
+    """The installed 0.8.2 API nests fields under result.agent
+    ({"type": "agent_started", "agent": AgentInfo}), live-captured."""
+    run = fake(stdout=(FIXTURES / "agent_start_nested.json").read_text())
     result = driver.agent_start(
         "sess-a1", kind="claude", pane_id="w3:p2", timeout_ms=30000
     )
@@ -91,13 +93,15 @@ def test_agent_start_with_session(fake: Any) -> None:
         "--pane", "w3:p2",
         "--timeout", "30000",
     ]]
-    assert result.agent_session is not None
-    assert result.agent_session.value == "7dfd77f8-a848-4a35-9122-d5343e019082"
+    assert result.name == "fixcap2"
+    assert result.pane_id == "wG:pW"
+    assert result.agent_status == "idle"
+    assert result.agent_session is None
 
 
 def test_agent_start_forwards_agent_args(fake: Any) -> None:
     """Args land after `--`; dropping them would launch claude in default mode."""
-    run = fake(stdout=(FIXTURES / "agent_start_with_session.json").read_text())
+    run = fake(stdout=(FIXTURES / "agent_start_nested.json").read_text())
     driver.agent_start(
         "sess-a1",
         kind="claude",
@@ -114,24 +118,13 @@ def test_agent_start_forwards_agent_args(fake: Any) -> None:
     ]]
 
 
-def test_agent_start_without_session(fake: Any) -> None:
-    """agent_session absent when the trust dialog blocked init — must parse."""
-    fake(stdout=(FIXTURES / "agent_start_no_session.json").read_text())
-    result = driver.agent_start(
-        "sess-a1", kind="claude", pane_id="w3:p2", timeout_ms=30000
-    )
-    assert result.agent_session is None
-
-
-def test_agent_start_nested_agent_shape(fake: Any) -> None:
-    """The installed 0.7.5 API schema nests fields under result.agent
-    ({"type": "agent_started", "agent": AgentInfo}) — must parse identically."""
-    fake(stdout=(FIXTURES / "agent_start_nested.json").read_text())
-    result = driver.agent_start(
-        "sess-a1", kind="claude", pane_id="w3:p2", timeout_ms=30000
-    )
-    assert result.agent_session is not None
-    assert result.agent_session.value == "7dfd77f8-a848-4a35-9122-d5343e019082"
+def test_agent_start_raises_when_no_agent_object(fake: Any) -> None:
+    fake(stdout='{"result": {"type": "agent_started"}}')
+    with pytest.raises(HerdrError) as exc_info:
+        driver.agent_start(
+            "sess-a1", kind="claude", pane_id="w3:p2", timeout_ms=30000
+        )
+    assert exc_info.value.code == "unexpected_result"
 
 
 def test_agent_get_argv_and_fixture_parse(fake: Any) -> None:
@@ -140,7 +133,8 @@ def test_agent_get_argv_and_fixture_parse(fake: Any) -> None:
     run = fake(stdout=(FIXTURES / "agent_get.json").read_text())
     info = driver.agent_get("sess-a1", timeout_s=10.0)
     assert run.calls == [["herdr", "agent", "get", "sess-a1"]]
-    assert driver.agent_status(info) == "idle"
+    assert info.name == "fixcap2"
+    assert info.agent_status == "idle"
 
 
 def test_agent_get_rejects_current(fake: Any) -> None:
@@ -148,6 +142,13 @@ def test_agent_get_rejects_current(fake: Any) -> None:
     with pytest.raises(ValueError):
         driver.agent_get("--current", timeout_s=1.0)
     assert run.calls == []
+
+
+def test_agent_get_raises_when_no_agent_object(fake: Any) -> None:
+    fake(stdout='{"result": {"type": "agent_info"}}')
+    with pytest.raises(HerdrError) as exc_info:
+        driver.agent_get("sess-a1", timeout_s=1.0)
+    assert exc_info.value.code == "unexpected_result"
 
 
 def test_agent_running_is_false_once_herdr_releases_the_name(fake: Any) -> None:
@@ -173,12 +174,6 @@ def test_agent_running_raises_when_the_answer_is_unknown(fake: Any) -> None:
     )
     with pytest.raises(HerdrError):
         driver.agent_running("s1", timeout_s=5.0)
-
-
-def test_agent_status_degrades_to_unknown() -> None:
-    assert driver.agent_status({}) == "unknown"
-    assert driver.agent_status({"agent": {"agent_status": "blocked"}}) == "blocked"
-    assert driver.agent_status({"agent": {"agent_status": 3}}) == "unknown"
 
 
 def test_agent_prompt_submits_with_no_trailing_enter(fake: Any) -> None:
@@ -240,7 +235,7 @@ def test_no_public_api_emits_current(fake: Any) -> None:
     ],
 )
 def test_agent_name_validation(name: str, valid: bool, fake: Any) -> None:
-    fake(stdout=(FIXTURES / "agent_start_no_session.json").read_text())
+    fake(stdout=(FIXTURES / "agent_start_nested.json").read_text())
     if valid:
         driver.agent_start(name, kind="claude", pane_id="w3:p2", timeout_ms=1000)
     else:

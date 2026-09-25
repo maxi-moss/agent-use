@@ -48,6 +48,7 @@ from broker.config import (
 )
 from broker.paths import BrokerPaths
 from broker.herdr import driver
+from broker.herdr.schemas import AgentStatus
 from broker.claude.paths import transcript_dir_for_cwd
 from broker.permission import PermissionModule, render_permission_log
 from broker.protocol import client
@@ -2013,16 +2014,14 @@ class SessionBroker:
         self._permission_prompt_pending = pending
         self._status_dirty.set()
 
-    def _herdr_state(self) -> str:
+    def _herdr_state(self) -> AgentStatus:
         """Report the agent's state as Herdr sees it, for the watchdog gate.
 
         Returns:
-            Herdr's status string, or ``"unknown"`` if the query fails.
+            Herdr's status, or ``"unknown"`` if the query fails.
         """
         try:
-            return driver.agent_status(
-                driver.agent_get(self.cfg.name, timeout_s=10.0)
-            )
+            return driver.agent_get(self.cfg.name, timeout_s=10.0).agent_status
         except Exception:
             return "unknown"  # gates the watchdog read out; never classifies
 
