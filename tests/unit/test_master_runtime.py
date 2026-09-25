@@ -694,13 +694,13 @@ async def test_list_sessions_reports_permission_prompt_flag(
     stub = StatusSession(permission_prompt=True)
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
-        listing = await runtime.render_sessions_with_permission_prompts()
+        listing = await runtime.list_sessions()
         assert "s1" in listing
         assert "sitting on a permission prompt" in listing
         assert "w3:p2" in listing
         # The flag is read on demand and must NOT reach the summary the master
         # carries into every turn.
-        assert "permission prompt" not in runtime.render_registry_summary()
+        assert "permission prompt" not in runtime.registry_summary()
     finally:
         server.close()
         await server.wait_closed()
@@ -711,7 +711,7 @@ async def test_list_sessions_degrades_when_a_session_is_unreachable(
 ) -> None:
     """One dead session costs a line of the listing, never the whole listing."""
     runtime, _ = rt
-    listing = await runtime.render_sessions_with_permission_prompts()
+    listing = await runtime.list_sessions()
     assert "s1" in listing
     assert "unreachable" in listing
 
@@ -1539,13 +1539,13 @@ async def test_session_ended_removes_from_fleet(
 ) -> None:
     runtime, posts = rt
     # s1 is seeded driving and visible in the summary the master carries.
-    assert "s1" in runtime.render_registry_summary()
+    assert "s1" in runtime.registry_summary()
     resp = await send(runtime, T_SESSION_ENDED, {})
     assert resp.ok
     # Removed everywhere a router looks: the summary, the fleet, and the
     # registry itself — so it can never be handed a new task or a decision.
     assert "s1" not in runtime.registry.records
-    assert runtime.render_registry_summary() == "(no sessions)"
+    assert runtime.registry_summary() == "(no sessions)"
     last_view = [m for m in posts if isinstance(m, FleetUpdated)][-1].view
     assert not any(row.session_id == "s1" for row in last_view.rows)
     # The removal is durable, and a late live-status push cannot resurrect it.
@@ -2460,7 +2460,7 @@ async def test_list_sessions_probes_rather_than_reading_the_pushed_map(
     stub = StatusSession(permission_prompt=True)
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
-        listing = await runtime.render_sessions_with_permission_prompts()
+        listing = await runtime.list_sessions()
         # The tool's authoritative probe wins over the stale pushed state.
         assert "sitting on a permission prompt" in listing
     finally:

@@ -10,10 +10,8 @@ answers.
 import asyncio
 import contextlib
 import logging
-import re
 import sys
 import uuid
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -117,15 +115,6 @@ from broker.protocol.schemas import (
 from broker.protocol.server import serve_unix
 
 logger = logging.getLogger(__name__)
-
-_SESSION_NUM = re.compile(r"s(\d+)\Z")
-
-
-def session_sort_key(name: str) -> tuple[int, str]:
-    """Order sessions by numeric id (s2 before s10); any non-'sN' name last."""
-    m = _SESSION_NUM.match(name)
-    return (int(m.group(1)), "") if m else (10**9, name)
-
 
 REQUEST_TIMEOUT_S = 10.0
 # The broker runs an LLM call before it can reply, so this is far longer than
@@ -275,7 +264,7 @@ async def reconcile_registry(
         One classification line per session, plus one line per retraction.
     """
     warnings: list[str] = []
-    for name in sorted(registry.records, key=session_sort_key):
+    for name in registry.names_in_order():
         record = registry.records[name]
         if await _broker_is_listening(Path(record.socket_path)):
             warnings.append(
@@ -408,7 +397,7 @@ class MasterRuntime:
         # announced in this process, so each is announced here, exactly once.
         self._publish_fleet()
         await self._surface_head()
-        for prompt in self.open_pane_escalations():
+        for prompt in self.panes.in_session_order():
             await self._announce_pane_escalation(prompt)
         server = await serve_unix(self.master_socket_path, self.handle)
         await self._repopulate_from_brokers()
@@ -418,7 +407,7 @@ class MasterRuntime:
     async def _repopulate_from_brokers(self) -> None:
         """Refresh state, task-activity and any pending proposal from each surviving broker."""
 
-        for name in sorted(self.registry.records, key=session_sort_key):
+        for name in self.registry.names_in_order():
             if self.registry.records[name].state in _ABSORBING:
                 continue
             try:
@@ -464,8 +453,11 @@ class MasterRuntime:
             p = CompletionPayload.model_validate(env.payload)
             self._set_state(name, SessionState.COMPLETED)
             self.emit(CompletionArrived(name, p.headline, p.supporting))
-            await self._notify(
-                notifier.notify_done, f"Session {name} complete", p.headline
+            await notifier.notify_or_notice(
+                self.emit,
+                notifier.notify_done,
+                f"Session {name} complete",
+                p.headline,
             )
             return self._ack(env, ok=True)
         if env.type == T_SESSION_ENDED:
@@ -480,7 +472,8 @@ class MasterRuntime:
             # otherwise wedge the queue, undispatchable to a dead session.
             await self._retract_stranded_escalation(name)
             self._retract_stranded_pane_escalations(name)
-            await self._notify(
+            await notifier.notify_or_notice(
+                self.emit,
                 notifier.notify_request,
                 f"Session {name} failed",
                 f"{p.error_class}: {p.detail}",
@@ -712,7 +705,8 @@ class MasterRuntime:
                 render_escalation(head),
             )
         )
-        await self._notify(
+        await notifier.notify_or_notice(
+            self.emit,
             notifier.notify_request,
             f"Escalation from session {head.session_id}",
             head.disclosure.what_was_asked,
@@ -734,7 +728,8 @@ class MasterRuntime:
             if p.kind == PaneKind.PERMISSION
             else f"Question in session {p.session_id}"
         )
-        await self._notify(
+        await notifier.notify_or_notice(
+            self.emit,
             notifier.notify_request,
             title,
             f"{pane_label(p)} — answer it in pane {pane_id}",
@@ -1320,8 +1315,8 @@ class MasterRuntime:
         """Return every proposal awaiting approval, oldest first."""
         return list(self.proposals.values())
 
-    def render_registry_summary(self) -> str:
-        """Render the registry summary for the LLM context and list_sessions.
+    def registry_summary(self) -> str:
+        """Render the registry summary for the LLM context and ``list_sessions``.
 
         Returns:
             One line per session, or ``"(no sessions)"``.
@@ -1329,7 +1324,7 @@ class MasterRuntime:
         if not self.registry.records:
             return "(no sessions)"
         lines: list[str] = []
-        for name in sorted(self.registry.records, key=session_sort_key):
+        for name in self.registry.names_in_order():
             r = self.registry.records[name]
             intent = r.approved_prompt or r.intent
             lines.append(
@@ -1339,7 +1334,7 @@ class MasterRuntime:
             )
         return "\n".join(lines)
 
-    async def render_sessions_with_permission_prompts(self) -> str:
+    async def list_sessions(self) -> str:
         """Render the registry summary, probing each session for a live prompt.
 
         The prompt flag lives in broker memory and is read on demand, so it
@@ -1350,8 +1345,8 @@ class MasterRuntime:
             waiting on a native permission prompt and for each session that
             could not be reached.
         """
-        lines = [self.render_registry_summary()]
-        for name in sorted(self.registry.records, key=session_sort_key):
+        lines = [self.registry_summary()]
+        for name in self.registry.names_in_order():
             try:
                 status = await self.probe_status(name)
             except PROBE_FAILURES as exc:
@@ -1581,7 +1576,7 @@ class MasterRuntime:
         """Assemble the structured sidebar view from current runtime state."""
         badges = self._badges_by_session()
         rows: list[SessionRow] = []
-        for name in sorted(self.registry.records, key=session_sort_key):
+        for name in self.registry.names_in_order():
             r = self.registry.records[name]
             rows.append(
                 SessionRow(
@@ -1604,7 +1599,7 @@ class MasterRuntime:
             head=self._head_request(),
             panes=tuple(
                 PaneRequest(p.kind, p.session_id, p.escalation_id, pane_label(p))
-                for p in self.open_pane_escalations()
+                for p in self.panes.in_session_order()
             ),
         )
 
@@ -1614,13 +1609,6 @@ class MasterRuntime:
             return None
         return HeadRequest(
             head.session_id, head.escalation_id, head.disclosure.what_was_asked
-        )
-
-    def open_pane_escalations(self) -> list[PaneEscalationPayload]:
-        """Return every open pane escalation, in numeric session order, then kind."""
-        return sorted(
-            self.panes.entries,
-            key=lambda p: (session_sort_key(p.session_id), p.kind.value),
         )
 
     def _badges_by_session(self) -> dict[str, tuple[Attention, ...]]:
@@ -1672,25 +1660,6 @@ class MasterRuntime:
         """Return the dashboard header to idle."""
         self._master_activity = None
         self._publish_fleet()
-
-    async def _notify(
-        self,
-        fn: Callable[[str, str], Awaitable[None]],
-        title: str,
-        body: str,
-    ) -> None:
-        """Send one notification, downgrading a notifier failure to a notice.
-
-        Args:
-            fn: Notifier coroutine from ``broker.master.notifier``.
-            title: Notification title.
-            body: Notification body, passed through verbatim.
-        """
-        try:
-            await fn(title, body)
-        except Exception as exc:
-            # A dead notifier must not lose the escalation it announces.
-            self.emit(Notice(f"notification failed: {exc}"))
 
     async def _deliver(
         self, socket_path: str, env: Envelope, *, rejection: str

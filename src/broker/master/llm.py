@@ -181,7 +181,7 @@ _REGISTRY = (
         "Current sessions with state, budget, and intent, plus which of them "
         "are sitting on a native permission prompt right now.",
         ListSessionsArgs,
-        lambda rt, _a: rt.render_sessions_with_permission_prompts(),
+        lambda rt, _a: rt.list_sessions(),
         "probing the sessions…",
     ),
     MasterTool(
@@ -391,7 +391,7 @@ class MasterLLM:
             {
                 "type": "text",
                 "text": "# Session registry\n"
-                + self.runtime.render_registry_summary(),
+                + self.runtime.registry_summary(),
             }
         ]
         active = self.runtime.queue.active
@@ -400,7 +400,7 @@ class MasterLLM:
             # Byte-identical to the runtime rendering — its own block, so
             # nothing is prepended to or reflowed around the broker's words.
             blocks.append({"type": "text", "text": render_escalation(active)})
-        for prompt in self.runtime.open_pane_escalations():
+        for prompt in self.runtime.panes.in_session_order():
             blocks.append(
                 {
                     "type": "text",

@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 
-from broker.herdr.driver import AGENT_NAME_RE
 from broker.master.registry import Registry, RegistryError, SessionRecord
 
 
@@ -37,7 +36,6 @@ def test_allocate_name_unique_and_valid(tmp_path: Path) -> None:
     for _ in range(5):
         name = registry.allocate_name()
         assert name not in names
-        assert AGENT_NAME_RE.fullmatch(name), name  # herdr agent-name rule
         names.add(name)
         registry.upsert(record(name))
     assert names == {"s1", "s2", "s3", "s4", "s5"}
