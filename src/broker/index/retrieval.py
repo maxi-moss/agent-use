@@ -39,13 +39,15 @@ async def retrieve(
         intent: The developer's intent, embedded verbatim.
         cwd: Repository root, used in error messages.
         index_path: The repository's index file.
-        embedder: Embedding backend for the intent.
+        embedder: Embedding backend for the intent; its ``model_id`` is
+            checked against the model the index was built with.
 
     Returns:
         Top-5 seeds by cosine similarity plus their one-hop expansion.
 
     Raises:
-        RetrievalError: No index, no embedded symbols, or vector mismatch.
+        RetrievalError: No index, an unrecorded or mismatched embedding
+            model, no embedded symbols, or vector mismatch.
         EmbeddingError: The intent could not be embedded.
     """
     if not index_path.exists():
@@ -56,6 +58,18 @@ async def retrieve(
         if not vectors:
             raise RetrievalError(
                 f"code index for {cwd} has no embedded symbols; {_hint(cwd)}"
+            )
+        stored_model_id = store.embedding_model_id()
+        if stored_model_id is None:
+            raise RetrievalError(
+                f"code index for {cwd} predates embedding-model tracking; "
+                f"re-index — {_hint(cwd)}"
+            )
+        if stored_model_id != embedder.model_id:
+            raise RetrievalError(
+                f"code index for {cwd} was built with embedding model "
+                f"{stored_model_id!r}, but retrieval is configured for "
+                f"{embedder.model_id!r}; re-index — {_hint(cwd)}"
             )
         [query] = await embedder.embed([intent], timeout_s=INTENT_EMBED_TIMEOUT_S)
         unit = unit_vector(query)

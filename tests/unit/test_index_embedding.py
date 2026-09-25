@@ -15,12 +15,17 @@ from broker.index.indexer import index_repo
 from broker.index.store import IndexStore
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "indexer_inputs"
+MODEL_ID = "fake-embed-model"
+# An ambient GIT_DIR (e.g. from a `git rebase --exec` running this suite)
+# must not redirect `git init` away from the fixture directory it targets.
+_GIT_ENV = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
 
 
 class FakeEmbedder:
     """Deterministic 4-d vectors from the text hash; records every batch."""
 
-    def __init__(self) -> None:
+    def __init__(self, model_id: str = MODEL_ID) -> None:
+        self.model_id = model_id
         self.batches: list[list[str]] = []
 
     async def embed(self, texts: list[str], *, timeout_s: float) -> list[list[float]]:
@@ -40,7 +45,7 @@ class FakeEmbedder:
 def make_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     shutil.copytree(FIXTURES / "python_repo", repo)
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, env=_GIT_ENV)
     return repo.resolve()
 
 
@@ -85,6 +90,20 @@ async def test_only_symbols_whose_text_changed_are_reembedded(tmp_path: Path) ->
     assert fake.embedded_names() == {
         "app/providers/anthropic.py::AnthropicProvider._call"
     }
+
+
+async def test_model_swap_reembeds_everything_even_when_text_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    repo = make_repo(tmp_path)
+    db = tmp_path / "index.sqlite"
+    first = FakeEmbedder(model_id="model-a")
+    await index_repo(repo, db, first)
+    names = first.embedded_names()
+    second = FakeEmbedder(model_id="model-b")
+    summary = await index_repo(repo, db, second)
+    assert second.embedded_names() == names
+    assert summary.embedded == len(names)
 
 
 async def test_vanished_symbols_lose_their_embeddings(tmp_path: Path) -> None:

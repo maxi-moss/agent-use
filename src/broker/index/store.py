@@ -81,6 +81,10 @@ CREATE TABLE IF NOT EXISTS embeddings (
     text_hash TEXT NOT NULL,
     vector BLOB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS meta (
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    embedding_model_id TEXT NOT NULL
+);
 """
 
 _SYMBOL_COLUMNS = (
@@ -332,6 +336,33 @@ class IndexStore:
             vector.frombytes(row["vector"])
             out.append((row["qualified_name"], vector))
         return out
+
+    # ── meta ───────────────────────────────────────────────────────────
+
+    def write_embedding_model_id(self, model_id: str) -> None:
+        """Record the embedding model this index's vectors are built with.
+
+        Wipes every stored embedding first when the recorded model is missing
+        or differs, so a model swap forces a full re-embed instead of leaving
+        vectors from the old model under the new model's id.
+        """
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT embedding_model_id FROM meta WHERE id = 0"
+            ).fetchone()
+            if row is None or str(row["embedding_model_id"]) != model_id:
+                self._conn.execute("DELETE FROM embeddings")
+            self._conn.execute(
+                "INSERT OR REPLACE INTO meta (id, embedding_model_id) VALUES (0, ?)",
+                (model_id,),
+            )
+
+    def embedding_model_id(self) -> str | None:
+        """Return the embedding model recorded for this index, if any."""
+        row = self._conn.execute(
+            "SELECT embedding_model_id FROM meta WHERE id = 0"
+        ).fetchone()
+        return None if row is None else str(row["embedding_model_id"])
 
     # ── retrieval ──────────────────────────────────────────────────────
 
