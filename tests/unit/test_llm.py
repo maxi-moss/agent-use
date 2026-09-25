@@ -7,7 +7,6 @@ import anthropic
 import pytest
 from anthropic import AsyncAnthropic
 
-from broker.config import BrokerConfig
 from broker.llm import LLMCallError, ToolCall, build_client, call_tool, call_turn
 
 
@@ -65,7 +64,7 @@ CALL_KWARGS: dict[str, Any] = {
 
 def test_client_has_zero_retries(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    client = build_client(BrokerConfig())
+    client = build_client()
     assert client.max_retries == 0
 
 

@@ -12,7 +12,7 @@ from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from broker.claude.atomic import atomic_update_json
+from broker.atomic_json import atomic_update_json
 from broker.protocol.constants import SessionState
 
 NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
@@ -101,7 +101,7 @@ class Registry:
             data["name_seq"] = self._name_seq
             return data
 
-        atomic_update_json(self.path, mutate)
+        atomic_update_json(self.path, mutate, backup=False)
 
     def allocate_name(self) -> str:
         """Allocate the next session name, never reusing a freed one.

@@ -26,6 +26,7 @@ from broker.permission.llm import PermissionCaller
 from broker.permission.schemas import AllowCall
 from broker.protocol import client
 from broker.protocol.constants import (
+    ASK_USER_QUESTION,
     DECISION_ALLOW,
     DECISION_ESCALATED,
     NACK_SLOT_OCCUPIED,
@@ -43,8 +44,6 @@ from broker.protocol.schemas import (
 logger = logging.getLogger(__name__)
 
 MASTER_TIMEOUT_S = 10.0
-
-ASK_USER_QUESTION = "AskUserQuestion"
 
 _ASK_REASON = (
     "the session is putting a question to the developer; that question travels"

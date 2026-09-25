@@ -65,7 +65,7 @@ MESSAGES: list[MessageParam] = [
 async def session_call() -> None:
     """Call the session broker's triage surface against its pinned model."""
     cfg = BrokerConfig()  # the pinned production model — deliberately
-    client = build_client(cfg)
+    client = build_client()
     call = await call_tool(
         client,
         model=cfg.model_id,

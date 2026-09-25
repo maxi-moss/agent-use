@@ -48,7 +48,7 @@ _WORKING = (
 async def probe_triage() -> None:
     """Issue two identical triage calls and report each call's cache usage."""
     cfg = BrokerConfig()
-    client = build_client(cfg)
+    client = build_client()
     system, messages = assemble_triage_context(
         prompts.load("triage"), _INTENT, [], _WORKING
     )

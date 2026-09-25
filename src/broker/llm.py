@@ -24,8 +24,6 @@ from anthropic.types import (
 
 from pydantic import BaseModel
 
-from broker.config import BrokerConfig
-
 
 class LLMCallError(Exception):
     """Any LLM-call failure. One class: every failure takes the same
@@ -122,17 +120,12 @@ def strict_tool(
     }
 
 
-def build_client(cfg: BrokerConfig) -> AsyncAnthropic:
+def build_client() -> AsyncAnthropic:
     """Construct the Anthropic client every caller shares.
-
-    Args:
-        cfg: Unused by the client itself; accepted so every caller shares one
-            construction site.
 
     Returns:
         A client that never retries.
     """
-    del cfg  # unused; accepted so every caller shares one construction site
     return AsyncAnthropic(max_retries=0)
 
 

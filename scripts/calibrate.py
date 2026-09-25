@@ -74,7 +74,7 @@ def _print_row(case_id: str, expected: str, decision: str, reasoning: str) -> No
 async def run_questions(cases: list[QuestionCase]) -> None:
     """Run the triage leg against the pinned session model."""
     cfg = BrokerConfig()
-    caller = functools.partial(call_tool, build_client(cfg))
+    caller = functools.partial(call_tool, build_client())
     print(f"questions ({cfg.model_id}): {len(cases)} cases")
     escalations = 0
     for case in cases:

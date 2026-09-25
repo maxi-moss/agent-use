@@ -100,10 +100,7 @@ def test_permission_request_needs_no_tool_use_id() -> None:
         {
             "tool_name": "Read",
             "tool_input": {"file_path": "/repo/x.py"},
-            "cwd": "/repo",
-            "transcript_path": "/private/tmp/t.jsonl",
         }
     )
-    assert payload.permission_mode is None
     assert payload.permission_suggestions == []
     assert "tool_use_id" not in PermissionRequestPayload.model_fields

@@ -31,6 +31,7 @@ from broker.permission import PermissionModule
 from broker.permission.llm import ToolCall as PermissionToolCall
 from broker.protocol import client
 from broker.protocol.constants import (
+    ENV_BROKER_HOOK_LOG,
     MAX_LINE_BYTES,
     T_APPROVE_PROMPT,
     T_BUDGET_UPDATE,
@@ -427,6 +428,7 @@ async def run_hook(
 ) -> tuple[bytes, bytes, float]:
     """Run the REAL hook subprocess; returns (stdout, stderr, elapsed_s)."""
     env = dict(os.environ)
+    env.pop(ENV_BROKER_HOOK_LOG, None)
     env["BROKER_SOCKET"] = str(sock)
     start = time.monotonic()
     proc = await asyncio.create_subprocess_exec(

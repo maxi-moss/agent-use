@@ -3,7 +3,7 @@
 Three-step parse per line, deliberately:
   1. json.loads         — malformed JSON is FATAL (TranscriptParseError)
   2. raw.map_line       — unrecognised record types are discarded (counted)
-  3. _EVENT.validate_python — shape drift is tolerated (skipped + counted)
+  3. EVENT_ADAPTER.validate_python — shape drift is tolerated (skipped + counted)
 
 TypeAdapter.validate_json would hide malformed JSON inside a ValidationError
 (type "json_invalid") and make the fatal/tolerant split impossible.
@@ -20,9 +20,9 @@ from pydantic import ValidationError
 from broker.transcript import raw
 from broker.transcript.schemas import (
     EVENT_ADAPTER,
-    VALIDATED_AGAINST,
-    AskUserQuestion,
-    ExitPlanMode,
+    TRANSCRIPT_VALIDATED_AGAINST,
+    AskUserQuestionUse,
+    ExitPlanModeUse,
     TranscriptEvent,
 )
 
@@ -39,15 +39,7 @@ class ReadReport:
     warnings: list[str] = field(default_factory=list[str])
 
 
-def read_cleaned(path: Path) -> list[TranscriptEvent]:
-    """Read a transcript file and return its cleaned events, dropping the report."""
-    events, _ = read_cleaned_with_report(path)
-    return events
-
-
-def read_cleaned_with_report(
-    path: Path,
-) -> tuple[list[TranscriptEvent], ReadReport]:
+def read_cleaned(path: Path) -> tuple[list[TranscriptEvent], ReadReport]:
     """Read a transcript file into cleaned events, with a report of what was lost.
 
     Args:
@@ -106,9 +98,9 @@ def read_cleaned_with_report(
             except ValidationError:
                 report.skipped_records += 1
                 continue
-            if isinstance(event, AskUserQuestion):
+            if isinstance(event, AskUserQuestionUse):
                 pending[event.id] = "ask_user_answer"
-            elif isinstance(event, ExitPlanMode):
+            elif isinstance(event, ExitPlanModeUse):
                 pending[event.id] = "exit_plan_result"
             events.append(event)
 
@@ -117,11 +109,13 @@ def read_cleaned_with_report(
             f"{path}: non-empty file ({nonblank_lines} lines) yielded zero events"
         )
 
-    mismatched = sorted(v for v in report.versions if v != VALIDATED_AGAINST)
+    mismatched = sorted(
+        v for v in report.versions if v != TRANSCRIPT_VALIDATED_AGAINST
+    )
     if mismatched:
         report.warnings.append(
             f"transcript version(s) {mismatched} differ from validated "
-            f"{VALIDATED_AGAINST!r} — adapter output may be stale"
+            f"{TRANSCRIPT_VALIDATED_AGAINST!r} — adapter output may be stale"
         )
     return events, report
 
@@ -179,8 +173,6 @@ def render(events: list[TranscriptEvent]) -> str:
             parts.append(f"## plan (id={event.id})\n{event.plan}\n\n")
         elif event.kind == "exit_plan_result":
             parts.append(f"## plan-result (id={event.id})\n{event.raw}\n\n")
-        elif event.kind == "compaction_boundary":
-            parts.append("## [compaction boundary]\n\n")
         else:
             assert_never(event)
     return "".join(parts)

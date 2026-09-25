@@ -6,8 +6,13 @@ permission path of every tool call in every supervised session.
 
 from enum import StrEnum
 
-PROTOCOL_VERSION = 1
 MAX_LINE_BYTES = 1_048_576  # 1 MiB; observed real max 857 KiB (2026-07-27 survey)
+
+ENV_BROKER_SOCKET = "BROKER_SOCKET"
+ENV_BROKER_HOOK_LOG = "BROKER_HOOK_LOG"
+
+# Claude Code's own tool name — NOT one of our wire-protocol constants above.
+ASK_USER_QUESTION = "AskUserQuestion"
 
 # Session-socket message types
 T_HOOK_EVENT = "hook_event"
@@ -68,6 +73,22 @@ class PaneKind(StrEnum):
 
     PERMISSION = "permission"
     QUESTION = "question"
+
+
+class HookEventName(StrEnum):
+    """The hook events the broker subscribes to."""
+
+    SESSION_START = "SessionStart"
+    SESSION_END = "SessionEnd"
+    USER_PROMPT_SUBMIT = "UserPromptSubmit"
+    STOP = "Stop"
+    STOP_FAILURE = "StopFailure"
+    NOTIFICATION = "Notification"
+    PRE_TOOL_USE = "PreToolUse"
+    POST_TOOL_USE = "PostToolUse"
+    PRE_COMPACT = "PreCompact"
+    POST_COMPACT = "PostCompact"
+    PERMISSION_REQUEST = "PermissionRequest"
 
 
 class SessionState(StrEnum):

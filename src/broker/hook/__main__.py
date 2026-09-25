@@ -17,27 +17,57 @@ import json
 import os
 import socket
 import sys
+import traceback
 import uuid
 from typing import Any, cast
 
-from broker.protocol.constants import (
-    ASK_DECISION_ANSWER,
-    DECISION_ALLOW,
-    HOOK_WAIT_SECONDS,
-    MAX_LINE_BYTES,
-    PROTOCOL_VERSION,
-    T_ASK_QUESTION,
-    T_HOOK_EVENT,
-    T_PERMISSION_REQUEST,
-)
 
-ASK_USER_QUESTION = "AskUserQuestion"
+def _record_failure(text: str) -> None:
+    """Append a hook failure to the log file named by ``BROKER_HOOK_LOG``.
+
+    Args:
+        text: The failure text to append.
+    """
+    # Spelled as a literal, not the constant: this must still work when
+    # broker.protocol.constants itself is what failed to import.
+    log_path = os.environ.get("BROKER_HOOK_LOG")
+    if not log_path:
+        return
+    try:
+        with open(
+            log_path, "a", encoding="utf-8", errors="backslashreplace"
+        ) as log_file:
+            log_file.write(text)
+    except OSError:
+        pass
+
+
+try:
+    from broker.protocol.constants import (
+        ASK_DECISION_ANSWER,
+        ASK_USER_QUESTION,
+        DECISION_ALLOW,
+        ENV_BROKER_SOCKET,
+        HOOK_WAIT_SECONDS,
+        HookEventName,
+        MAX_LINE_BYTES,
+        T_ASK_QUESTION,
+        T_HOOK_EVENT,
+        T_PERMISSION_REQUEST,
+    )
+except Exception:
+    # Exit-0 degradation is for the hook entrypoint; an importer (the closure
+    # tests) must still see the failure.
+    if __name__ != "__main__":
+        raise
+    _record_failure(traceback.format_exc())
+    sys.exit(0)
 
 # PermissionRequest's own nested shape. Claude Code validates it and treats
 # PreToolUse's flat permissionDecision shape here as if nothing was printed.
 _ALLOW_OUTPUT = {
     "hookSpecificOutput": {
-        "hookEventName": "PermissionRequest",
+        "hookEventName": HookEventName.PERMISSION_REQUEST,
         "decision": {"behavior": "allow", "message": "broker approved"},
     }
 }
@@ -79,32 +109,30 @@ def main() -> None:
     if not isinstance(raw_payload, dict):
         return
     payload = cast(dict[str, Any], raw_payload)
-    sock_path = os.environ.get("BROKER_SOCKET")
+    sock_path = os.environ.get(ENV_BROKER_SOCKET)
     if not sock_path:
         return  # isolation gate
 
     event = payload.get("hook_event_name")
-    if event == "PreToolUse" and payload.get("tool_name") != ASK_USER_QUESTION:
+    if (
+        event == HookEventName.PRE_TOOL_USE
+        and payload.get("tool_name") != ASK_USER_QUESTION
+    ):
         # PreToolUse fires on every tool call. Returning here — above the
         # socket — is what keeps ordinary tool calls free of any broker cost:
         # no connection, no wait. The decision path is PermissionRequest.
         return
 
     timeout = _timeout_seconds()
-    blocking = event in ("PermissionRequest", "PreToolUse")
+    blocking = event in (HookEventName.PERMISSION_REQUEST, HookEventName.PRE_TOOL_USE)
 
-    if event == "PermissionRequest":
+    if event == HookEventName.PERMISSION_REQUEST:
         envelope = {
-            "v": PROTOCOL_VERSION,
             "id": uuid.uuid4().hex,
             "type": T_PERMISSION_REQUEST,
-            "session_id": payload.get("session_id"),
             "payload": {
                 "tool_name": payload.get("tool_name", ""),
                 "tool_input": payload.get("tool_input", {}),
-                "cwd": payload.get("cwd", ""),
-                "transcript_path": payload.get("transcript_path", ""),
-                "permission_mode": payload.get("permission_mode"),
                 # Forwarded verbatim: this process is stdlib-only, so the
                 # broker owns validating the arms.
                 "permission_suggestions": payload.get(
@@ -112,12 +140,10 @@ def main() -> None:
                 ),
             },
         }
-    elif event == "PreToolUse":
+    elif event == HookEventName.PRE_TOOL_USE:
         envelope = {
-            "v": PROTOCOL_VERSION,
             "id": uuid.uuid4().hex,
             "type": T_ASK_QUESTION,
-            "session_id": payload.get("session_id"),
             "payload": {
                 "tool_input": payload.get("tool_input", {}),
                 "tool_use_id": payload.get("tool_use_id", ""),
@@ -125,10 +151,8 @@ def main() -> None:
         }
     else:
         envelope = {
-            "v": PROTOCOL_VERSION,
             "id": uuid.uuid4().hex,
             "type": T_HOOK_EVENT,
-            "session_id": payload.get("session_id"),
             "payload": {"hook_event_name": event, "raw": payload},
         }
 
@@ -141,16 +165,19 @@ def main() -> None:
 
         line = _read_line(sock, timeout)
         if line is None:
+            _record_failure(f"{event}: reply closed early or over the line cap\n")
             return
         raw_reply: Any = json.loads(line)
         if not isinstance(raw_reply, dict):
+            _record_failure(f"{event}: reply is not a JSON object\n")
             return
         raw_decision: Any = cast(dict[str, Any], raw_reply).get("payload")
         if not isinstance(raw_decision, dict):
+            _record_failure(f"{event}: reply payload is not a JSON object\n")
             return
         decision_payload = cast(dict[str, Any], raw_decision)
 
-        if event == "PermissionRequest":
+        if event == HookEventName.PERMISSION_REQUEST:
             if decision_payload.get("decision") == DECISION_ALLOW:
                 # The sanctioned stdout write for permissions. Anything but an
                 # explicit allow (escalated / malformed / timeout) prints
@@ -163,12 +190,13 @@ def main() -> None:
             return
         updated: Any = decision_payload.get("updated_input")
         if not isinstance(updated, dict):
+            _record_failure(f"{event}: answer carries no updated_input object\n")
             return
         print(
             json.dumps(
                 {
                     "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
+                        "hookEventName": HookEventName.PRE_TOOL_USE,
                         "permissionDecision": "allow",
                         "permissionDecisionReason": "broker answered",
                         "updatedInput": updated,
@@ -182,5 +210,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        pass  # ALWAYS — degradation, never breakage
+        # ALWAYS — degradation, never breakage.
+        _record_failure(traceback.format_exc())
     sys.exit(0)

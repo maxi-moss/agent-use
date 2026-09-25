@@ -7,13 +7,15 @@ registration.
 """
 
 import json
+import shlex
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
-from broker.claude.atomic import atomic_update_json
+from broker.atomic_json import atomic_update_json
 from broker.claude.paths import settings_path
-from broker.protocol.constants import HOOK_SETTINGS_TIMEOUT
+from broker.protocol.constants import ENV_BROKER_SOCKET, HOOK_SETTINGS_TIMEOUT
 
 # Substring of our hook command used to identify OUR entries during repair.
 BROKER_HOOK_MARKER = "broker-hook"
@@ -26,6 +28,21 @@ _RULE_LISTS = ("allow", "ask", "deny")
 class RepairReport:
     repaired_events: list[str] = field(default_factory=list[str])
     warnings: list[str] = field(default_factory=list[str])
+
+
+def broker_hook_command(python: str) -> str:
+    """Build the shell command Claude Code runs for every broker hook event.
+
+    Args:
+        python: Interpreter that runs ``broker.hook``.
+
+    Returns:
+        The command, carrying ``BROKER_HOOK_MARKER``.
+    """
+    return (
+        f'[ -n "${ENV_BROKER_SOCKET}" ] || exit 0; '
+        f"exec {shlex.quote(python)} -I -m broker.hook  # {BROKER_HOOK_MARKER}"
+    )
 
 
 def hook_entry(command: str) -> dict[str, Any]:
@@ -57,7 +74,7 @@ def _entry_is_ours(entry: Any) -> bool:
 
 
 def _ensure_registered(
-    data: dict[str, Any], events: list[str], command: str
+    data: dict[str, Any], events: Sequence[str], command: str
 ) -> list[str]:
     """Bring our entry for each event up to ``command``, adding it if absent.
 
@@ -92,6 +109,11 @@ def _ensure_registered(
         entries = cast(list[Any], raw_entries)
         desired = hook_entry(command)
         ours = [i for i, entry in enumerate(entries) if _entry_is_ours(entry)]
+        # Never register a SECOND PreToolUse hook that can match
+        # AskUserQuestion, in any scope: when two PreToolUse hooks match one
+        # call and a sibling returns "ask", Claude Code silently drops the
+        # first hook's updatedInput and an approval executes the ORIGINAL
+        # input — the broker's injected answers die without an error.
         if not ours:
             entries.append(desired)
             added.append(event)
@@ -102,32 +124,6 @@ def _ensure_registered(
             entries[i] = desired
         added.append(event)
     return added
-
-
-def register_hooks(
-    events: list[str], command: str, path: Path | None = None
-) -> None:
-    """Register our hook entry for ``events`` in Claude Code's settings.
-
-    Never register a SECOND PreToolUse hook that can match AskUserQuestion,
-    in any scope: when two PreToolUse hooks match one call and a sibling
-    returns "ask", Claude Code silently drops the first hook's updatedInput
-    and an approval executes the ORIGINAL input — the broker's injected
-    answers die without an error.
-
-    Args:
-        events: Hook event names to register under.
-        command: Hook command to install; must contain ``BROKER_HOOK_MARKER``.
-        path: Settings file to update; defaults to user-level ``settings.json``.
-    """
-    target = path if path is not None else settings_path()
-
-    def mutate(data: dict[str, Any]) -> dict[str, Any]:
-        """Add any missing entries to the settings object."""
-        _ensure_registered(data, events, command)
-        return data
-
-    atomic_update_json(target, mutate)
 
 
 def write_session_permissions(path: Path, rules: dict[str, Any]) -> None:
@@ -153,17 +149,17 @@ def write_session_permissions(path: Path, rules: dict[str, Any]) -> None:
         data["permissions"] = permissions
         return data
 
-    atomic_update_json(path, mutate)
+    atomic_update_json(path, mutate, backup=False)
 
 
 def verify_and_repair(
-    events: list[str],
+    events: Sequence[str],
     command: str,
     path: Path | None = None,
     *,
     shadow_candidates: list[Path] | None = None,
 ) -> RepairReport:
-    """Re-add any broker hook entries missing from the settings file.
+    """Register the broker hook entry for each event, repairing any that drifted.
 
     Args:
         events: Hook event names that must carry our entry.
@@ -178,14 +174,15 @@ def verify_and_repair(
     report = RepairReport()
 
     def mutate(data: dict[str, Any]) -> dict[str, Any]:
-        """Add any missing entries, recording which events were repaired."""
+        """Add or rewrite our entries, recording which events changed."""
         report.repaired_events = _ensure_registered(data, events, command)
         return data
 
-    atomic_update_json(target, mutate)
+    atomic_update_json(target, mutate, backup=True)
     if report.repaired_events:
         report.warnings.append(
-            f"re-registered broker hook entries for {report.repaired_events}"
+            "wrote broker hook entries (first registration, changed command "
+            f"or repair) for {report.repaired_events}"
         )
     # Settings scopes REPLACE the whole hooks array per event, they don't
     # merge — a project-level file defining an event without our marker
@@ -196,7 +193,7 @@ def verify_and_repair(
 
 
 def _check_shadow(
-    candidate: Path, events: list[str], report: RepairReport
+    candidate: Path, events: Sequence[str], report: RepairReport
 ) -> None:
     """Warn when ``candidate`` shadows our registration for any of ``events``.
 

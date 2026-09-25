@@ -19,7 +19,11 @@ from typing import Any, cast
 
 import pytest
 
-from broker.protocol.constants import HOOK_SETTINGS_TIMEOUT, HOOK_WAIT_SECONDS
+from broker.protocol.constants import (
+    ENV_BROKER_HOOK_LOG,
+    HOOK_SETTINGS_TIMEOUT,
+    HOOK_WAIT_SECONDS,
+)
 
 EXPECTED_ALLOW = {
     "hookSpecificOutput": {
@@ -115,7 +119,6 @@ class _StubHandler(socketserver.StreamRequestHandler):
         server.received.append(envelope)
         if server.mode == "allow":
             reply = {
-                "v": 1,
                 "id": envelope["id"],
                 "type": "response",
                 "ok": True,
@@ -123,7 +126,6 @@ class _StubHandler(socketserver.StreamRequestHandler):
             }
         elif server.mode == "escalated":
             reply = {
-                "v": 1,
                 "id": envelope["id"],
                 "type": "response",
                 "ok": True,
@@ -131,7 +133,6 @@ class _StubHandler(socketserver.StreamRequestHandler):
             }
         elif server.mode == "ask_answer":
             reply = {
-                "v": 1,
                 "id": envelope["id"],
                 "type": "response",
                 "ok": True,
@@ -142,12 +143,14 @@ class _StubHandler(socketserver.StreamRequestHandler):
             }
         elif server.mode == "ask_escalated":
             reply = {
-                "v": 1,
                 "id": envelope["id"],
                 "type": "response",
                 "ok": True,
                 "payload": {"decision": "escalated"},
             }
+        elif server.mode == "malformed":
+            self.wfile.write(b"[]\n")
+            return
         else:  # "mute": hold the connection open, never reply
             time.sleep(1.0)
             return
@@ -176,11 +179,15 @@ def run_hook(
     payload: dict[str, Any],
     sock_path: Path | None,
     timeout_override: str | None = "5",
+    hook_log: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env.pop("BROKER_SOCKET", None)
+    env.pop(ENV_BROKER_HOOK_LOG, None)
     if sock_path is not None:
         env["BROKER_SOCKET"] = str(sock_path)
+    if hook_log is not None:
+        env[ENV_BROKER_HOOK_LOG] = str(hook_log)
     if timeout_override is not None:
         env["BROKER_HOOK_TIMEOUT"] = timeout_override
     return subprocess.run(
@@ -236,9 +243,8 @@ def test_askuserquestion_answer_prints_flat_shape(sock_dir: Path) -> None:
         assert json.loads(lines[0]) == EXPECTED_ASK_ANSWER
         assert len(stub.received) == 1
         env = stub.received[0]
-        assert env["v"] == 1
         assert env["type"] == "ask_question"
-        assert env["session_id"] == "sess-1"
+        assert "session_id" not in env
         assert env["payload"] == {
             "tool_input": {"questions": [{"question": "which one?"}]},
             "tool_use_id": "toolu_ask_1",
@@ -279,15 +285,11 @@ def test_permission_request_allow_prints_nested_shape(sock_dir: Path) -> None:
         # envelope that reached the broker
         assert len(stub.received) == 1
         env = stub.received[0]
-        assert env["v"] == 1
         assert env["type"] == "permission_request"
-        assert env["session_id"] == "sess-1"
+        assert "session_id" not in env
         assert env["payload"] == {
             "tool_name": "Bash",
             "tool_input": {"command": "rm -rf build", "description": "clean"},
-            "cwd": "/private/tmp/x",
-            "transcript_path": "/private/tmp/x/t.jsonl",
-            "permission_mode": "default",
             "permission_suggestions": [
                 {"type": "addDirectories", "directories": ["/private/tmp/x"]}
             ],
@@ -315,6 +317,20 @@ def test_timeout_prints_nothing_exits_zero(sock_dir: Path) -> None:
         assert proc.returncode == 0
         assert proc.stdout == ""
         assert elapsed < 2.0
+
+
+def test_malformed_reply_records_one_line_and_prints_nothing(
+    sock_dir: Path,
+) -> None:
+    sock_path = sock_dir / "broker.sock"
+    hook_log = sock_dir / "hook.log"
+    with start_stub(sock_path, "malformed"):
+        proc = run_hook(PERMISSION_REQUEST_PAYLOAD, sock_path, hook_log=hook_log)
+    assert proc.returncode == 0
+    assert proc.stdout == ""
+    lines = hook_log.read_text().splitlines()
+    assert len(lines) == 1
+    assert "PermissionRequest" in lines[0]
 
 
 def test_unreachable_socket_exits_zero(sock_dir: Path) -> None:

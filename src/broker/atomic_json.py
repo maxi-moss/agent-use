@@ -5,6 +5,7 @@ rule). Refuses to overwrite a file that fails JSON validation — a corrupted
 settings file is the developer's to inspect, never ours to clobber.
 """
 
+import copy
 import json
 import os
 import tempfile
@@ -20,17 +21,20 @@ class AtomicWriteError(Exception):
 def atomic_update_json(
     path: Path,
     mutate: Callable[[dict[str, Any]], dict[str, Any]],
-    backup_suffix: str = ".broker-backup",
+    *,
+    backup: bool,
 ) -> dict[str, Any]:
     """Apply ``mutate`` to the JSON object at ``path``, atomically.
 
     Args:
         path: JSON file to update.
-        mutate: Receives the current object and returns the object to write.
-        backup_suffix: Suffix for the pre-write backup file.
+        mutate: Receives a copy of the current object and returns the object
+            to write.
+        backup: Whether to keep the pre-write bytes beside ``path`` as
+            ``<name>.broker-backup``.
 
     Returns:
-        The object that was written.
+        The object at ``path`` after the update.
 
     Raises:
         AtomicWriteError: The file is not a JSON object, or ``mutate`` did not
@@ -52,13 +56,15 @@ def atomic_update_json(
             )
         data = cast(dict[str, Any], parsed)
 
-    updated = mutate(dict(data))
+    updated = mutate(copy.deepcopy(data))
     if not isinstance(updated, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
         raise AtomicWriteError("mutate() must return a dict")
+    if original_bytes is not None and updated == data:
+        return updated
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    if original_bytes is not None:
-        backup_path = path.with_name(path.name + backup_suffix)
+    if backup and original_bytes is not None:
+        backup_path = path.with_name(path.name + ".broker-backup")
         backup_path.write_bytes(original_bytes)
 
     fd, temp_name = tempfile.mkstemp(

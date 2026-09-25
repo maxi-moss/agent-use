@@ -1,16 +1,16 @@
 """Pre-seed folder trust in ~/.claude.json.
 
 The trust key is UNDOCUMENTED — verified only by observation on 2.1.220.
-Re-verify on every Claude Code upgrade before trusting VALIDATED_AGAINST here.
+Re-verify on every Claude Code upgrade before trusting TRUST_KEY_VALIDATED_AGAINST.
 """
 
 from pathlib import Path
 from typing import Any, cast
 
-from broker.claude.atomic import AtomicWriteError, atomic_update_json
+from broker.atomic_json import AtomicWriteError, atomic_update_json
 from broker.claude.paths import claude_json_path
 
-VALIDATED_AGAINST = "2.1.220"
+TRUST_KEY_VALIDATED_AGAINST = "2.1.220"
 
 
 def seed_trust(project_path: Path, path: Path | None = None) -> None:
@@ -46,4 +46,4 @@ def seed_trust(project_path: Path, path: Path | None = None) -> None:
         cast(dict[str, Any], raw_project)["hasTrustDialogAccepted"] = True
         return data
 
-    atomic_update_json(target, mutate)
+    atomic_update_json(target, mutate, backup=True)
