@@ -6,10 +6,10 @@ permission path of every tool call in every supervised session.
 
 from enum import StrEnum
 
-PROTOCOL_VERSION = 1
 MAX_LINE_BYTES = 1_048_576  # 1 MiB; observed real max 857 KiB (2026-07-27 survey)
 
 ENV_BROKER_SOCKET = "BROKER_SOCKET"
+ENV_BROKER_HOOK_LOG = "BROKER_HOOK_LOG"
 
 # Claude Code's own tool name — NOT one of our wire-protocol constants above.
 ASK_USER_QUESTION = "AskUserQuestion"

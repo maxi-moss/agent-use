@@ -34,7 +34,9 @@ def _record_failure(text: str) -> None:
     if not log_path:
         return
     try:
-        with open(log_path, "a") as log_file:
+        with open(
+            log_path, "a", encoding="utf-8", errors="backslashreplace"
+        ) as log_file:
             log_file.write(text)
     except OSError:
         pass
@@ -49,7 +51,6 @@ try:
         HOOK_WAIT_SECONDS,
         HookEventName,
         MAX_LINE_BYTES,
-        PROTOCOL_VERSION,
         T_ASK_QUESTION,
         T_HOOK_EVENT,
         T_PERMISSION_REQUEST,
@@ -127,16 +128,11 @@ def main() -> None:
 
     if event == HookEventName.PERMISSION_REQUEST:
         envelope = {
-            "v": PROTOCOL_VERSION,
             "id": uuid.uuid4().hex,
             "type": T_PERMISSION_REQUEST,
-            "session_id": payload.get("session_id"),
             "payload": {
                 "tool_name": payload.get("tool_name", ""),
                 "tool_input": payload.get("tool_input", {}),
-                "cwd": payload.get("cwd", ""),
-                "transcript_path": payload.get("transcript_path", ""),
-                "permission_mode": payload.get("permission_mode"),
                 # Forwarded verbatim: this process is stdlib-only, so the
                 # broker owns validating the arms.
                 "permission_suggestions": payload.get(
@@ -146,10 +142,8 @@ def main() -> None:
         }
     elif event == HookEventName.PRE_TOOL_USE:
         envelope = {
-            "v": PROTOCOL_VERSION,
             "id": uuid.uuid4().hex,
             "type": T_ASK_QUESTION,
-            "session_id": payload.get("session_id"),
             "payload": {
                 "tool_input": payload.get("tool_input", {}),
                 "tool_use_id": payload.get("tool_use_id", ""),
@@ -157,10 +151,8 @@ def main() -> None:
         }
     else:
         envelope = {
-            "v": PROTOCOL_VERSION,
             "id": uuid.uuid4().hex,
             "type": T_HOOK_EVENT,
-            "session_id": payload.get("session_id"),
             "payload": {"hook_event_name": event, "raw": payload},
         }
 
@@ -173,12 +165,15 @@ def main() -> None:
 
         line = _read_line(sock, timeout)
         if line is None:
+            _record_failure(f"{event}: reply closed early or over the line cap\n")
             return
         raw_reply: Any = json.loads(line)
         if not isinstance(raw_reply, dict):
+            _record_failure(f"{event}: reply is not a JSON object\n")
             return
         raw_decision: Any = cast(dict[str, Any], raw_reply).get("payload")
         if not isinstance(raw_decision, dict):
+            _record_failure(f"{event}: reply payload is not a JSON object\n")
             return
         decision_payload = cast(dict[str, Any], raw_decision)
 
@@ -195,6 +190,7 @@ def main() -> None:
             return
         updated: Any = decision_payload.get("updated_input")
         if not isinstance(updated, dict):
+            _record_failure(f"{event}: answer carries no updated_input object\n")
             return
         print(
             json.dumps(
@@ -214,5 +210,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        pass  # ALWAYS — degradation, never breakage
+        # ALWAYS — degradation, never breakage.
+        _record_failure(traceback.format_exc())
     sys.exit(0)

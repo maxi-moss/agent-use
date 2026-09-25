@@ -57,6 +57,7 @@ from broker.protocol.constants import (
     ASK_USER_QUESTION,
     DECISION_ALLOW,
     DECISION_ESCALATED,
+    ENV_BROKER_HOOK_LOG,
     ENV_BROKER_SOCKET,
     HookEventName,
     NACK_STALE_PROPOSAL,
@@ -471,7 +472,10 @@ class SessionBroker:
             cfg.anchor_pane,
             direction="right",
             cwd=Path(cfg.cwd),
-            env={ENV_BROKER_SOCKET: cfg.socket_path},
+            env={
+                ENV_BROKER_SOCKET: cfg.socket_path,
+                ENV_BROKER_HOOK_LOG: str(self._paths.session_hook_log(cfg.name)),
+            },
             focus=False,
             timeout_s=15.0,
         )

@@ -18,7 +18,7 @@ from broker.claude.settings import (
     verify_and_repair,
     write_session_permissions,
 )
-from broker.protocol.constants import ENV_BROKER_SOCKET
+from broker.protocol.constants import ENV_BROKER_HOOK_LOG, ENV_BROKER_SOCKET
 
 COMMAND = "/usr/bin/env python3 -m broker.hook  # broker-hook"
 EVENTS = ["PreToolUse", "Stop", "SessionStart"]
@@ -182,7 +182,11 @@ def _run_hook_command(
     env_socket: str | None, cwd: Path
 ) -> subprocess.CompletedProcess[str]:
     """Run the registered hook command under ``sh`` with an empty payload."""
-    env = {k: v for k, v in os.environ.items() if k != ENV_BROKER_SOCKET}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in (ENV_BROKER_SOCKET, ENV_BROKER_HOOK_LOG)
+    }
     if env_socket is not None:
         env[ENV_BROKER_SOCKET] = env_socket
     return subprocess.run(

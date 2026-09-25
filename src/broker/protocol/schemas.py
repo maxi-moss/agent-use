@@ -10,7 +10,6 @@ from typing import Annotated, Any, ClassVar, Literal
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from broker.protocol.constants import (
-    PROTOCOL_VERSION,
     T_APPROVE_PROMPT,
     T_ASK_QUESTION,
     T_BUDGET_UPDATE,
@@ -44,7 +43,6 @@ from broker.protocol.constants import (
 class Envelope(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    v: int = PROTOCOL_VERSION
     id: str  # uuid4 hex
     type: str
     session_id: str | None = None
@@ -54,7 +52,6 @@ class Envelope(BaseModel):
 class Response(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    v: int = PROTOCOL_VERSION
     id: str  # reuses request id
     type: Literal["response"] = "response"
     ok: bool
@@ -103,9 +100,6 @@ class PermissionRequestPayload(WireMessage):
 
     tool_name: str
     tool_input: dict[str, Any]
-    cwd: str
-    transcript_path: str
-    permission_mode: str | None = None
     permission_suggestions: list[PermissionSuggestion] = Field(
         default_factory=list[PermissionSuggestion]
     )
@@ -139,7 +133,7 @@ class AskQuestionDecisionPayload(BaseModel):
 
 
 class HookEventPayload(WireMessage):
-    """Fire-and-forget wrapper for every non-PreToolUse hook event."""
+    """Fire-and-forget wrapper for every hook event except PreToolUse and PermissionRequest."""
 
     MESSAGE_TYPE = T_HOOK_EVENT
     model_config = ConfigDict(extra="ignore")

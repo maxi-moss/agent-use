@@ -79,6 +79,10 @@ class BrokerPaths:
         """Append-only permission decision log for session ``name``."""
         return self.session_logs(name) / "permissions.ndjson"
 
+    def session_hook_log(self, name: str) -> Path:
+        """Failure log the hook client appends to for session ``name``."""
+        return self.session_logs(name) / "hook.log"
+
     @property
     def index_dir(self) -> Path:
         """Root of the per-repository code indexes."""
