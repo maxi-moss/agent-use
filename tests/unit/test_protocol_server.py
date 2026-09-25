@@ -38,17 +38,6 @@ class RecordingHandler:
         return Response(id=env.id, ok=True, payload={"echo": env.payload})
 
 
-class SilentHandler:
-    """Returns no response — the fire-and-forget message classes."""
-
-    def __init__(self) -> None:
-        self.received: list[Envelope] = []
-
-    async def __call__(self, env: Envelope) -> Response | None:
-        self.received.append(env)
-        return None
-
-
 @pytest.fixture
 async def echo_server(sock_dir: Path) -> AsyncIterator[tuple[Path, RecordingHandler]]:
     handler = RecordingHandler()
@@ -97,22 +86,6 @@ async def test_rebind_unlinks_stale_socket(sock_dir: Path) -> None:
     try:
         resp = await client.request(sock_path, make_envelope(), timeout_s=5.0)
         assert resp.ok is True
-    finally:
-        server.close()
-        await server.wait_closed()
-
-
-async def test_notify_is_fire_and_forget(sock_dir: Path) -> None:
-    handler = SilentHandler()
-    sock_path = sock_dir / "s.sock"
-    server = await serve_unix(sock_path, handler)
-    try:
-        env = make_envelope()
-        await client.notify(sock_path, env)  # returns without reading a reply
-        async with asyncio.timeout(5.0):
-            while not handler.received:
-                await asyncio.sleep(0.01)
-        assert handler.received == [env]
     finally:
         server.close()
         await server.wait_closed()

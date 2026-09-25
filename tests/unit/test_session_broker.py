@@ -2,6 +2,7 @@
 fake llm_call, scripted driver.subprocess.run, stub master recording envelopes."""
 
 import asyncio
+import contextlib
 import json
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ from broker.permission import PermissionModule
 from broker.permission.llm import ToolCall as PermissionToolCall
 from broker.protocol import client
 from broker.protocol.constants import (
+    MAX_LINE_BYTES,
     NACK_PROTOCOL_VIOLATION,
     NACK_WRONG_STATE,
     T_APPROVE_PROMPT,
@@ -363,6 +365,21 @@ def hook_env(name: str, raw_extra: dict[str, Any]) -> Envelope:
     )
 
 
+async def _notify(path: Path, env: Envelope, *, timeout_s: float = 5.0) -> None:
+    """Send one envelope without reading a reply."""
+    async with asyncio.timeout(timeout_s):
+        _, writer = await asyncio.open_unix_connection(
+            str(path), limit=MAX_LINE_BYTES
+        )
+        try:
+            writer.write(env.model_dump_json().encode() + b"\n")
+            await writer.drain()
+        finally:
+            writer.close()
+            with contextlib.suppress(OSError, ConnectionError):
+                await writer.wait_closed()
+
+
 def permission_env(tool_name: str, tool_input: dict[str, Any]) -> Envelope:
     return Envelope(
         id=uuid.uuid4().hex,
@@ -611,7 +628,7 @@ async def ground_and_approve(h: Harness, *, count: int, prompt: str) -> None:
 
 async def launch(h: Harness) -> None:
     """Walk the launch sequence to the driving state."""
-    await client.notify(
+    await _notify(
         h.sock,
         hook_env(
             "SessionStart",
@@ -623,7 +640,7 @@ async def launch(h: Harness) -> None:
 
 async def complete(h: Harness) -> None:
     """Drive one turn boundary to the completed state."""
-    await client.notify(
+    await _notify(
         h.sock, hook_env("Stop", {"last_assistant_message": "all done"})
     )
     await h.llm.results.put(
@@ -741,15 +758,15 @@ async def test_get_permission_log_round_trip(harness: Harness) -> None:
 async def test_hook_events_reach_module(harness: Harness) -> None:
     spy = harness.spy_permission()
     await launch(harness)
-    await client.notify(
+    await _notify(
         harness.sock,
         hook_env(
             "PostToolUse",
             {"tool_name": "Bash", "tool_input": {"command": "ls"}},
         ),
     )
-    await client.notify(harness.sock, hook_env("UserPromptSubmit", {}))
-    await client.notify(harness.sock, hook_env("SessionEnd", {}))
+    await _notify(harness.sock, hook_env("UserPromptSubmit", {}))
+    await _notify(harness.sock, hook_env("SessionEnd", {}))
     await wait_state(harness.broker, "stopped")
     assert spy.notes == [
         "tool_completed:Bash:{'command': 'ls'}",
@@ -762,7 +779,7 @@ async def test_session_end_reports_terminal_and_exits(
     harness: Harness,
 ) -> None:
     await launch(harness)
-    await client.notify(harness.sock, hook_env("SessionEnd", {}))
+    await _notify(harness.sock, hook_env("SessionEnd", {}))
     # The developer ran /exit: the broker reports the terminal end to the
     # master so the session leaves the fleet...
     await harness.master.wait_for(T_SESSION_ENDED)
@@ -773,7 +790,7 @@ async def test_session_end_reports_terminal_and_exits(
 
 
 async def test_launch_failure_is_reported_to_the_master(harness: Harness) -> None:
-    await client.notify(
+    await _notify(
         harness.sock,
         hook_env(
             "SessionStart",
@@ -828,7 +845,7 @@ async def test_permission_prompt_notification_shows_up_on_status(
     harness: Harness,
 ) -> None:
     await launch(harness)
-    await client.notify(
+    await _notify(
         harness.sock,
         hook_env("Notification", {"notification_type": "permission_prompt"}),
     )
@@ -839,7 +856,7 @@ async def test_permission_prompt_notification_shows_up_on_status(
         timeout_s=5.0,
     )
     assert resp.payload["permission_prompt"] is True
-    await client.notify(
+    await _notify(
         harness.sock,
         hook_env("PostToolUse", {"tool_name": "Bash", "tool_input": {}}),
     )
@@ -856,7 +873,7 @@ async def test_task_activity_persists_across_pushes_and_status_probe(
     harness: Harness,
 ) -> None:
     await launch(harness)
-    await client.notify(
+    await _notify(
         harness.sock,
         hook_env("Stop", {"last_assistant_message": "Which auth provider?"}),
     )
@@ -871,7 +888,7 @@ async def test_task_activity_persists_across_pushes_and_status_probe(
     )
     assert resp.payload["task_activity"] == "wiring up oauth"
     # A later, unrelated push still carries the same task description.
-    await client.notify(
+    await _notify(
         harness.sock,
         hook_env("Notification", {"notification_type": "permission_prompt"}),
     )
@@ -895,7 +912,7 @@ async def test_stop_triggers_triage_and_answer_submits(
 ) -> None:
     await launch(harness)
     harness.run.calls.clear()
-    await client.notify(
+    await _notify(
         harness.sock,
         hook_env("Stop", {"last_assistant_message": "Which auth provider?"}),
     )
@@ -917,7 +934,7 @@ async def test_escalation_sent_then_broker_is_quiescent(
     harness: Harness,
 ) -> None:
     await launch(harness)
-    await client.notify(
+    await _notify(
         harness.sock, hook_env("Stop", {"last_assistant_message": "proceed how?"})
     )
     await harness.llm.results.put(ESCALATE_RESULT)
@@ -930,7 +947,7 @@ async def test_escalation_sent_then_broker_is_quiescent(
     await wait_state(harness.broker, "escalated")
     harness.run.calls.clear()
     # Further turn boundaries must not write to the pane (quiescence).
-    await client.notify(
+    await _notify(
         harness.sock, hook_env("Stop", {"last_assistant_message": "still here"})
     )
     await asyncio.sleep(0.2)
@@ -1056,11 +1073,11 @@ async def test_menu_answered_in_pane_retracts_and_resets_budget(
     harness.broker.budget_count = 3
     raised = await open_escalated_menu(harness)
     # A hook event before the answer lands leaves the escalation open.
-    await client.notify(harness.sock, hook_env("PostToolUse", {}))
+    await _notify(harness.sock, hook_env("PostToolUse", {}))
     await asyncio.sleep(0.1)
     assert harness.master.of_type(T_PANE_RETRACT) == []
     append_menu(harness, "toolu_open", answers={"Pick a color": "Red"})
-    await client.notify(harness.sock, hook_env("PostToolUse", {}))
+    await _notify(harness.sock, hook_env("PostToolUse", {}))
     retract = await harness.master.wait_for(T_PANE_RETRACT)
     assert retract.payload == {
         "escalation_id": raised.payload["escalation_id"],
@@ -1079,7 +1096,7 @@ async def test_rejected_menu_retracts(harness: Harness) -> None:
     await launch(harness)
     # The fixture transcript already records a REJECTED answer for this id.
     raised = await open_escalated_menu(harness, PENDING_ASK_ID)
-    await client.notify(harness.sock, hook_env("UserPromptSubmit", {}))
+    await _notify(harness.sock, hook_env("UserPromptSubmit", {}))
     retract = await harness.master.wait_for(T_PANE_RETRACT)
     assert retract.payload["escalation_id"] == raised.payload["escalation_id"]
     assert retract.payload["reason"] == "answered in pane"
@@ -1240,7 +1257,7 @@ async def test_ask_verified_on_matching_post_tool_use(harness: Harness) -> None:
         ask_question_env("toolu_new_1", COLOR_TOOL_INPUT),
         timeout_s=5.0,
     )
-    await client.notify(
+    await _notify(
         harness.sock,
         hook_env(
             "PostToolUse",
@@ -1272,7 +1289,7 @@ async def test_ask_verify_mismatch_escalates_without_auto_retract(
         ask_question_env("toolu_new_1", COLOR_TOOL_INPUT),
         timeout_s=5.0,
     )
-    await client.notify(
+    await _notify(
         harness.sock,
         hook_env(
             "PostToolUse",
@@ -1292,8 +1309,8 @@ async def test_ask_verify_mismatch_escalates_without_auto_retract(
     await wait_state(harness.broker, "escalated")
     # The answer already exists in the session; id-existence resolution would
     # self-retract this before the developer saw it. It must stay raised.
-    await client.notify(harness.sock, hook_env("PostToolUse", {}))
-    await client.notify(
+    await _notify(harness.sock, hook_env("PostToolUse", {}))
+    await _notify(
         harness.sock, hook_env("Stop", {"last_assistant_message": "moving on"})
     )
     await asyncio.sleep(0.2)
@@ -1325,7 +1342,7 @@ async def test_late_injected_answer_retracts_without_budget_reset(
     append_menu(
         harness, "toolu_backstop", answers={"Pick a color": "Blue (Recommended)"}
     )
-    await client.notify(harness.sock, hook_env("PostToolUse", {}))
+    await _notify(harness.sock, hook_env("PostToolUse", {}))
     retract = await harness.master.wait_for(T_PANE_RETRACT)
     assert retract.payload == {
         "escalation_id": escalation.payload["escalation_id"],
@@ -1401,8 +1418,8 @@ async def test_ask_verify_backstop_read_failure_escalates_without_auto_retract(
             )
             + "\n"
         )
-    await client.notify(harness.sock, hook_env("PostToolUse", {}))
-    await client.notify(
+    await _notify(harness.sock, hook_env("PostToolUse", {}))
+    await _notify(
         harness.sock, hook_env("Stop", {"last_assistant_message": "moving on"})
     )
     await asyncio.sleep(0.2)
@@ -1421,7 +1438,7 @@ async def test_stop_that_resolves_an_escalation_still_triages_its_turn(
     harness.run.calls.clear()
     append_user_prompt(harness, "use oauth, obviously")
     await harness.llm.results.put(ANSWER_RESULT)
-    await client.notify(
+    await _notify(
         harness.sock,
         hook_env("Stop", {"last_assistant_message": "Which auth provider?"}),
     )
@@ -1444,7 +1461,7 @@ async def test_stop_releases_an_answered_menu_before_triaging(
     await open_escalated_menu(harness, PENDING_ASK_ID)  # answered in the fixture
     harness.run.calls.clear()
     await harness.llm.results.put(ANSWER_RESULT)
-    await client.notify(
+    await _notify(
         harness.sock,
         hook_env("Stop", {"last_assistant_message": "Which auth provider?"}),
     )
@@ -1462,7 +1479,7 @@ async def test_dispatch_decision_submits_and_resets_budget(
     harness: Harness,
 ) -> None:
     await launch(harness)
-    await client.notify(
+    await _notify(
         harness.sock, hook_env("Stop", {"last_assistant_message": "proceed how?"})
     )
     await harness.llm.results.put(ESCALATE_RESULT)
@@ -1498,7 +1515,7 @@ async def test_dispatch_decision_submits_and_resets_budget(
 
 async def escalate_via_stop(h: Harness) -> str:
     """Drive one Stop through triage to a raised escalation; return its id."""
-    await client.notify(
+    await _notify(
         h.sock, hook_env("Stop", {"last_assistant_message": "proceed how?"})
     )
     await h.llm.results.put(ESCALATE_RESULT)
@@ -1576,7 +1593,7 @@ async def test_clarify_escalation_cancelled_by_retract(harness: Harness) -> None
             await asyncio.sleep(0.01)
     # The developer answers in the pane: this hook retracts.
     append_user_prompt(harness, "try B")
-    await client.notify(harness.sock, hook_env("UserPromptSubmit", {}))
+    await _notify(harness.sock, hook_env("UserPromptSubmit", {}))
     retract = await harness.master.wait_for(T_ESCALATION_RETRACT)
     assert retract.payload["escalation_id"] == escalation_id
     answer = await asking
@@ -1676,7 +1693,7 @@ async def test_budget_exhaustion_converts_answer_to_escalation(
     await launch(harness)
     harness.broker.budget_count = harness.cfg.budget_max
     harness.run.calls.clear()
-    await client.notify(
+    await _notify(
         harness.sock,
         hook_env("Stop", {"last_assistant_message": "Which auth provider?"}),
     )
@@ -1695,7 +1712,7 @@ async def test_budget_exhaustion_converts_answer_to_escalation(
 
 async def test_stop_failure_sends_fatal_error(harness: Harness) -> None:
     await launch(harness)
-    await client.notify(
+    await _notify(
         harness.sock,
         hook_env(
             "StopFailure",
@@ -1713,7 +1730,7 @@ async def test_transcript_parse_error_sends_fatal_error(
 ) -> None:
     await launch(harness)
     harness.transcript.write_text('{"broken json\n')
-    await client.notify(
+    await _notify(
         harness.sock, hook_env("Stop", {"last_assistant_message": "hi"})
     )
     fatal = await harness.master.wait_for(T_FATAL_ERROR)
@@ -1723,7 +1740,7 @@ async def test_transcript_parse_error_sends_fatal_error(
 
 async def test_retrieval_failure_is_fatal_not_a_proposal(harness: Harness) -> None:
     harness.retriever.raise_error = RetrievalError("no code index for /x; run …")
-    await client.notify(
+    await _notify(
         harness.sock,
         hook_env(
             "SessionStart",
@@ -1791,7 +1808,7 @@ async def test_resume_restores_completed(
 
 async def test_resume_budget_continues(resumed: Harness) -> None:
     await wait_state(resumed.broker, "driving")
-    await client.notify(
+    await _notify(
         resumed.sock,
         hook_env("Stop", {"last_assistant_message": "Which auth provider?"}),
     )
@@ -1819,7 +1836,7 @@ async def test_reactivate_grounds_new_task_and_supersedes_the_old_intent(
     assert harness.master.of_type(T_BUDGET_UPDATE)[-1].payload == {"count": 0}
     # The new approved prompt is the authoritative intent from here on;
     # triaging the second task against the first one's would misclassify it.
-    await client.notify(
+    await _notify(
         harness.sock, hook_env("Stop", {"last_assistant_message": "which format?"})
     )
     await harness.llm.results.put(ANSWER_RESULT)
@@ -1864,7 +1881,7 @@ async def test_rebound_session_is_pushed_without_a_state_change(
     rebound = harness.transcript.with_name("cc-2.jsonl")
     # /clear starts a new Claude session in the same pane; the master must
     # learn it or a later takeover adopts the old transcript.
-    await client.notify(
+    await _notify(
         harness.sock,
         hook_env(
             "SessionStart",
@@ -1884,7 +1901,7 @@ async def test_state_changes_push_live_status_with_activity(
     harness: Harness,
 ) -> None:
     h = harness
-    await client.notify(
+    await _notify(
         h.sock,
         hook_env(
             "SessionStart",
@@ -1910,7 +1927,7 @@ async def test_concurrent_phrases_both_appear_and_clear_independently(
     h = harness
     await launch(h)
     # Turn triage in flight on the serial event loop (empty LLM queue).
-    await client.notify(
+    await _notify(
         h.sock, hook_env("Stop", {"last_assistant_message": "which way?"})
     )
     await wait_live(h.master, lambda p: PHRASE_TRIAGE in p["activity"])
@@ -1948,7 +1965,7 @@ async def test_permission_prompt_notification_is_pushed(
     h = harness
     await launch(h)
     mark = len(h.master.received)
-    await client.notify(
+    await _notify(
         h.sock,
         hook_env("Notification", {"notification_type": "permission_prompt"}),
     )
@@ -1970,7 +1987,7 @@ async def test_failed_push_is_retried(
     h.master.fail_types.add(T_LIVE_STATUS)
     # Exactly one change after the scripted failure: only the retry can
     # deliver it.
-    await client.notify(
+    await _notify(
         h.sock,
         hook_env("Notification", {"notification_type": "permission_prompt"}),
     )
@@ -2009,9 +2026,9 @@ async def test_send_prompt_refused_while_a_native_prompt_is_open(
     assert "an AskUserQuestion menu" in resp.payload["error"]
     assert "w3:p2" in resp.payload["error"]
     append_menu(harness, "toolu_open", answers={"Pick a color": "Red"})
-    await client.notify(harness.sock, hook_env("PostToolUse", {}))
+    await _notify(harness.sock, hook_env("PostToolUse", {}))
     await harness.master.wait_for(T_PANE_RETRACT)
-    await client.notify(
+    await _notify(
         harness.sock,
         hook_env("Notification", {"notification_type": "permission_prompt"}),
     )
@@ -2081,7 +2098,7 @@ async def test_out_of_band_resolution_resets_the_budget(harness: Harness) -> Non
     harness.broker.budget_count = 4
     escalation_id = await escalate_via_stop(harness)
     append_user_prompt(harness, "go with a")
-    await client.notify(harness.sock, hook_env("UserPromptSubmit", {}))
+    await _notify(harness.sock, hook_env("UserPromptSubmit", {}))
     retract = await harness.master.wait_for(T_ESCALATION_RETRACT)
     assert retract.payload["escalation_id"] == escalation_id
     budget = await harness.master.wait_for(T_BUDGET_UPDATE)
@@ -2093,7 +2110,7 @@ async def test_out_of_band_resolution_resets_the_budget(harness: Harness) -> Non
 async def test_refused_decision_escalation_is_fatal(harness: Harness) -> None:
     await launch(harness)
     harness.master.nack_types.add(T_ESCALATION)
-    await client.notify(
+    await _notify(
         harness.sock, hook_env("Stop", {"last_assistant_message": "proceed how?"})
     )
     await harness.llm.results.put(ESCALATE_RESULT)
@@ -2118,7 +2135,7 @@ async def test_refused_question_escalation_keeps_the_picker_claimed(
     # The menu is still in the pane: nothing may be typed over it.
     assert (await send_prompt(harness, "hello")).ok is False
     append_menu(harness, "toolu_open", answers={"Pick a color": "Red"})
-    await client.notify(harness.sock, hook_env("PostToolUse", {}))
+    await _notify(harness.sock, hook_env("PostToolUse", {}))
     async with asyncio.timeout(5.0):
         while not (await send_prompt(harness, "hello")).ok:
             await asyncio.sleep(0.01)
@@ -2157,7 +2174,7 @@ async def test_permission_prompt_not_reported_while_a_menu_is_open(
     await launch(harness)
     await open_escalated_menu(harness)
     # The picker's own permission check can raise this notification.
-    await client.notify(
+    await _notify(
         harness.sock,
         hook_env("Notification", {"notification_type": "permission_prompt"}),
     )

@@ -8,6 +8,7 @@ serve_unix.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -30,6 +31,7 @@ from broker.permission import PermissionModule
 from broker.permission.llm import ToolCall as PermissionToolCall
 from broker.protocol import client
 from broker.protocol.constants import (
+    MAX_LINE_BYTES,
     T_APPROVE_PROMPT,
     T_BUDGET_UPDATE,
     T_COMPLETION,
@@ -223,6 +225,21 @@ def hook_env(name: str, raw_extra: dict[str, Any]) -> Envelope:
     )
 
 
+async def _notify(path: Path, env: Envelope, *, timeout_s: float = 5.0) -> None:
+    """Send one envelope without reading a reply."""
+    async with asyncio.timeout(timeout_s):
+        _, writer = await asyncio.open_unix_connection(
+            str(path), limit=MAX_LINE_BYTES
+        )
+        try:
+            writer.write(env.model_dump_json().encode() + b"\n")
+            await writer.drain()
+        finally:
+            writer.close()
+            with contextlib.suppress(OSError, ConnectionError):
+                await writer.wait_closed()
+
+
 async def wait_state(
     broker: SessionBroker, state: str, timeout: float = 5.0
 ) -> None:
@@ -337,7 +354,7 @@ async def _teardown(h: Harness, master_server: "asyncio.Server") -> None:
 
 async def launch(h: Harness) -> None:
     """Walk the launch sequence to the driving state."""
-    await client.notify(
+    await _notify(
         h.sock,
         hook_env(
             "SessionStart",
@@ -524,7 +541,7 @@ async def test_full_loop_criteria_3_to_8(
 
     # ── prose question → autonomous answer, logged ────────────────────────────
     h.run.calls.clear()
-    await client.notify(
+    await _notify(
         h.sock,
         hook_env("Stop", {"last_assistant_message": "Which auth provider?"}),
     )
@@ -542,7 +559,7 @@ async def test_full_loop_criteria_3_to_8(
     assert "grounded" in log_resp.payload["text"]  # rationale recorded
 
     # ── question → full structured escalation ─────────────────────────────────
-    await client.notify(
+    await _notify(
         h.sock, hook_env("Stop", {"last_assistant_message": "proceed how?"})
     )
     await h.llm.results.put(ESCALATE_RESULT)
@@ -588,13 +605,13 @@ async def test_full_loop_criteria_3_to_8(
 
     # ── budget exhaustion converts answer into handover ───────────────────────
     for i in range(2):  # budget_max=2 autonomous answers
-        await client.notify(
+        await _notify(
             h.sock,
             hook_env("Stop", {"last_assistant_message": f"question {i}?"}),
         )
         await h.llm.results.put(ANSWER_RESULT)
         await h.master.wait_for(T_BUDGET_UPDATE, count=3 + i)
-    await client.notify(
+    await _notify(
         h.sock,
         hook_env("Stop", {"last_assistant_message": "one more question?"}),
     )
@@ -624,7 +641,7 @@ async def test_full_loop_criteria_3_to_8(
     await wait_state(h.broker, "driving")
 
     # ── completion detected; broker stops driving ─────────────────────────────
-    await client.notify(
+    await _notify(
         h.sock,
         hook_env("Stop", {"last_assistant_message": "All done."}),
     )

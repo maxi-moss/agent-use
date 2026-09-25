@@ -41,24 +41,3 @@ async def request(path: Path, env: Envelope, *, timeout_s: float) -> Response:
     if not line:
         raise ConnectionError(f"no reply from {path}")
     return Response.model_validate_json(line)
-
-
-async def notify(path: Path, env: Envelope, *, timeout_s: float = 5.0) -> None:
-    """Send one envelope without reading a reply.
-
-    Args:
-        path: Unix socket to connect to.
-        env: Envelope written as one NDJSON line.
-        timeout_s: Hard deadline covering connect and write together.
-    """
-    async with asyncio.timeout(timeout_s):
-        _, writer = await asyncio.open_unix_connection(
-            str(path), limit=MAX_LINE_BYTES
-        )
-        try:
-            writer.write(env.model_dump_json().encode() + b"\n")
-            await writer.drain()
-        finally:
-            writer.close()
-            with contextlib.suppress(OSError, ConnectionError):
-                await writer.wait_closed()
