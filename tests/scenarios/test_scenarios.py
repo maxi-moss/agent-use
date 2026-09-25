@@ -16,12 +16,10 @@ from broker.master.pane_escalations import PaneEscalations
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry
 from broker.master.runtime import MasterRuntime
-from broker.master.testmode import load_scenario, run_scenario
+from broker.master.testmode import SCENARIO_DIR, load_scenario, run_scenario
 from broker.master.testmode.schemas import Scenario
 
 pytestmark = pytest.mark.scenarios
-
-SCENARIOS_DIR = Path(__file__).parent
 
 
 @pytest.fixture
@@ -58,7 +56,7 @@ async def _run(
     rt: tuple[MasterRuntime, list[Any]], name: str
 ) -> None:
     runtime, posts = rt
-    scenario = load_scenario(SCENARIOS_DIR / f"{name}.json")
+    scenario = load_scenario(SCENARIO_DIR / f"{name}.json")
     report = await run_scenario(
         runtime, posts, scenario, paths=runtime.paths
     )
@@ -108,7 +106,7 @@ async def test_attach_refusal(rt: tuple[MasterRuntime, list[Any]]) -> None:
 
 
 def test_scenario_files_all_validate() -> None:
-    files = sorted(SCENARIOS_DIR.glob("*.json"))
+    files = sorted(SCENARIO_DIR.glob("*.json"))
     assert files, "no scenario files found"
     for path in files:
         Scenario.model_validate_json(path.read_text(encoding="utf-8"))

@@ -31,12 +31,11 @@ from broker.master.pane_escalations import PaneEscalations, PaneStoreError
 from broker.master.queue import EscalationQueue, QueueError
 from broker.master.registry import Registry
 from broker.master.runtime import reconcile_registry
-from broker.master.testmode import test_mode_llm_call
+from broker.master.testmode import SCENARIO_DIR, test_mode_llm_call
 from broker.master.tui.app import BrokerMasterApp
 
 TEST_MODE_ANCHOR = "%test-mode"
 TEST_MODE_WARNING = "TEST MODE — synthetic traffic only; LLM disabled"
-SCENARIOS_DIR = Path("tests/scenarios")
 
 # Core hook events plus observability extras
 EVENTS = [
@@ -146,7 +145,7 @@ def main() -> None:
         llm_call,
         anchor_pane=anchor,
         startup_warnings=warnings,
-        scenarios_dir=SCENARIOS_DIR if args.test_mode else None,
+        scenarios_dir=SCENARIO_DIR if args.test_mode else None,
     )
     app.run()
 
