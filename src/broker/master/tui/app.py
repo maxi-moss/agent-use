@@ -6,12 +6,11 @@ Structural rules encoded here:
 - The LLM turn runs under a worker with an explicit group ("llm"),
   exclusive=True, exit_on_error=False; the prompt box is re-enabled in
   on_worker_state_changed, never at the worker body's end.
-- The runtime emits renderer-neutral view events through ``_emit``; the app
+- The runtime emits renderer-neutral view events through the relay; the app
   wraps each in a ViewEventMessage and dispatches it to widgets. Prose fields
   are displayed verbatim (thin-master rule).
 """
 
-from pathlib import Path
 from typing import cast
 
 from rich.text import Text
@@ -20,14 +19,9 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import RichLog
 from textual.worker import Worker, WorkerState
 
-from broker.config import BrokerConfig
-from broker.llm import LLMCaller, TurnResult
 from broker.master.llm import MasterLLM
-from broker.master.pane_escalations import PaneEscalations
-from broker.master.queue import EscalationQueue
-from broker.master.registry import Registry
 from broker.master.runtime import MasterRuntime
-from broker.master.testmode import load_scenario, run_scenario, scenario_names
+from broker.master.testmode import InjectCommand
 from broker.master.tui.chat_log import ChatMessage, ThinkingIndicator
 from broker.master.tui.fleet import FLEET_WIDTH, FleetSidebar, SessionRowWidget
 from broker.master.tui.messages import LLMReply, ViewEventMessage
@@ -44,6 +38,7 @@ from broker.master.viewmodel import (
     PaneEscalationArrived,
     ProposalArrived,
     ViewEvent,
+    ViewEventRelay,
 )
 from broker.protocol.constants import PaneKind
 
@@ -68,25 +63,27 @@ class BrokerMasterApp(App[None]):
 
     def __init__(
         self,
-        cfg: BrokerConfig,
-        registry: Registry,
-        queue: EscalationQueue,
-        panes: PaneEscalations,
-        llm_call: LLMCaller[TurnResult],
+        runtime: MasterRuntime,
+        master_llm: MasterLLM,
+        relay: ViewEventRelay,
         *,
-        anchor_pane: str,
-        startup_warnings: list[str] | None = None,
-        scenarios_dir: Path | None = None,
+        startup_warnings: list[str],
+        inject: InjectCommand | None,
     ) -> None:
+        """Attach the app to a built runtime and its master LLM.
+
+        Args:
+            runtime: The master runtime, not yet started.
+            master_llm: Runs the developer's turns.
+            relay: The runtime's event sink; the app connects its widgets to it.
+            startup_warnings: Lines shown in the activity log on mount.
+            inject: Test-mode command handler for ``/`` lines, or None.
+        """
         super().__init__()
-        self.cfg = cfg
-        self.registry = registry
-        self.startup_warnings = list(startup_warnings or [])
-        self.scenarios_dir = scenarios_dir
-        # In test mode the runtime's events are teed into a capture the
-        # scenario runner reads its assertions from, while still reaching the
-        # widgets.
-        self._scenario_posts: list[ViewEvent] = []
+        self.runtime = runtime
+        self.master_llm = master_llm
+        self.startup_warnings = startup_warnings
+        self.inject = inject
         # Disclosures are held here, off the chat, until /escalation,
         # /permission, /question or /proposal pastes one in; FleetUpdated
         # prunes what is no longer live.
@@ -94,20 +91,10 @@ class BrokerMasterApp(App[None]):
         self._panes: dict[PaneKind, dict[str, str]] = {kind: {} for kind in PaneKind}
         self._proposals: dict[str, str] = {}
         self._last_view: FleetView | None = None
-        self.runtime = MasterRuntime(
-            self._emit, registry, queue, panes, cfg, anchor_pane=anchor_pane
-        )
-        self.master_llm = MasterLLM(llm_call, self.runtime, cfg)
+        relay.connect(self._post_view_event)
 
-    @property
-    def test_mode(self) -> bool:
-        """True when the app was given scenarios to drive instead of an LLM."""
-        return self.scenarios_dir is not None
-
-    def _emit(self, event: ViewEvent) -> None:
-        """Neutral sink handed to the runtime; pump the event through Textual."""
-        if self.test_mode:
-            self._scenario_posts.append(event)
+    def _post_view_event(self, event: ViewEvent) -> None:
+        """Pump one runtime view event through Textual."""
         self.post_message(ViewEventMessage(event))
 
     def compose(self) -> ComposeResult:
@@ -173,10 +160,15 @@ class BrokerMasterApp(App[None]):
             return
         box.disabled = True
         self._chat_block(text, role="user", label="you")
-        if self.test_mode and text.startswith("/"):
-            self._handle_command(text)
-            return
         self._show_thinking()
+        if self.inject is not None and self.inject.handles(text):
+            self.run_worker(
+                self._run_inject(self.inject, text),
+                group="scenario",
+                exclusive=True,
+                exit_on_error=False,
+            )
+            return
         self.run_worker(
             self._master_turn(text),
             group="llm",
@@ -184,59 +176,9 @@ class BrokerMasterApp(App[None]):
             exit_on_error=False,
         )
 
-    def _handle_command(self, text: str) -> None:
-        parts = text.split(maxsplit=1)
-        command = parts[0]
-        if command != "/inject":
-            self._finish_command(
-                f"unknown command {command!r}; available: /inject <name> "
-                f"where <name> is one of {', '.join(self._scenario_names())}"
-            )
-            return
-        if len(parts) < 2 or not parts[1].strip():
-            self._finish_command("usage: /inject <scenario>")
-            return
-        name = parts[1].strip()
-        self._chat_block(
-            f"running scenario: {name} "
-            "(some scenarios probe a live socket and take a few seconds)"
-        )
-        self.run_worker(
-            self._run_scenario(name),
-            group="scenario",
-            exclusive=True,
-            exit_on_error=False,
-        )
-
-    def _finish_command(self, text: str) -> None:
-        """Render a command outcome and free the box: no worker will run."""
-        self._chat_block(text)
-        self.query_one("#box", PromptArea).disabled = False
-
-    def _scenario_names(self) -> list[str]:
-        assert self.scenarios_dir is not None  # reached only in test mode
-        return scenario_names(self.scenarios_dir)
-
-    async def _run_scenario(self, name: str) -> None:
-        assert self.scenarios_dir is not None  # reached only in test mode
-        scenario = load_scenario(self.scenarios_dir / f"{name}.json")
-        report = await run_scenario(
-            self.runtime,
-            self._scenario_posts,
-            scenario,
-            paths=self.runtime.paths,
-        )
-        for result in report.results:
-            status = "PASS" if result.passed else "FAIL"
-            self._chat_block(
-                f"{status} [{result.index}] {result.op} — {result.detail}"
-            )
-        passed = sum(1 for r in report.results if r.passed)
-        summary = "PASS" if report.passed else "FAIL"
-        self._chat_block(
-            f"scenario {report.name}: {summary} "
-            f"({passed}/{len(report.results)} steps)"
-        )
+    async def _run_inject(self, inject: InjectCommand, text: str) -> None:
+        for line in await inject.run(text):
+            self._chat_block(line)
 
     async def _master_turn(self, text: str) -> None:
         reply = await self.master_llm.handle_developer_message(
