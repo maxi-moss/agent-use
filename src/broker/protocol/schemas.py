@@ -187,9 +187,6 @@ class StatusPayload(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     state: SessionState
-    pane_id: str | None = None
-    claude_session_id: str | None = None
-    transcript_path: str | None = None
     permission_prompt: bool = False
     task_activity: str = ""
     pending_proposal: PromptProposalPayload | None = None
@@ -380,3 +377,6 @@ class LiveStatusPayload(BaseModel):
     activity: str = ""  # active gerund phrases joined, "" when idle
     permission_prompt: bool = False
     task_activity: str = ""  # last per-turn task description; persists across turns
+    pane_id: str | None = None
+    claude_session_id: str | None = None
+    transcript_path: str | None = None

@@ -9,13 +9,11 @@ import pytest
 from pydantic import ValidationError
 
 from broker.protocol import constants
-from broker.protocol.constants import SessionState
 from broker.protocol.schemas import (
     AddDirectoriesSuggestion,
     PermissionDecisionPayload,
     PermissionEscalationPayload,
     PermissionRequestPayload,
-    StatusPayload,
 )
 
 COMPLETE_PERMISSION_ESCALATION: dict[str, Any] = {
@@ -49,21 +47,6 @@ def test_decision_literals_match_constants() -> None:
         constants.DECISION_ALLOW,
         constants.DECISION_ESCALATED,
     }
-
-
-def test_status_payload_extension_is_additive() -> None:
-    """Old-style state-only payloads must still validate."""
-    old = StatusPayload.model_validate({"state": "driving"})
-    assert old.pane_id is None
-    assert old.claude_session_id is None
-    assert old.transcript_path is None
-    new = StatusPayload(
-        state=SessionState.DRIVING,
-        pane_id="w3:p2",
-        claude_session_id="sess-1",
-        transcript_path="/private/tmp/t.jsonl",
-    )
-    assert StatusPayload.model_validate_json(new.model_dump_json()) == new
 
 
 def test_permission_pane_rejects_every_missing_field() -> None:

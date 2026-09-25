@@ -209,7 +209,6 @@ class StatusSession:
             ok=True,
             payload={
                 "state": self.state,
-                "pane_id": "w3:p2",
                 "permission_prompt": self.permission_prompt,
                 "task_activity": self.task_activity,
             },
@@ -746,6 +745,9 @@ async def test_list_sessions_reports_permission_prompt_flag(
     rt: tuple[MasterRuntime, list[Any]], home: Path
 ) -> None:
     runtime, _ = rt
+    assert (
+        await send(runtime, T_LIVE_STATUS, {"state": "driving", "pane_id": "w3:p2"})
+    ).ok
     stub = StatusSession(permission_prompt=True)
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
@@ -2309,6 +2311,49 @@ async def test_live_status_updates_state_activity_and_perm(
         runtime, T_LIVE_STATUS, {"state": "driving"}, session="ghost"
     )
     assert resp.ok
+
+
+async def test_live_status_persists_the_session_identity(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, _ = rt
+    identity = {
+        "pane_id": "w3:p2",
+        "claude_session_id": "cc-1",
+        "transcript_path": "/private/tmp/cc-1.jsonl",
+    }
+    assert (await send(runtime, T_LIVE_STATUS, {"state": "driving", **identity})).ok
+    # Persisted, not just held: a master restarted after its brokers died
+    # has only the registry file to adopt or reconcile from.
+    record = Registry.load(home / "registry.json").get("s1")
+    assert (record.pane_id, record.claude_session_id, record.transcript_path) == (
+        "w3:p2",
+        "cc-1",
+        "/private/tmp/cc-1.jsonl",
+    )
+    # A push that has not learned a field never erases what the registry holds.
+    assert (await send(runtime, T_LIVE_STATUS, {"state": "driving"})).ok
+    assert Registry.load(home / "registry.json").get("s1").pane_id == "w3:p2"
+    # /clear in a settled session binds a new Claude session: the absorbing
+    # guard that drops late state must not drop the new identity with it.
+    assert (
+        await send(runtime, T_COMPLETION, {"headline": "done", "supporting": "s"})
+    ).ok
+    assert (
+        await send(
+            runtime,
+            T_LIVE_STATUS,
+            {
+                "state": "completed",
+                **identity,
+                "claude_session_id": "cc-2",
+                "transcript_path": "/private/tmp/cc-2.jsonl",
+            },
+        )
+    ).ok
+    record = Registry.load(home / "registry.json").get("s1")
+    assert record.claude_session_id == "cc-2"
+    assert record.transcript_path == "/private/tmp/cc-2.jsonl"
 
 
 async def test_set_state_is_idempotent(

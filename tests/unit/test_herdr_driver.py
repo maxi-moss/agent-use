@@ -153,6 +153,31 @@ def test_agent_get_rejects_current(fake: Any) -> None:
     assert run.calls == []
 
 
+def test_agent_running_is_false_once_herdr_releases_the_name(fake: Any) -> None:
+    # herdr's answer both for a Claude that exited in a surviving shell and
+    # for a closed pane (verified against herdr 0.8.2).
+    fake(
+        stderr='{"error":{"code":"agent_not_found","message":"agent target '
+        's1 not found"},"id":"cli:agent:get"}',
+        returncode=1,
+    )
+    assert driver.agent_running("s1", timeout_s=5.0) is False
+
+
+def test_agent_running_is_true_while_herdr_knows_the_agent(fake: Any) -> None:
+    fake(stdout=(FIXTURES / "agent_get.json").read_text())
+    assert driver.agent_running("sess-a1", timeout_s=5.0) is True
+
+
+def test_agent_running_raises_when_the_answer_is_unknown(fake: Any) -> None:
+    fake(
+        stderr='{"error":{"code":"server_unavailable","message":"no server"}}',
+        returncode=1,
+    )
+    with pytest.raises(HerdrError):
+        driver.agent_running("s1", timeout_s=5.0)
+
+
 def test_agent_status_degrades_to_unknown() -> None:
     assert driver.agent_status({}) == "unknown"
     assert driver.agent_status({"agent": {"agent_status": "blocked"}}) == "blocked"
@@ -207,7 +232,6 @@ def test_no_public_api_emits_current(fake: Any) -> None:
     for call in (
         lambda: driver.agent_prompt("--current", "x", timeout_s=1.0),
         lambda: driver.pane_send_keys("--current", "enter", timeout_s=1.0),
-        lambda: driver.pane_read("--current", timeout_s=1.0),
         lambda: driver.pane_close("--current", timeout_s=1.0),
         lambda: driver.agent_wait("--current", until=["idle"], timeout_ms=1000),
         lambda: driver.pane_split(
@@ -246,16 +270,6 @@ def test_agent_name_validation(name: str, valid: bool, fake: Any) -> None:
             driver.agent_start(
                 name, kind="claude", pane_id="w3:p2", timeout_ms=1000
             )
-
-
-def test_pane_read_returns_plain_text(fake: Any) -> None:
-    run = fake(stdout="shell prompt $\n")
-    text = driver.pane_read("w3:p2", timeout_s=5.0)
-    assert text == "shell prompt $\n"
-    assert run.calls == [[
-        "herdr", "pane", "read", "w3:p2",
-        "--source", "visible", "--format", "text",
-    ]]
 
 
 def test_notification_show_argv(fake: Any) -> None:

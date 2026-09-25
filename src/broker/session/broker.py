@@ -323,7 +323,7 @@ class SessionBroker:
         self.state: SessionState = SessionState.SPAWNING
         self.pane_id: str | None = None
         self.claude_session_id: str | None = None
-        self.transcript_path: Path | None = None
+        self.transcript_path: str | None = None
         self.budget_count = cfg.budget_count
         self.intent = cfg.intent  # replaced outright on reactivation
         self.approved_prompt: str | None = None
@@ -424,7 +424,7 @@ class SessionBroker:
         """
         self.pane_id = adopt.pane_id
         self.claude_session_id = adopt.claude_session_id
-        self.transcript_path = Path(adopt.transcript_path)
+        self.transcript_path = adopt.transcript_path
         self.session_bound.set()
         self._log(
             DecisionKind.ADOPTED,
@@ -568,6 +568,9 @@ class SessionBroker:
                 activity=" · ".join(sorted(self._activity_phrases)),
                 permission_prompt=self._reports_permission_prompt(),
                 task_activity=self.task_activity,
+                pane_id=self.pane_id,
+                claude_session_id=self.claude_session_id,
+                transcript_path=self.transcript_path,
             )
             try:
                 await self._to_master(T_LIVE_STATUS, payload.model_dump())
@@ -1004,11 +1007,6 @@ class SessionBroker:
                 ok=True,
                 payload=StatusPayload(
                     state=self.state,
-                    pane_id=self.pane_id,
-                    claude_session_id=self.claude_session_id,
-                    transcript_path=(
-                        str(self.transcript_path) if self.transcript_path else None
-                    ),
                     permission_prompt=self._reports_permission_prompt(),
                     task_activity=self.task_activity,
                     pending_proposal=(
@@ -1110,14 +1108,15 @@ class SessionBroker:
             self.claude_session_id = session_id
         transcript = raw.get("transcript_path")
         if isinstance(transcript, str) and transcript:
-            self.transcript_path = Path(transcript)
+            self.transcript_path = transcript
         elif self.transcript_path is None and self.claude_session_id:
             # cwd derivation is the fallback, not an error.
-            self.transcript_path = (
+            self.transcript_path = str(
                 transcript_dir_for_cwd(Path(self.cfg.cwd))
                 / f"{self.claude_session_id}.jsonl"
             )
         self.session_bound.set()
+        self._status_dirty.set()
 
     # ── queued jobs ───────────────────────────────────────────────────────
 
@@ -1842,7 +1841,7 @@ class SessionBroker:
             raise FatalSessionError(
                 "transcript_unbound", "no transcript path bound"
             )
-        return read_cleaned(self.transcript_path)
+        return read_cleaned(Path(self.transcript_path))
 
     def _native_prompt(self) -> str | None:
         """Name the native prompt open in the pane, or ``None`` when there is none."""

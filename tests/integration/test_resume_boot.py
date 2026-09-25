@@ -25,7 +25,7 @@ from broker.config import (
     SessionBrokerConfig,
 )
 from broker.protocol import client
-from broker.protocol.constants import T_PROMPT_PROPOSAL, T_STATUS
+from broker.protocol.constants import T_LIVE_STATUS, T_PROMPT_PROPOSAL, T_STATUS
 from broker.protocol.schemas import Envelope, Response
 
 from broker.protocol.server import serve_unix
@@ -97,6 +97,16 @@ async def _poll_status(sock: Path) -> dict[str, Any]:
     raise AssertionError(f"broker never reported driving; last status: {last}")
 
 
+async def _wait_live_driving(master: StubMaster) -> dict[str, Any]:
+    """Wait for a driving live-status push to reach the stub master, bounded."""
+    for _ in range(100):
+        for env in master.of_type(T_LIVE_STATUS):
+            if env.payload.get("state") == "driving":
+                return env.payload
+        await asyncio.sleep(0.1)
+    raise AssertionError("no driving live-status push reached the master")
+
+
 async def test_resumed_broker_binds_and_answers_driving(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -119,10 +129,12 @@ async def test_resumed_broker_binds_and_answers_driving(
             env=env,
         )
         try:
-            status = await _poll_status(Path(cfg.socket_path))
-            # The resumed binding, exactly as the config carried it.
-            assert status["pane_id"] == "w9:p9"
-            assert status["claude_session_id"] == "cc-1"
+            await _poll_status(Path(cfg.socket_path))
+            # The resumed binding reaches the master exactly as the config
+            # carried it.
+            live = await _wait_live_driving(master)
+            assert live["pane_id"] == "w9:p9"
+            assert live["claude_session_id"] == "cc-1"
             # Resume never grounds: no proposal reached the master.
             assert master.of_type(T_PROMPT_PROPOSAL) == []
         finally:

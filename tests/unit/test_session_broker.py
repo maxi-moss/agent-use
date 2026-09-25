@@ -1749,14 +1749,12 @@ async def test_adopted_broker_takes_over_without_touching_the_pane(
     assert adopted.run.drive_calls() == [
         ["herdr", "agent", "prompt", "s1", "THE HANDOVER TASK"],
     ]
-    resp = await client.request(
-        adopted.sock,
-        Envelope(id=uuid.uuid4().hex, type=T_STATUS, session_id="s1"),
-        timeout_s=5.0,
+    await wait_live(
+        adopted.master,
+        lambda p: p["pane_id"] == ADOPTED_PANE
+        and p["claude_session_id"] == ADOPTED_SESSION
+        and p["transcript_path"] == str(adopted.transcript),
     )
-    assert resp.payload["pane_id"] == ADOPTED_PANE
-    assert resp.payload["claude_session_id"] == ADOPTED_SESSION
-    assert resp.payload["transcript_path"] == str(adopted.transcript)
 
 
 async def test_resume_skips_grounding(resumed: Harness) -> None:
@@ -1847,17 +1845,39 @@ async def test_reactivate_refused_while_a_task_is_still_running(
     assert harness.broker.state == "driving"
 
 
-async def test_status_answers_with_bound_identifiers(harness: Harness) -> None:
+async def test_live_status_carries_bound_identifiers(harness: Harness) -> None:
     await launch(harness)
-    resp = await client.request(
-        harness.sock,
-        Envelope(id=uuid.uuid4().hex, type=T_STATUS, session_id="s1"),
-        timeout_s=5.0,
+    await wait_live(
+        harness.master,
+        lambda p: p["state"] == "driving"
+        and p["pane_id"] == "w3:p2"
+        and p["claude_session_id"] == "cc-1"
+        and p["transcript_path"] == str(harness.transcript),
     )
-    assert resp.payload["state"] == "driving"
-    assert resp.payload["pane_id"] == "w3:p2"
-    assert resp.payload["claude_session_id"] == "cc-1"
-    assert resp.payload["transcript_path"] == str(harness.transcript)
+
+
+async def test_rebound_session_is_pushed_without_a_state_change(
+    harness: Harness,
+) -> None:
+    await launch(harness)
+    seen, _ = await wait_live(harness.master, lambda p: p["state"] == "driving")
+    rebound = harness.transcript.with_name("cc-2.jsonl")
+    # /clear starts a new Claude session in the same pane; the master must
+    # learn it or a later takeover adopts the old transcript.
+    await client.notify(
+        harness.sock,
+        hook_env(
+            "SessionStart",
+            {"session_id": "cc-2", "transcript_path": str(rebound)},
+        ),
+    )
+    _, p = await wait_live(
+        harness.master,
+        lambda p: p["claude_session_id"] == "cc-2",
+        after=seen + 1,
+    )
+    assert p["state"] == "driving"
+    assert p["transcript_path"] == str(rebound)
 
 
 async def test_state_changes_push_live_status_with_activity(

@@ -1,6 +1,6 @@
 """reconcile_registry classification harness: a real registry, queue and
-pane store on disk under /private/tmp, driver.pane_read monkeypatched, the live-broker case
-served by a real serve_unix socket."""
+pane store on disk under /private/tmp, driver.agent_running monkeypatched, the
+live-broker case served by a real serve_unix socket."""
 
 import asyncio
 import tempfile
@@ -48,6 +48,8 @@ def _registry_with_s1(
             anchor_pane="%1",
             state=SessionState.DRIVING,
             pane_id=pane_id,
+            claude_session_id="cc-1",
+            transcript_path="/private/tmp/cc-1.jsonl",
             approved_prompt=approved_prompt,
         )
     )
@@ -109,15 +111,49 @@ def _question_escalation(esc_id: str, session: str) -> QuestionEscalationPayload
     )
 
 
-def _fail_pane_read(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
-    def fake_pane_read(pane_id: str, *, timeout_s: float) -> str:
+def _agent_running(monkeypatch: pytest.MonkeyPatch, running: bool) -> None:
+    def fake_agent_running(name: str, *, timeout_s: float) -> bool:
+        return running
+
+    monkeypatch.setattr(driver, "agent_running", fake_agent_running)
+
+
+def _agent_probe_fails(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
+    def fake_agent_running(name: str, *, timeout_s: float) -> bool:
         raise exc
 
-    monkeypatch.setattr(driver, "pane_read", fake_pane_read)
+    monkeypatch.setattr(driver, "agent_running", fake_agent_running)
 
 
-async def test_live_broker_left_alone(home: Path) -> None:
+def _seed_escalations(home: Path) -> tuple[EscalationQueue, PaneEscalations]:
+    queue = _queue(home)
+    queue.accept(_broker_escalation("e1", "s1"))
+    panes = _panes(home)
+    panes.accept(_permission_pane("p1", "s1"))
+    panes.accept(_question_escalation("q1", "s1"))
+    return queue, panes
+
+
+def _assert_dropped(home: Path, registry: Registry, warnings: list[str]) -> None:
+    # Removed here and on reload, so it can never be handed back to the
+    # master as a routing candidate.
+    assert "s1" not in registry.records
+    assert "s1" not in Registry.load(home / "registry.json").records
+    # Every kind retracted from its PERSISTED store, so nothing the runtime
+    # re-announces on startup can belong to a dropped session.
+    assert _queue(home).depth == 0
+    assert _panes(home).entries == ()
+    retraction_lines = [w for w in warnings if "retracted" in w]
+    assert len(retraction_lines) == 3
+    for esc_id in ("e1", "p1", "q1"):
+        assert any(esc_id in w for w in retraction_lines)
+
+
+async def test_live_broker_left_alone(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     registry = _registry_with_s1(home)
+    _agent_probe_fails(monkeypatch, AssertionError("a live broker is not probed"))
 
     async def handler(env: Envelope) -> Response:
         return Response(id=env.id, ok=True)
@@ -133,15 +169,11 @@ async def test_live_broker_left_alone(home: Path) -> None:
     assert Registry.load(home / "registry.json").get("s1").state == "driving"
 
 
-async def test_live_pane_marked_unmanaged(
+async def test_live_claude_marked_unmanaged(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registry = _registry_with_s1(home)
-
-    def fake_pane_read(pane_id: str, *, timeout_s: float) -> str:
-        return "visible pane text"
-
-    monkeypatch.setattr(driver, "pane_read", fake_pane_read)
+    _agent_running(monkeypatch, True)
     warnings = await reconcile_registry(registry, _queue(home), _panes(home))
     assert len(warnings) == 1
     assert "unmanaged" in warnings[0]
@@ -149,7 +181,18 @@ async def test_live_pane_marked_unmanaged(
     assert Registry.load(home / "registry.json").get("s1").state == "unmanaged"
 
 
-async def test_dead_pane_removed_and_retracts(
+async def test_exited_claude_removed_and_retracts(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = _registry_with_s1(home)
+    queue, panes = _seed_escalations(home)
+    _agent_running(monkeypatch, False)
+    warnings = await reconcile_registry(registry, queue, panes)
+    _assert_dropped(home, registry, warnings)
+    assert any("no longer runs" in w for w in warnings)
+
+
+async def test_inconclusive_probe_never_removes(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registry = _registry_with_s1(home)
@@ -157,36 +200,9 @@ async def test_dead_pane_removed_and_retracts(
     queue.accept(_broker_escalation("e1", "s1"))
     panes = _panes(home)
     panes.accept(_permission_pane("p1", "s1"))
-    panes.accept(_question_escalation("q1", "s1"))
-    _fail_pane_read(monkeypatch, HerdrError("pane_not_found", "no such pane"))
+    _agent_probe_fails(monkeypatch, HerdrError("unknown", "herdr hiccup"))
     warnings = await reconcile_registry(registry, queue, panes)
-    # A session whose pane is gone is finished: removed here and on reload, so
-    # it can never be handed back to the master as a routing candidate.
-    assert "s1" not in registry.records
-    assert "s1" not in Registry.load(home / "registry.json").records
-    # Every kind retracted from its PERSISTED store, so nothing the runtime
-    # re-announces on startup can belong to a dead session.
-    assert _queue(home).depth == 0
-    assert _panes(home).entries == ()
-    retraction_lines = [w for w in warnings if "retracted" in w]
-    assert any("e1" in w for w in retraction_lines)
-    assert any("p1" in w for w in retraction_lines)
-    assert any("q1" in w for w in retraction_lines)
-    assert len(retraction_lines) == 3
-    assert any("gone — removed" in w for w in warnings)
-
-
-async def test_inconclusive_probe_never_marks_dead(
-    home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    registry = _registry_with_s1(home)
-    queue = _queue(home)
-    queue.accept(_broker_escalation("e1", "s1"))
-    panes = _panes(home)
-    panes.accept(_permission_pane("p1", "s1"))
-    _fail_pane_read(monkeypatch, HerdrError("unknown", "herdr hiccup"))
-    warnings = await reconcile_registry(registry, queue, panes)
-    # A wrong `unmanaged` costs the developer a glance; a wrong `dead` throws
+    # A wrong `unmanaged` costs the developer a glance; a wrong removal throws
     # away queued decisions and open prompts.
     assert Registry.load(home / "registry.json").get("s1").state == "unmanaged"
     assert _queue(home).depth == 1
@@ -195,23 +211,16 @@ async def test_inconclusive_probe_never_marks_dead(
     assert "herdr hiccup" in warnings[0]
 
 
-def test_missing_pane_id_marked_unmanaged(
+def test_live_claude_without_adoption_fields_removed(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registry = _registry_with_s1(home, pane_id=None)
-
-    def unexpected_pane_read(pane_id: str, *, timeout_s: float) -> str:
-        raise AssertionError("no pane probe should be attempted")
-
-    monkeypatch.setattr(driver, "pane_read", unexpected_pane_read)
+    queue, panes = _seed_escalations(home)
+    _agent_running(monkeypatch, True)
     # Run through asyncio.run on a fresh loop, exactly as main() does before
     # the TUI builds its own.
-    warnings = asyncio.run(
-        reconcile_registry(registry, _queue(home), _panes(home))
-    )
-    assert len(warnings) == 1
-    # The probe-was-attempted failure would read "inconclusive" here, because
-    # the inconclusive branch absorbs the AssertionError.
-    assert "never learned its pane" in warnings[0]
-    assert "unmanaged" in warnings[0]
-    assert Registry.load(home / "registry.json").get("s1").state == "unmanaged"
+    warnings = asyncio.run(reconcile_registry(registry, queue, panes))
+    # Neither attach_session nor reassign_session can ever take it over, so
+    # keeping it only turns every recovery attempt into the same refusal.
+    _assert_dropped(home, registry, warnings)
+    assert any("no broker can take it over" in w and "pane_id" in w for w in warnings)

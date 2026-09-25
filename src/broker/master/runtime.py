@@ -35,7 +35,6 @@ from broker.config import (
     SessionBrokerConfig,
 )
 from broker.herdr import driver
-from broker.herdr.driver import HerdrError
 from broker.paths import BrokerPaths
 from broker.master import notifier
 from broker.master.outcome import SessionOutcome, build_outcome
@@ -138,7 +137,7 @@ CLARIFY_ESCALATION_TIMEOUT_S = 60.0
 STOP_WAIT_S = 10.0
 SOCKET_POLL_S = 0.1
 SOCKET_PROBE_TIMEOUT_S = 2.0
-PANE_PROBE_TIMEOUT_S = 5.0
+AGENT_PROBE_TIMEOUT_S = 5.0
 
 # Stands in for a pane the registry cannot name. A pane escalation is still
 # worth surfacing without it: the developer knows the session.
@@ -223,27 +222,60 @@ def _adoption_fields(record: SessionRecord) -> AdoptedSession:
     )
 
 
+def _drop_from_fleet(
+    registry: Registry,
+    queue: EscalationQueue,
+    panes: PaneEscalations,
+    name: str,
+) -> list[str]:
+    """Remove a session no broker can drive again, retracting its escalations.
+
+    Args:
+        registry: Session registry; the removal persists on its own.
+        queue: Persisted escalation queue.
+        panes: Persisted pane escalations.
+        name: Session to drop.
+
+    Returns:
+        One line per retracted escalation.
+    """
+    lines: list[str] = []
+    queued = queue.retract_for_session(name)
+    if queued is not None:
+        lines.append(
+            f"session {name}: queued escalation {queued.escalation_id} "
+            "retracted — no decision can reach it"
+        )
+    for prompt in panes.retract_for_session(name):
+        lines.append(
+            f"session {name}: {prompt.kind} escalation "
+            f"{prompt.escalation_id} retracted — no broker will see it closed"
+        )
+    registry.remove(name)
+    return lines
+
+
 async def reconcile_registry(
     registry: Registry,
     queue: EscalationQueue,
     panes: PaneEscalations,
 ) -> list[str]:
-    """Classify every registry session at startup, retracting for dead ones.
+    """Classify every registry session at startup, dropping finished ones.
 
-    Probes are client-side connects and pane reads only — nothing is spawned
-    and nothing binds a socket. A session whose pane is definitively gone is
-    removed and its queued escalation and open pane escalations are
-    retracted; every other outcome leaves the session recoverable. An
-    inconclusive probe never removes a session — a wrong ``unmanaged`` costs
-    the developer a glance, a wrong removal throws away queued decisions.
+    Probes are client-side connects and herdr reads only — nothing is spawned
+    and nothing binds a socket. A session with no answering broker is dropped
+    once its Claude Code no longer runs, or when the registry lacks what a
+    replacement broker needs to adopt it. An inconclusive probe never drops a
+    session — a wrong ``unmanaged`` costs the developer a glance, a wrong
+    removal throws away queued decisions.
 
     Args:
-        registry: Loaded session registry; a gone session is removed, every
+        registry: Loaded session registry; a dropped session is removed, every
             other classification updates its state in place and is saved once.
-        queue: Persisted escalation queue; a dead session's queued
+        queue: Persisted escalation queue; a dropped session's queued
             escalation is retracted from it before the TUI re-announces
             the head.
-        panes: Persisted pane escalations; a dead session's open ones are
+        panes: Persisted pane escalations; a dropped session's open ones are
             retracted before the TUI re-announces what remains.
 
     Returns:
@@ -257,56 +289,37 @@ async def reconcile_registry(
                 f"session {name}: broker still answering — left as-is"
             )
             continue
-        if not record.pane_id:
-            record.state = SessionState.UNMANAGED
-            warnings.append(
-                f"session {name}: nothing answers its socket and the "
-                "registry never learned its pane — marked unmanaged"
-            )
-            continue
         try:
-            await asyncio.to_thread(
-                driver.pane_read, record.pane_id, timeout_s=PANE_PROBE_TIMEOUT_S
+            running = await asyncio.to_thread(
+                driver.agent_running, name, timeout_s=AGENT_PROBE_TIMEOUT_S
             )
-        except HerdrError as exc:
-            if exc.code == "pane_not_found":
-                warnings.append(
-                    f"session {name}: pane {record.pane_id} gone — removed"
-                )
-                queued = queue.retract_for_session(name)
-                if queued is not None:
-                    warnings.append(
-                        f"session {name}: queued escalation "
-                        f"{queued.escalation_id} retracted — the session "
-                        "is dead and no decision can reach it"
-                    )
-                for prompt in panes.retract_for_session(name):
-                    warnings.append(
-                        f"session {name}: {prompt.kind} escalation "
-                        f"{prompt.escalation_id} retracted — its pane and "
-                        "prompt are gone"
-                    )
-                # A session whose pane is gone is finished: drop it so it can
-                # never be a routing candidate. remove() persists on its own.
-                registry.remove(name)
-                continue
-            record.state = SessionState.UNMANAGED
-            warnings.append(
-                f"session {name}: pane probe inconclusive ({exc}) — "
-                "marked unmanaged"
-            )
-            continue
         except Exception as exc:
             record.state = SessionState.UNMANAGED
             warnings.append(
-                f"session {name}: pane probe inconclusive ({exc!r}) — "
+                f"session {name}: agent probe inconclusive ({exc!r}) — "
                 "marked unmanaged"
             )
             continue
+        if not running:
+            warnings.append(
+                f"session {name}: Claude Code no longer runs — it exited or "
+                "its pane closed; removed"
+            )
+            warnings.extend(_drop_from_fleet(registry, queue, panes, name))
+            continue
+        try:
+            _adoption_fields(record)
+        except ValueError as exc:
+            warnings.append(
+                f"session {name}: Claude Code still runs but no broker can "
+                f"take it over ({exc}) — removed; its pane is left untouched"
+            )
+            warnings.extend(_drop_from_fleet(registry, queue, panes, name))
+            continue
         record.state = SessionState.UNMANAGED
         line = (
-            f"session {name}: pane alive with nothing driving it — marked "
-            "unmanaged; recover it with attach_session"
+            f"session {name}: Claude Code alive with nothing driving it — "
+            "marked unmanaged; recover it with attach_session"
         )
         if record.approved_prompt is None:
             line += (
@@ -683,6 +696,10 @@ class MasterRuntime:
         if env.type == T_LIVE_STATUS:
             p = LiveStatusPayload.model_validate(env.payload)
             rec = self.registry.records.get(name)
+            if rec is not None:
+                # Outside the absorbing guard: /clear in a settled session
+                # binds a new Claude session id.
+                self._note_identity(rec, p)
             # A settled/gone session ignores late pushes: absorbing states are
             # left only by a master-initiated boundary write, never by a stale
             # in-flight push arriving after the fact (cross-connection sends
@@ -1339,7 +1356,7 @@ class MasterRuntime:
         return f"prompt accepted by session {session_id}"
 
     async def probe_status(self, session_id: str) -> StatusPayload:
-        """Ask a session for its status and fold the reply into the registry.
+        """Ask a session for its status and record the state it reports.
 
         Args:
             session_id: Registry name of the session to probe.
@@ -1351,13 +1368,6 @@ class MasterRuntime:
         env = self._env(T_STATUS, {})
         resp = await client.request(socket_path, env, timeout_s=REQUEST_TIMEOUT_S)
         status = StatusPayload.model_validate(resp.payload)
-        record = self.registry.get(session_id)
-        record.pane_id = status.pane_id or record.pane_id
-        record.claude_session_id = (
-            status.claude_session_id or record.claude_session_id
-        )
-        record.transcript_path = status.transcript_path or record.transcript_path
-        self.registry.upsert(record)
         self._set_state(session_id, status.state)
         self._note_task_activity(session_id, status.task_activity)
         return status
@@ -1521,7 +1531,7 @@ class MasterRuntime:
             if status.permission_prompt:
                 lines.append(
                     f"- {name}: sitting on a permission prompt, answered in "
-                    f"pane {status.pane_id or PANE_UNKNOWN}"
+                    f"pane {self.pane_of(name)}"
                 )
         return "\n".join(lines)
 
@@ -1707,6 +1717,22 @@ class MasterRuntime:
         self.emit(SessionStatusChanged(name, state))
         self._publish_fleet()
         return True
+
+    def _note_identity(self, record: SessionRecord, p: LiveStatusPayload) -> None:
+        """Persist the pane, Claude session and transcript a broker reports."""
+        pane_id = p.pane_id or record.pane_id
+        claude_session_id = p.claude_session_id or record.claude_session_id
+        transcript_path = p.transcript_path or record.transcript_path
+        if (pane_id, claude_session_id, transcript_path) == (
+            record.pane_id,
+            record.claude_session_id,
+            record.transcript_path,
+        ):
+            return
+        record.pane_id = pane_id
+        record.claude_session_id = claude_session_id
+        record.transcript_path = transcript_path
+        self.registry.upsert(record)
 
     def _note_task_activity(self, name: str, text: str) -> None:
         """Show ``text`` as a live session's task activity; a settled session shows none."""

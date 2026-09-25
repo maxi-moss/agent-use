@@ -7,6 +7,8 @@ Rules encoded here, verified against herdr 0.7.5:
 - No public API accepts or emits `--current`.
 - Exit 1 + stderr JSON -> HerdrError(code, message); exit 2 -> RuntimeError (our bug).
 - Trust `herdr status --json` .server.compatible, never `herdr --version`.
+- An agent's name is released once its Claude exits or its pane closes; the
+  pane itself survives an exit as a plain shell (verified against herdr 0.8.2).
 """
 
 import json
@@ -304,6 +306,28 @@ def agent_status(info: dict[str, Any]) -> str:
     return "unknown"
 
 
+def agent_running(name: str, *, timeout_s: float) -> bool:
+    """Report whether the Claude started as agent ``name`` is still running.
+
+    Args:
+        name: Agent name given to :func:`agent_start`.
+        timeout_s: Wall-clock limit for the subprocess.
+
+    Returns:
+        ``False`` once herdr has released the name, otherwise ``True``.
+
+    Raises:
+        HerdrError: herdr failed any other way, so the answer is unknown.
+    """
+    try:
+        agent_get(name, timeout_s=timeout_s)
+    except HerdrError as exc:
+        if exc.code == "agent_not_found":
+            return False
+        raise
+    return True
+
+
 def agent_prompt(target: str, text: str, *, timeout_s: float) -> None:
     """Type ``text`` into an agent's input box, submitting it.
 
@@ -368,26 +392,6 @@ def agent_wait(
     if isinstance(parsed, dict):
         return cast(dict[str, Any], parsed)
     return {}
-
-
-def pane_read(pane_id: str, *, timeout_s: float) -> str:
-    """Read the visible contents of a pane as plain text, not JSON.
-
-    Args:
-        pane_id: Pane to read.
-        timeout_s: Wall-clock limit for the subprocess.
-
-    Returns:
-        The visible text of the pane.
-
-    Raises:
-        ValueError: ``pane_id`` looks like a flag.
-    """
-    _check_identifier(pane_id, "pane id")
-    return _run(
-        [HERDR, "pane", "read", pane_id, "--source", "visible", "--format", "text"],
-        timeout_s,
-    )
 
 
 def pane_close(pane_id: str, *, timeout_s: float) -> None:
