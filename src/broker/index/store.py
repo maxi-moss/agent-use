@@ -22,6 +22,16 @@ from broker.index.schemas import (
     Symbol,
     SymbolKey,
     SymbolKind,
+    split_qualified_name,
+)
+
+EMBEDDABLE_KINDS: tuple[SymbolKind, ...] = (
+    SymbolKind.FUNCTION,
+    SymbolKind.METHOD,
+    SymbolKind.CLASS,
+)
+_EMBEDDABLE_KINDS_SQL = (
+    "(" + ", ".join(f"'{kind.value}'" for kind in EMBEDDABLE_KINDS) + ")"
 )
 
 _SCHEMA = """
@@ -265,7 +275,7 @@ class IndexStore:
         """Return every function, method and class symbol, ordered by qualified name."""
         rows = self._conn.execute(
             f"SELECT {_SYMBOL_COLUMNS} FROM symbols "
-            "WHERE kind IN ('function', 'method', 'class') ORDER BY qualified_name"
+            f"WHERE kind IN {_EMBEDDABLE_KINDS_SQL} ORDER BY qualified_name"
         )
         return [_symbol_row(row) for row in rows]
 
@@ -275,7 +285,7 @@ class IndexStore:
         """Map each class to its methods' ``(name, signature)`` in source order."""
         out: dict[str, list[tuple[str, str]]] = {}
         for qname in class_qnames:
-            path, _, scope = qname.partition("::")
+            path, scope = split_qualified_name(qname)
             rows = self._conn.execute(
                 "SELECT name, signature FROM symbols "
                 "WHERE kind = 'method' AND path = ? AND scope = ? "
@@ -308,7 +318,7 @@ class IndexStore:
             self._conn.execute(
                 "DELETE FROM embeddings WHERE qualified_name NOT IN "
                 "(SELECT qualified_name FROM symbols "
-                "WHERE kind IN ('function', 'method', 'class'))"
+                f"WHERE kind IN {_EMBEDDABLE_KINDS_SQL})"
             )
 
     def load_vectors(self) -> list[tuple[str, array[float]]]:

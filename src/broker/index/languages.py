@@ -1,15 +1,17 @@
 """Per-language extraction tables.
 
 A ``LanguageSpec`` is data — which tree-sitter node types play which structural
-role and which field holds a name — plus the three hooks whose shape genuinely
-differs between grammars (imports, docstrings, base classes). ``extract`` holds
-the single walker; adding a language means adding a spec.
+role, which field holds a name, which names mean "self" inside a method, and
+how an import binding resolves to a file — plus the three hooks whose shape
+genuinely differs between grammars (imports, docstrings, base classes).
+``extract`` holds the single walker; adding a language means adding a spec.
 """
 
 import posixpath
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal
 
 import tree_sitter_javascript
 import tree_sitter_python
@@ -18,8 +20,12 @@ from tree_sitter import Language, Node
 
 from broker.index.schemas import Import
 
+ImportResolution = Literal["dotted_module", "file_path"]
+
 _DOTTED_RE = re.compile(r"^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$")
 _ECMA_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+_ECMA_INDEX_FILES = ("/index.ts", "/index.tsx", "/index.js", "/index.jsx")
+ECMA_MODULE_PROBES = _ECMA_EXTENSIONS + _ECMA_INDEX_FILES
 _NAME_NODE_TYPES = frozenset(
     {"identifier", "property_identifier", "type_identifier"}
 )
@@ -73,6 +79,8 @@ class LanguageSpec:
     annotation_nodes: frozenset[str]
     type_name_nodes: frozenset[str]
     decorator_node: str
+    self_names: frozenset[str]
+    import_resolution: ImportResolution
     imports: Callable[[Node, str], list[Import]]
     docstring: Callable[[Node, Node], str]
     bases: Callable[[Node], list[str]]
@@ -84,6 +92,17 @@ class LanguageSpec:
 def _python_package(path: str) -> list[str]:
     """Dotted package holding ``path``; the directory, for modules and __init__ alike."""
     return path[: -len(".py")].split("/")[:-1]
+
+
+def python_module_names(path: str) -> list[str]:
+    """Every dotted suffix that may name ``path`` as a module."""
+    dotted = path[: -len(".py")].replace("/", ".")
+    if dotted.endswith(".__init__"):
+        dotted = dotted[: -len(".__init__")]
+    elif dotted == "__init__":
+        return []
+    parts = dotted.split(".")
+    return [".".join(parts[i:]) for i in range(len(parts))]
 
 
 def _python_imports(node: Node, path: str) -> list[Import]:
@@ -319,6 +338,8 @@ PYTHON = LanguageSpec(
     annotation_nodes=frozenset({"type"}),
     type_name_nodes=frozenset({"identifier", "attribute"}),
     decorator_node="decorator",
+    self_names=frozenset({"self", "cls"}),
+    import_resolution="dotted_module",
     imports=_python_imports,
     docstring=_python_docstring,
     bases=_python_bases,
@@ -359,6 +380,8 @@ def _ecma(name: str, extensions: frozenset[str], language: Language) -> Language
         annotation_nodes=frozenset({"type_annotation"}),
         type_name_nodes=frozenset({"type_identifier", "nested_type_identifier"}),
         decorator_node="decorator",
+        self_names=frozenset({"this"}),
+        import_resolution="file_path",
         imports=_ecma_imports,
         docstring=_ecma_docstring,
         bases=_ecma_bases,
@@ -380,6 +403,7 @@ JAVASCRIPT = _ecma(
 )
 
 SPECS: tuple[LanguageSpec, ...] = (PYTHON, TYPESCRIPT, TSX, JAVASCRIPT)
+SPECS_BY_NAME: dict[str, LanguageSpec] = {spec.name: spec for spec in SPECS}
 
 
 def spec_for(path: str) -> LanguageSpec | None:

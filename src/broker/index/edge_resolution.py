@@ -11,7 +11,14 @@ indexed bases; then P's imports. Unresolved references are dropped.
 
 from collections import defaultdict, deque
 from collections.abc import Iterable
+from typing import assert_never
 
+from broker.index.languages import (
+    ECMA_MODULE_PROBES,
+    SPECS_BY_NAME,
+    LanguageSpec,
+    python_module_names,
+)
 from broker.index.schemas import (
     Edge,
     EdgeKind,
@@ -20,17 +27,12 @@ from broker.index.schemas import (
     Reference,
     SymbolKey,
     SymbolKind,
+    join_qualified_name,
+    split_qualified_name,
 )
 
-_PYTHON = "python"
-_PY_SELF = frozenset({"self", "cls"})
-_ECMA_SELF = frozenset({"this"})
 _CALL_TARGETS = frozenset({SymbolKind.FUNCTION, SymbolKind.METHOD, SymbolKind.CLASS})
 _TYPE_TARGETS = frozenset({SymbolKind.CLASS, SymbolKind.TYPE})
-_ECMA_PROBES = (
-    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
-    "/index.ts", "/index.tsx", "/index.js", "/index.jsx",
-)
 
 
 def resolve_edges(
@@ -53,17 +55,6 @@ def resolve_edges(
     return _Resolver(symbols, imports, languages).edges(references)
 
 
-def _python_module_names(path: str) -> list[str]:
-    """Every dotted suffix that may name ``path`` as a module."""
-    dotted = path[: -len(".py")].replace("/", ".")
-    if dotted.endswith(".__init__"):
-        dotted = dotted[: -len(".__init__")]
-    elif dotted == "__init__":
-        return []
-    parts = dotted.split(".")
-    return [".".join(parts[i:]) for i in range(len(parts))]
-
-
 class _Resolver:
     def __init__(
         self,
@@ -71,15 +62,17 @@ class _Resolver:
         imports: Iterable[Import],
         languages: dict[str, str],
     ) -> None:
-        self._languages = languages
+        self._specs: dict[str, LanguageSpec] = {
+            path: SPECS_BY_NAME[name] for path, name in languages.items()
+        }
         self._by_qname: dict[str, SymbolKey] = {}
         for symbol in symbols:
             self._by_qname[symbol.qualified_name] = symbol
         self._imports = {(i.path, i.local_name): i for i in imports}
         self._modules: dict[str, list[str]] = defaultdict(list)
-        for path, language in languages.items():
-            if language == _PYTHON:
-                for dotted in _python_module_names(path):
+        for path, spec in self._specs.items():
+            if spec.import_resolution == "dotted_module":
+                for dotted in python_module_names(path):
                     self._modules[dotted].append(path)
         self._bases: dict[str, list[str]] = defaultdict(list)
 
@@ -117,7 +110,7 @@ class _Resolver:
             if symbol.scope:
                 found.add(
                     (
-                        f"{symbol.path}::{symbol.scope}",
+                        join_qualified_name(symbol.path, symbol.scope),
                         symbol.qualified_name,
                         EdgeKind.DEFINES,
                     )
@@ -133,17 +126,17 @@ class _Resolver:
         self, source: str, target: str, kinds: frozenset[SymbolKind], *, hierarchy: bool
     ) -> str | None:
         """Resolve one as-written reference to a target symbol's qualified name, or ``None``."""
-        path, _, inner = source.partition("::")
+        path, inner = split_qualified_name(source)
         parts = target.split(".")
-        candidate = f"{path}::{target}"
+        candidate = join_qualified_name(path, target)
         if self._is(candidate, kinds):
             return candidate
-        self_names = _PY_SELF if self._languages.get(path) == _PYTHON else _ECMA_SELF
+        self_names = self._specs[path].self_names
         if hierarchy and len(parts) > 1 and parts[0] in self_names:
             owner_inner = self._owner_inner(source, inner)
             if owner_inner:
                 rest = ".".join(parts[1:])
-                for cls in self._hierarchy(f"{path}::{owner_inner}"):
+                for cls in self._hierarchy(join_qualified_name(path, owner_inner)):
                     candidate = f"{cls}.{rest}"
                     if self._is(candidate, kinds):
                         return candidate
@@ -175,23 +168,35 @@ class _Resolver:
 
     def _via_import(self, imp: Import, rest: list[str]) -> str | None:
         """Resolve an import binding plus a trailing member-access chain to a symbol or module."""
-        if self._languages.get(imp.path) == _PYTHON:
-            dotted = (
-                imp.module.split(".")
-                + ([imp.imported_name] if imp.imported_name else [])
-                + rest
-            )
-            for cut in range(len(dotted), 0, -1):
-                paths = self._modules.get(".".join(dotted[:cut]), [])
-                if len(paths) != 1:
-                    continue
-                remaining = dotted[cut:]
-                if not remaining:
-                    return paths[0]
-                candidate = f"{paths[0]}::{'.'.join(remaining)}"
-                return candidate if candidate in self._by_qname else None
-            return None
-        module_path = self._ecma_module_path(imp.module)
+        resolution = self._specs[imp.path].import_resolution
+        if resolution == "dotted_module":
+            return self._via_dotted_module(imp, rest)
+        elif resolution == "file_path":
+            return self._via_file_path(imp, rest)
+        else:
+            assert_never(resolution)
+
+    def _via_dotted_module(self, imp: Import, rest: list[str]) -> str | None:
+        """Resolve an import addressed by dotted module name to a symbol or module."""
+        dotted = (
+            imp.module.split(".")
+            + ([imp.imported_name] if imp.imported_name else [])
+            + rest
+        )
+        for cut in range(len(dotted), 0, -1):
+            paths = self._modules.get(".".join(dotted[:cut]), [])
+            if len(paths) != 1:
+                continue
+            remaining = dotted[cut:]
+            if not remaining:
+                return paths[0]
+            candidate = join_qualified_name(paths[0], ".".join(remaining))
+            return candidate if candidate in self._by_qname else None
+        return None
+
+    def _via_file_path(self, imp: Import, rest: list[str]) -> str | None:
+        """Resolve an import addressed by relative file path to a symbol or module."""
+        module_path = self._module_path(imp.module)
         if module_path is None:
             return None
         chain = (
@@ -199,15 +204,15 @@ class _Resolver:
         ) + rest
         if not chain:
             return module_path
-        candidate = f"{module_path}::{'.'.join(chain)}"
+        candidate = join_qualified_name(module_path, ".".join(chain))
         return candidate if candidate in self._by_qname else None
 
-    def _ecma_module_path(self, module: str) -> str | None:
-        """Resolve an ECMAScript module specifier to an indexed file path."""
-        if module in self._languages:
+    def _module_path(self, module: str) -> str | None:
+        """Resolve a relative module specifier to an indexed file path."""
+        if module in self._specs:
             return module
-        for probe in _ECMA_PROBES:
+        for probe in ECMA_MODULE_PROBES:
             candidate = module + probe
-            if candidate in self._languages:
+            if candidate in self._specs:
                 return candidate
         return None
