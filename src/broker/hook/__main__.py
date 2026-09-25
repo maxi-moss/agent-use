@@ -17,19 +17,47 @@ import json
 import os
 import socket
 import sys
+import traceback
 import uuid
 from typing import Any, cast
 
-from broker.protocol.constants import (
-    ASK_DECISION_ANSWER,
-    DECISION_ALLOW,
-    HOOK_WAIT_SECONDS,
-    MAX_LINE_BYTES,
-    PROTOCOL_VERSION,
-    T_ASK_QUESTION,
-    T_HOOK_EVENT,
-    T_PERMISSION_REQUEST,
-)
+
+def _record_failure(text: str) -> None:
+    """Append a hook failure to the log file named by ``BROKER_HOOK_LOG``.
+
+    Args:
+        text: The failure text to append.
+    """
+    # Spelled as a literal, not the constant: this must still work when
+    # broker.protocol.constants itself is what failed to import.
+    log_path = os.environ.get("BROKER_HOOK_LOG")
+    if not log_path:
+        return
+    try:
+        with open(log_path, "a") as log_file:
+            log_file.write(text)
+    except OSError:
+        pass
+
+
+try:
+    from broker.protocol.constants import (
+        ASK_DECISION_ANSWER,
+        DECISION_ALLOW,
+        HOOK_WAIT_SECONDS,
+        MAX_LINE_BYTES,
+        PROTOCOL_VERSION,
+        T_ASK_QUESTION,
+        T_HOOK_EVENT,
+        T_PERMISSION_REQUEST,
+    )
+except Exception:
+    # Exit-0 degradation is for the hook entrypoint; an importer (the closure
+    # tests) must still see the failure.
+    if __name__ != "__main__":
+        raise
+    _record_failure(traceback.format_exc())
+    sys.exit(0)
 
 ASK_USER_QUESTION = "AskUserQuestion"
 
