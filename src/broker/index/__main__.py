@@ -40,6 +40,7 @@ def main() -> None:
         _fail(str(exc))
     print(
         f"indexed {repo}: {summary.files_changed} files changed, "
+        f"{summary.files_removed} files removed, "
         f"{summary.symbols} symbols, {summary.edges} edges, "
         f"{summary.embedded} embedded"
     )

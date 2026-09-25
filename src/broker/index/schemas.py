@@ -137,14 +137,6 @@ class ContextSymbol(BaseModel):
     rank: float  # own score, or the best score among the seeds that pulled it in
 
 
-class ContextEdge(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    source: str
-    target: str
-    kind: EdgeKind
-
-
 class GroundingContext(BaseModel):
     """Seeds and their one-hop neighbourhood.
 
@@ -156,5 +148,5 @@ class GroundingContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     symbols: list[ContextSymbol]
-    edges: list[ContextEdge]
+    edges: list[Edge]
     imports: dict[str, list[str]]

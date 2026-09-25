@@ -9,7 +9,6 @@ from pathlib import Path
 
 from broker.index.embedding import Embedder
 from broker.index.schemas import (
-    ContextEdge,
     ContextSymbol,
     Edge,
     EdgeKind,
@@ -127,8 +126,6 @@ def _expand(store: IndexStore, seeds: dict[str, float]) -> GroundingContext:
     seed_paths = sorted({symbols[q].path for q in seeds if q in symbols})
     return GroundingContext(
         symbols=context_symbols,
-        edges=[
-            ContextEdge(source=e.source, target=e.target, kind=e.kind) for e in kept
-        ],
+        edges=kept,
         imports=store.import_edges(seed_paths),
     )

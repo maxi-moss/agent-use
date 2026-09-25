@@ -6,8 +6,8 @@ import pytest
 from broker.index import render
 from broker.index.render import fit_to_budget, render_relevant_code
 from broker.index.schemas import (
-    ContextEdge,
     ContextSymbol,
+    Edge,
     EdgeKind,
     GroundingContext,
     SymbolKind,
@@ -73,14 +73,14 @@ CONTEXT = GroundingContext(
         ),
     ],
     edges=[
-        ContextEdge(
+        Edge(
             source="a.py::Service", target="a.py::Service.send", kind=EdgeKind.DEFINES
         ),
-        ContextEdge(
+        Edge(
             source="a.py::Service.send", target="b.py::unrelated", kind=EdgeKind.CALLS
         ),
-        ContextEdge(source="b.py::make", target="a.py::Service", kind=EdgeKind.CALLS),
-        ContextEdge(
+        Edge(source="b.py::make", target="a.py::Service", kind=EdgeKind.CALLS),
+        Edge(
             source="a.py::Service", target="a.py::Base", kind=EdgeKind.INHERITS
         ),
     ],
