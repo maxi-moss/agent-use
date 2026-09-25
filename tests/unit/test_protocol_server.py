@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 
 from broker.protocol import client
-from broker.protocol.constants import T_STATUS
-from broker.protocol.schemas import Envelope, Response
+from broker.protocol.constants import T_SEND_PROMPT, T_STATUS
+from broker.protocol.schemas import Envelope, Response, SendPromptPayload
 from broker.protocol.server import serve_unix
 
 
@@ -38,17 +38,6 @@ class RecordingHandler:
         return Response(id=env.id, ok=True, payload={"echo": env.payload})
 
 
-class SilentHandler:
-    """Returns no response — the fire-and-forget message classes."""
-
-    def __init__(self) -> None:
-        self.received: list[Envelope] = []
-
-    async def __call__(self, env: Envelope) -> Response | None:
-        self.received.append(env)
-        return None
-
-
 @pytest.fixture
 async def echo_server(sock_dir: Path) -> AsyncIterator[tuple[Path, RecordingHandler]]:
     handler = RecordingHandler()
@@ -71,6 +60,23 @@ async def test_envelope_round_trip(
     assert resp.id == env.id
     assert resp.payload == {"echo": {"text": "hi"}}
     assert handler.received == [env]
+
+
+async def test_send_types_envelope_from_payload(
+    echo_server: tuple[Path, RecordingHandler],
+) -> None:
+    sock_path, handler = echo_server
+    resp = await client.send(
+        sock_path, SendPromptPayload(text="hi"), session_id="s1", timeout_s=5.0
+    )
+    assert resp.ok is True
+    (env,) = handler.received
+    assert resp.id == env.id
+    assert (env.type, env.session_id, env.payload) == (
+        T_SEND_PROMPT,
+        "s1",
+        {"text": "hi"},
+    )
 
 
 async def test_oversized_line_closes_connection_not_server(
@@ -102,22 +108,6 @@ async def test_rebind_unlinks_stale_socket(sock_dir: Path) -> None:
         await server.wait_closed()
 
 
-async def test_notify_is_fire_and_forget(sock_dir: Path) -> None:
-    handler = SilentHandler()
-    sock_path = sock_dir / "s.sock"
-    server = await serve_unix(sock_path, handler)
-    try:
-        env = make_envelope()
-        await client.notify(sock_path, env)  # returns without reading a reply
-        async with asyncio.timeout(5.0):
-            while not handler.received:
-                await asyncio.sleep(0.01)
-        assert handler.received == [env]
-    finally:
-        server.close()
-        await server.wait_closed()
-
-
 async def test_request_timeout_raises(sock_dir: Path) -> None:
     class NeverReplies:
         async def __call__(self, env: Envelope) -> Response | None:
@@ -131,6 +121,21 @@ async def test_request_timeout_raises(sock_dir: Path) -> None:
     try:
         with pytest.raises(TimeoutError):
             await client.request(sock_path, make_envelope(), timeout_s=0.2)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_silent_peer_closed(sock_dir: Path) -> None:
+    handler = RecordingHandler()
+    sock_path = sock_dir / "s.sock"
+    server = await serve_unix(sock_path, handler, read_timeout_s=0.2)
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(sock_path))
+        line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+        assert line == b""  # closed for missing the read deadline, no reply
+        writer.close()
+        assert handler.received == []
     finally:
         server.close()
         await server.wait_closed()

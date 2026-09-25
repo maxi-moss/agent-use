@@ -1,27 +1,17 @@
 """Synthetic peers that speak the real NDJSON protocol.
 
 ``FakeBrokerClient`` raises and retracts decision and pane escalations over
-the master socket through the same ``protocol.client.request`` a session
-broker and its permission module use.
+the master socket through ``protocol.client.send``.
 ``FakeSessionSocket`` binds a session socket that records every envelope it
 receives and ACKs it, standing in for a broker's listening end.
 """
 
 import asyncio
 import contextlib
-import uuid
 from pathlib import Path
 
 from broker.protocol import client
-from broker.protocol.constants import (
-    SessionState,
-    T_DECISION_DELIVERED,
-    T_ESCALATION,
-    T_ESCALATION_RETRACT,
-    T_PANE_ESCALATION,
-    T_PANE_RETRACT,
-    T_STATUS,
-)
+from broker.protocol.constants import SessionState, T_STATUS
 from broker.protocol.schemas import (
     DecisionDeliveredPayload,
     Envelope,
@@ -31,6 +21,7 @@ from broker.protocol.schemas import (
     PaneRetractPayload,
     Response,
     StatusPayload,
+    WireMessage,
 )
 from broker.protocol.server import serve_unix
 
@@ -48,53 +39,35 @@ class FakeBrokerClient:
 
     async def escalate(self, payload: EscalationPayload) -> Response:
         """Raise a broker escalation and return the master's reply."""
-        return await self._send(T_ESCALATION, payload)
+        return await self._send(payload)
 
     async def pane_escalate(self, payload: PaneEscalationPayload) -> Response:
         """Raise a pane escalation and return the master's reply."""
-        return await self._send(T_PANE_ESCALATION, payload)
+        return await self._send(payload)
 
     async def escalation_retract(self, escalation_id: str, reason: str) -> Response:
         """Withdraw a broker escalation and return the master's reply."""
         return await self._send(
-            T_ESCALATION_RETRACT,
-            EscalationRetractPayload(escalation_id=escalation_id, reason=reason),
+            EscalationRetractPayload(escalation_id=escalation_id, reason=reason)
         )
 
     async def pane_retract(self, escalation_id: str, reason: str) -> Response:
         """Withdraw a pane escalation and return the master's reply."""
         return await self._send(
-            T_PANE_RETRACT,
-            PaneRetractPayload(escalation_id=escalation_id, reason=reason),
+            PaneRetractPayload(escalation_id=escalation_id, reason=reason)
         )
 
     async def deliver(self, escalation_id: str) -> Response:
         """Confirm a dispatched decision reached the pane."""
-        return await self._send(
-            T_DECISION_DELIVERED,
-            DecisionDeliveredPayload(escalation_id=escalation_id),
-        )
+        return await self._send(DecisionDeliveredPayload(escalation_id=escalation_id))
 
-    async def _send(
-        self,
-        msg_type: str,
-        payload: (
-            EscalationPayload
-            | PaneEscalationPayload
-            | EscalationRetractPayload
-            | PaneRetractPayload
-            | DecisionDeliveredPayload
-        ),
-    ) -> Response:
-        """Wrap a payload in a fresh-id envelope and send it to the master."""
-        env = Envelope(
-            id=uuid.uuid4().hex,
-            type=msg_type,
+    async def _send(self, payload: WireMessage) -> Response:
+        """Send one message to the master as this session."""
+        return await client.send(
+            self._master_socket,
+            payload,
             session_id=self._session,
-            payload=payload.model_dump(),
-        )
-        return await client.request(
-            self._master_socket, env, timeout_s=self._timeout_s
+            timeout_s=self._timeout_s,
         )
 
 
