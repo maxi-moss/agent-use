@@ -10,6 +10,8 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 
+from broker.herdr.schemas import AgentStatus
+
 logger = logging.getLogger(__name__)
 
 
@@ -17,7 +19,7 @@ class Watchdog:
     def __init__(
         self,
         deadline_s: float,
-        herdr_state: Callable[[], str],
+        herdr_state: Callable[[], AgentStatus],
         reconcile: Callable[[], Awaitable[None]],
     ) -> None:
         """Arm the watchdog against ``deadline_s`` of hook-event silence.

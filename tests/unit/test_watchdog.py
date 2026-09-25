@@ -2,6 +2,7 @@
 
 import asyncio
 
+from broker.herdr.schemas import AgentStatus
 from broker.session.watchdog import Watchdog
 
 
@@ -15,7 +16,7 @@ class Reconciler:
 
 async def test_fires_only_when_idle_and_stale() -> None:
     reconcile = Reconciler()
-    state = "working"
+    state: AgentStatus = "working"
     dog = Watchdog(0.05, lambda: state, reconcile)
     dog.start()
     try:

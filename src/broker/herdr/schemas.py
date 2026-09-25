@@ -1,12 +1,12 @@
-"""Pydantic models for herdr CLI JSON results (verified against herdr 0.7.5).
+"""Pydantic models for herdr CLI JSON results (verified against herdr 0.8.2).
 
 Every model here is extra="ignore", never extra="forbid": a new key in herdr's
 JSON output is a herdr upgrade, not a typo, and must not fail the parse.
 """
 
-from typing import Any, cast
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict
 
 
 class HerdrClientInfo(BaseModel):
@@ -71,47 +71,17 @@ class AgentSession(BaseModel):
     value: str
 
 
+AgentStatus = Literal["idle", "working", "blocked", "done", "unknown"]
+
+
 class AgentInfo(BaseModel):
-    """AgentInfo per `herdr api schema --json` on the installed 0.7.5.
-    agent_status enum (schema-verified): idle | working | blocked | done | unknown."""
+    """`agent start`/`agent get` result, from ``result.agent`` (installed
+    herdr 0.8.2, live capture). agent_status is the schema-verified
+    AgentStatus enum."""
 
     model_config = ConfigDict(extra="ignore")
 
     pane_id: str | None = None
     name: str | None = None
-    agent_status: str = "unknown"
+    agent_status: AgentStatus = "unknown"
     agent_session: AgentSession | None = None
-
-
-class AgentStartResult(BaseModel):
-    """`herdr agent start` result.
-
-    The installed binary's API schema says the result is
-    {"type": "agent_started", "agent": AgentInfo, "argv": [...]} — fields nested
-    under `agent`, NOT flat as originally assumed. The validator lifts the
-    nested shape; the flat shape still validates too, tolerated until a live
-    capture settles it. agent_session stays OPTIONAL — absent when the trust
-    dialog blocked session init."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    agent_session: AgentSession | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def _lift_nested_agent(cls, data: Any) -> Any:
-        """Lift the nested ``agent`` object to the top level before validation.
-
-        Args:
-            data: Raw input handed to the model; only dicts are inspected.
-
-        Returns:
-            The nested ``agent`` object if present, otherwise ``data`` unchanged.
-        """
-        if not isinstance(data, dict):
-            return data
-        typed = cast(dict[str, Any], data)
-        agent = typed.get("agent")
-        if isinstance(agent, dict):
-            return cast(dict[str, Any], agent)
-        return typed
