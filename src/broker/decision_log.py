@@ -81,7 +81,7 @@ def append(
         detail: Outcome-specific verbatim text (answer, situation, response).
         task_summary: Developer-facing one-line history summary, for a kept
             triage action or an escalation's Reason.
-        escalation_id: Links an escalation's raise row to its dispatch row.
+        escalation_id: Links an escalation's raise row to the row that ends it.
         what_was_asked: The escalation question, verbatim.
         headline: Completion outcome headline.
         supporting: Completion supporting assertion.
@@ -143,6 +143,7 @@ def render_log(path: Path) -> str:
             f"  detail: {row.detail}"
         )
         for label, value in (
+            ("escalation_id", row.escalation_id),
             ("summary", row.task_summary),
             ("headline", row.headline),
             ("supporting", row.supporting),

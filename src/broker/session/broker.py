@@ -1322,13 +1322,32 @@ class SessionBroker:
     async def _retract_superseded_menu(self, menu: _OpenMenu) -> None:
         """Withdraw the question escalation of a picker a newer one replaced."""
         assert menu.escalation_id is not None
-        reason = "a newer AskUserQuestion menu replaced it"
-        self._log(DecisionKind.RETRACTED, reason, menu.escalation_id)
+        await self._retract_question(
+            menu.escalation_id,
+            "a newer AskUserQuestion menu replaced it",
+            "Replaced by a newer question",
+        )
+
+    async def _retract_question(
+        self, escalation_id: str, reason: str, summary: str
+    ) -> None:
+        """End a question escalation without a dispatch and tell the master.
+
+        Args:
+            escalation_id: The question escalation being withdrawn.
+            reason: Why it ended; shown to the developer.
+            summary: The escalation's Solution line in the outcome history.
+        """
+        self._log(
+            DecisionKind.RETRACTED,
+            reason,
+            "",
+            task_summary=summary,
+            escalation_id=escalation_id,
+        )
         await self._to_master(
             T_PANE_RETRACT,
-            PaneRetractPayload(
-                escalation_id=menu.escalation_id, reason=reason
-            ).model_dump(),
+            PaneRetractPayload(escalation_id=escalation_id, reason=reason).model_dump(),
         )
 
     async def _check_menu_answered(self) -> None:
@@ -1357,15 +1376,13 @@ class SessionBroker:
         )
         if answered_by_developer:
             reason = "answered in pane"
-            self._log(DecisionKind.RETRACTED, reason, menu.escalation_id)
         else:
             reason = "the broker's answer was recorded late"
             self._log(DecisionKind.ASK_VERIFIED, "recorded late", menu.tool_use_id)
-        await self._to_master(
-            T_PANE_RETRACT,
-            PaneRetractPayload(
-                escalation_id=menu.escalation_id, reason=reason
-            ).model_dump(),
+        # A late answer matching the broker's cannot be told apart from the
+        # developer picking the same options, so both read as the developer's.
+        await self._retract_question(
+            menu.escalation_id, reason, "User answered the questions in the pane"
         )
         if answered_by_developer:
             await self._note_developer_contact()
@@ -1605,18 +1622,25 @@ class SessionBroker:
             return
         if _count_user_prompts(self._read_transcript()) <= self._user_prompt_baseline:
             return
-        await self._retract_decision("resolved in pane")
+        await self._retract_decision("resolved in pane", "User answered in the pane")
         await self._note_developer_contact()
 
-    async def _retract_decision(self, reason: str) -> None:
+    async def _retract_decision(self, reason: str, summary: str) -> None:
         """End the active decision escalation without a dispatch and tell the master.
 
         Args:
             reason: Why it ended; shown to the developer.
+            summary: The escalation's Solution line in the outcome history.
         """
         assert self._active_escalation is not None
         escalation_id = self._active_escalation.escalation_id
-        self._log(DecisionKind.RETRACTED, reason, escalation_id)
+        self._log(
+            DecisionKind.RETRACTED,
+            reason,
+            "",
+            task_summary=summary,
+            escalation_id=escalation_id,
+        )
         self._end_active_escalation()
         self._set_state(SessionState.DRIVING)
         await self._to_master(
@@ -1734,7 +1758,9 @@ class SessionBroker:
             )
             return
         if self._active_escalation is not None:
-            await self._retract_decision("superseded by a developer prompt")
+            await self._retract_decision(
+                "superseded by a developer prompt", "Superseded by a developer prompt"
+            )
         self._set_state(SessionState.DRIVING)
         await self._note_developer_contact()
         self._log(DecisionKind.DEVELOPER_PROMPT, "relayed by master", prompt.text)
