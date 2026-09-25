@@ -3,6 +3,7 @@ globally, embed symbols whose text changed."""
 
 import hashlib
 import logging
+import os
 import subprocess
 from pathlib import Path
 
@@ -30,7 +31,14 @@ class IndexingError(Exception):
 
 
 def _git(repo: Path, *args: str) -> str:
-    """Run a git command in ``repo`` and return its stdout."""
+    """Run a git command in ``repo`` and return its stdout.
+
+    Strips inherited ``GIT_*`` environment variables so repository discovery
+    is decided by ``repo`` alone: a caller running under its own ``GIT_DIR``
+    (a git hook, a rebase ``--exec``) must not leak into which repository
+    this git subprocess resolves.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     try:
         proc = subprocess.run(
             ["git", *args],
@@ -38,6 +46,7 @@ def _git(repo: Path, *args: str) -> str:
             capture_output=True,
             text=True,
             timeout=GIT_TIMEOUT_S,
+            env=env,
         )
     except OSError as exc:
         raise IndexingError(f"git is not runnable in {repo}: {exc}") from exc
@@ -157,7 +166,8 @@ async def index_repo(repo: Path, db_path: Path, embedder: Embedder) -> IndexSumm
     Args:
         repo: Absolute, resolved repository root.
         db_path: The repository's index file.
-        embedder: Embedding backend for changed symbols.
+        embedder: Embedding backend for changed symbols; its ``model_id`` is
+            recorded so retrieval can refuse a later model swap.
 
     Returns:
         Counts for the CLI summary line.
@@ -169,6 +179,7 @@ async def index_repo(repo: Path, db_path: Path, embedder: Embedder) -> IndexSumm
     files = list_repo_files(repo)
     store = IndexStore.open(db_path)
     try:
+        store.write_embedding_model_id(embedder.model_id)
         known = store.file_hashes()
         seen: set[str] = set()
         changed = 0

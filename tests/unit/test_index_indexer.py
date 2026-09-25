@@ -2,6 +2,7 @@
 incremental re-parse, deletions, and loud failure off a repo root."""
 
 import hashlib
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -15,12 +16,17 @@ from broker.index.schemas import EdgeKind
 from broker.index.store import IndexStore
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "indexer_inputs"
+MODEL_ID = "fake-embed-model"
+# An ambient GIT_DIR (e.g. from a `git rebase --exec` running this suite)
+# must not redirect `git init` away from the fixture directory it targets.
+_GIT_ENV = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
 
 
 class FakeEmbedder:
     """Deterministic 4-d vectors from the text hash; records every batch."""
 
-    def __init__(self) -> None:
+    def __init__(self, model_id: str = MODEL_ID) -> None:
+        self.model_id = model_id
         self.batches: list[list[str]] = []
 
     async def embed(self, texts: list[str], *, timeout_s: float) -> list[list[float]]:
@@ -40,7 +46,7 @@ class FakeEmbedder:
 def make_repo(tmp_path: Path, fixture: str) -> Path:
     repo = tmp_path / "repo"
     shutil.copytree(FIXTURES / fixture, repo)
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, env=_GIT_ENV)
     return repo.resolve()
 
 
@@ -230,10 +236,29 @@ async def test_unchanged_run_parses_nothing(
 
 async def test_non_git_directory_fails_loud(tmp_path: Path) -> None:
     with pytest.raises(IndexingError):
-        await index_repo(tmp_path.resolve(), tmp_path / "index.sqlite", FakeEmbedder())
+        await index_repo(
+            tmp_path.resolve(), tmp_path / "index.sqlite", FakeEmbedder()
+        )
 
 
 async def test_subdirectory_of_a_repo_is_refused(tmp_path: Path) -> None:
     repo = make_repo(tmp_path, "python_repo")
     with pytest.raises(IndexingError, match="not the root"):
-        await index_repo(repo / "app", tmp_path / "index.sqlite", FakeEmbedder())
+        await index_repo(
+            repo / "app", tmp_path / "index.sqlite", FakeEmbedder()
+        )
+
+
+async def test_non_git_directory_fails_loud_under_an_ambient_git_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller running under its own GIT_DIR (a rebase --exec, a git hook)
+    must not leak into which repository this git subprocess resolves."""
+    unrelated_repo = tmp_path / "unrelated"
+    unrelated_repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=unrelated_repo, check=True, env=_GIT_ENV)
+    monkeypatch.setenv("GIT_DIR", str(unrelated_repo / ".git"))
+    target = tmp_path / "target"
+    target.mkdir()
+    with pytest.raises(IndexingError):
+        await index_repo(target, tmp_path / "index.sqlite", FakeEmbedder())

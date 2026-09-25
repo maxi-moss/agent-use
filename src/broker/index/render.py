@@ -4,7 +4,14 @@ Signatures and edge lines only — no docstrings, no bodies. Deterministic:
 the same context renders byte-identically.
 """
 
-from broker.index.schemas import ContextSymbol, EdgeKind, GroundingContext, SymbolKind
+from broker.index.schemas import (
+    ContextSymbol,
+    EdgeKind,
+    GroundingContext,
+    SymbolKind,
+    join_qualified_name,
+    split_qualified_name,
+)
 
 BUDGET_CHARS = 16_000  # ~4k tokens at ~4 chars/token; deliberately no tokenizer
 _HEADER = "# Relevant code"
@@ -60,17 +67,17 @@ def render_relevant_code(context: GroundingContext) -> str:
 
 def _owner(qualified_name: str) -> str | None:
     """Return the qualified name of a symbol's owning class, or ``None``."""
-    path, _, inner = qualified_name.partition("::")
+    path, inner = split_qualified_name(qualified_name)
     if "." not in inner:
         return None
-    return f"{path}::{inner.rsplit('.', 1)[0]}"
+    return join_qualified_name(path, inner.rsplit(".", 1)[0])
 
 
 def _symbol_lines(
     context: GroundingContext, symbol: ContextSymbol, indent: str
 ) -> list[str]:
     """Render one symbol's heading, signature and edge lines."""
-    _, _, inner = symbol.qualified_name.partition("::")
+    _, inner = split_qualified_name(symbol.qualified_name)
     tag = symbol.kind.value + (", seed" if symbol.score is not None else "")
     lines = [
         f"{indent}### {inner} ({tag}, lines {symbol.start_line}-{symbol.end_line})"

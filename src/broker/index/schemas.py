@@ -28,10 +28,21 @@ class RefKind(StrEnum):
     TYPE = "type"
 
 
+def join_qualified_name(path: str, inner: str) -> str:
+    """Build ``path::inner``, the low-level join behind the qualified-name format."""
+    return f"{path}::{inner}"
+
+
+def split_qualified_name(qname: str) -> tuple[str, str]:
+    """Split ``path::inner`` back into its path and inner halves."""
+    path, _, inner = qname.partition("::")
+    return path, inner
+
+
 def qualified_name(path: str, scope: str, name: str) -> str:
     """Build ``path::Scope.name``, the repository-wide identity of a symbol."""
     inner = f"{scope}.{name}" if scope else name
-    return f"{path}::{inner}"
+    return join_qualified_name(path, inner)
 
 
 class Symbol(BaseModel):
@@ -126,14 +137,6 @@ class ContextSymbol(BaseModel):
     rank: float  # own score, or the best score among the seeds that pulled it in
 
 
-class ContextEdge(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    source: str
-    target: str
-    kind: EdgeKind
-
-
 class GroundingContext(BaseModel):
     """Seeds and their one-hop neighbourhood.
 
@@ -145,5 +148,5 @@ class GroundingContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     symbols: list[ContextSymbol]
-    edges: list[ContextEdge]
+    edges: list[Edge]
     imports: dict[str, list[str]]

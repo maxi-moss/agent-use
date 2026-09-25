@@ -15,10 +15,13 @@ from broker.index.schemas import (
 )
 from broker.index.store import IndexStore
 
+MODEL_ID = "test-embed-model"
+
 
 class FixedEmbedder:
-    def __init__(self, vector: list[float]) -> None:
+    def __init__(self, vector: list[float], model_id: str = MODEL_ID) -> None:
         self.vector = vector
+        self.model_id = model_id
         self.calls: list[list[str]] = []
 
     async def embed(self, texts: list[str], *, timeout_s: float) -> list[list[float]]:
@@ -39,7 +42,7 @@ def sym(path: str, scope: str, name: str, kind: SymbolKind, sig: str) -> Symbol:
     )
 
 
-def build_index(db: Path) -> None:
+def build_index(db: Path, *, model_id: str | None = MODEL_ID) -> None:
     """Two files: a service class with two methods, a factory function, a base class."""
     store = IndexStore.open(db)
     store.replace_file(
@@ -115,6 +118,8 @@ def build_index(db: Path) -> None:
             Edge(source="a.py", target="b.py::make", kind=EdgeKind.IMPORTS),
         ]
     )
+    if model_id is not None:
+        store.write_embedding_model_id(model_id)
     store.store_embeddings(
         [
             ("a.py::Service.send", "t", [1.0, 0.0, 0.0]),
@@ -165,7 +170,10 @@ async def test_expansion_rank_is_the_best_pulling_seed(tmp_path: Path) -> None:
     db = tmp_path / "index.sqlite"
     build_index(db)
     ctx = await retrieve(
-        "x", Path("/repo"), index_path=db, embedder=FixedEmbedder([1.0, 0.0, 0.0])
+        "x",
+        Path("/repo"),
+        index_path=db,
+        embedder=FixedEmbedder([1.0, 0.0, 0.0]),
     )
     unrelated = next(s for s in ctx.symbols if s.qualified_name == "b.py::unrelated")
     assert abs(unrelated.rank - 1.0) < 1e-9  # pulled by `send`, score 1.0
@@ -186,3 +194,28 @@ async def test_index_without_embeddings_fails_loud(tmp_path: Path) -> None:
     with pytest.raises(RetrievalError, match="no embedded symbols"):
         await retrieve("x", Path("/repo"), index_path=db, embedder=embedder)
     assert embedder.calls == []  # the intent is never embedded against an empty index
+
+
+async def test_index_predating_model_tracking_fails_loud(tmp_path: Path) -> None:
+    db = tmp_path / "index.sqlite"
+    build_index(db, model_id=None)
+    with pytest.raises(RetrievalError, match="predates embedding-model tracking"):
+        await retrieve(
+            "x",
+            Path("/repo"),
+            index_path=db,
+            embedder=FixedEmbedder([1.0, 0.0, 0.0]),
+        )
+
+
+async def test_mismatched_embedding_model_fails_loud(tmp_path: Path) -> None:
+    db = tmp_path / "index.sqlite"
+    build_index(db, model_id="old-model")
+    with pytest.raises(RetrievalError, match="'old-model'") as exc_info:
+        await retrieve(
+            "x",
+            Path("/repo"),
+            index_path=db,
+            embedder=FixedEmbedder([1.0, 0.0, 0.0], model_id="new-model"),
+        )
+    assert "'new-model'" in str(exc_info.value)

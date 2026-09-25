@@ -22,6 +22,16 @@ from broker.index.schemas import (
     Symbol,
     SymbolKey,
     SymbolKind,
+    split_qualified_name,
+)
+
+EMBEDDABLE_KINDS: tuple[SymbolKind, ...] = (
+    SymbolKind.FUNCTION,
+    SymbolKind.METHOD,
+    SymbolKind.CLASS,
+)
+_EMBEDDABLE_KINDS_SQL = (
+    "(" + ", ".join(f"'{kind.value}'" for kind in EMBEDDABLE_KINDS) + ")"
 )
 
 _SCHEMA = """
@@ -70,6 +80,10 @@ CREATE TABLE IF NOT EXISTS embeddings (
     qualified_name TEXT PRIMARY KEY,
     text_hash TEXT NOT NULL,
     vector BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS meta (
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    embedding_model_id TEXT NOT NULL
 );
 """
 
@@ -265,7 +279,7 @@ class IndexStore:
         """Return every function, method and class symbol, ordered by qualified name."""
         rows = self._conn.execute(
             f"SELECT {_SYMBOL_COLUMNS} FROM symbols "
-            "WHERE kind IN ('function', 'method', 'class') ORDER BY qualified_name"
+            f"WHERE kind IN {_EMBEDDABLE_KINDS_SQL} ORDER BY qualified_name"
         )
         return [_symbol_row(row) for row in rows]
 
@@ -275,7 +289,7 @@ class IndexStore:
         """Map each class to its methods' ``(name, signature)`` in source order."""
         out: dict[str, list[tuple[str, str]]] = {}
         for qname in class_qnames:
-            path, _, scope = qname.partition("::")
+            path, scope = split_qualified_name(qname)
             rows = self._conn.execute(
                 "SELECT name, signature FROM symbols "
                 "WHERE kind = 'method' AND path = ? AND scope = ? "
@@ -308,7 +322,7 @@ class IndexStore:
             self._conn.execute(
                 "DELETE FROM embeddings WHERE qualified_name NOT IN "
                 "(SELECT qualified_name FROM symbols "
-                "WHERE kind IN ('function', 'method', 'class'))"
+                f"WHERE kind IN {_EMBEDDABLE_KINDS_SQL})"
             )
 
     def load_vectors(self) -> list[tuple[str, array[float]]]:
@@ -322,6 +336,33 @@ class IndexStore:
             vector.frombytes(row["vector"])
             out.append((row["qualified_name"], vector))
         return out
+
+    # ── meta ───────────────────────────────────────────────────────────
+
+    def write_embedding_model_id(self, model_id: str) -> None:
+        """Record the embedding model this index's vectors are built with.
+
+        Wipes every stored embedding first when the recorded model is missing
+        or differs, so a model swap forces a full re-embed instead of leaving
+        vectors from the old model under the new model's id.
+        """
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT embedding_model_id FROM meta WHERE id = 0"
+            ).fetchone()
+            if row is None or str(row["embedding_model_id"]) != model_id:
+                self._conn.execute("DELETE FROM embeddings")
+            self._conn.execute(
+                "INSERT OR REPLACE INTO meta (id, embedding_model_id) VALUES (0, ?)",
+                (model_id,),
+            )
+
+    def embedding_model_id(self) -> str | None:
+        """Return the embedding model recorded for this index, if any."""
+        row = self._conn.execute(
+            "SELECT embedding_model_id FROM meta WHERE id = 0"
+        ).fetchone()
+        return None if row is None else str(row["embedding_model_id"])
 
     # ── retrieval ──────────────────────────────────────────────────────
 

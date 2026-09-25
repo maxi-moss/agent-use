@@ -28,6 +28,11 @@ class EmbeddingError(Exception):
 class Embedder(Protocol):
     """The injected embedding seam: tests pass a fake, production binds OpenAI."""
 
+    @property
+    def model_id(self) -> str:
+        """The model this embedder calls, recorded alongside its vectors."""
+        ...
+
     async def embed(self, texts: list[str], *, timeout_s: float) -> list[list[float]]:
         """Embed ``texts`` in order, one vector per text."""
         ...
@@ -37,6 +42,10 @@ class OpenAIEmbedder:
     def __init__(self, client: AsyncOpenAI, cfg: EmbeddingConfig) -> None:
         self._client = client
         self._cfg = cfg
+
+    @property
+    def model_id(self) -> str:
+        return self._cfg.model_id
 
     @classmethod
     def from_env(cls, cfg: EmbeddingConfig) -> "OpenAIEmbedder":
