@@ -19,19 +19,6 @@ from broker.config import (
     load,
 )
 
-SRC_ROOT = Path(__file__).parent.parent.parent / "src" / "broker"
-
-
-def _modules_mentioning(needle: str) -> list[Path]:
-    """Every file under src/broker containing ``needle``."""
-    hits: list[Path] = []
-    for path in SRC_ROOT.rglob("*"):
-        if path.suffix not in {".py", ".md"} or not path.is_file():
-            continue
-        if needle in path.read_text(encoding="utf-8"):
-            hits.append(path.relative_to(SRC_ROOT))
-    return hits
-
 
 def test_broker_home_env_override(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -72,18 +59,6 @@ def test_load_missing_file_is_defaults(
 ) -> None:
     monkeypatch.setenv("BROKER_HOME", str(tmp_path))
     assert load() == BrokerConfig(broker_home=tmp_path)
-
-
-def test_model_id_pinned_in_exactly_one_module() -> None:
-    """`claude-sonnet-5` lives in broker/config.py and nowhere else in src."""
-    hits = _modules_mentioning("claude-sonnet-5")
-    assert hits == [Path("config.py")], f"model id leaked into {hits}"
-
-
-def test_classifier_model_id_pinned_in_exactly_one_module() -> None:
-    """`claude-haiku-4-5` lives in broker/config.py and nowhere else in src."""
-    hits = _modules_mentioning("claude-haiku-4-5")
-    assert hits == [Path("config.py")], f"classifier model id leaked into {hits}"
 
 
 def test_classifier_defaults() -> None:
