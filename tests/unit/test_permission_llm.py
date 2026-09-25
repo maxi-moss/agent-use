@@ -4,6 +4,8 @@ The strict-tool derivation here duplicates the session broker's on purpose, so
 the schema pin is what stops the two drifting apart unnoticed.
 """
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -140,6 +142,15 @@ def test_both_tools_are_strict_and_fully_required() -> None:
                 props.keys()
             ), f"{tool['name']} {path}: not every property is required"
         assert list(cast(dict[str, Any], schema["properties"])) == ["reasoning"]
+
+
+def test_permission_tools_schema_pin() -> None:
+    digest = hashlib.sha256(
+        json.dumps(PERMISSION_TOOLS, sort_keys=True).encode()
+    ).hexdigest()
+    assert digest == (
+        "ebdf2c7ce4289e3110c215dffe8553d6c589561d1d913883ab4a4e539a032a11"
+    ), "LLM-visible tool schema changed; review the dumped schema and update the pin"
 
 
 def test_client_has_zero_retries(monkeypatch: pytest.MonkeyPatch) -> None:

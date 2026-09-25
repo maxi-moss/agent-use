@@ -1,10 +1,14 @@
 """Strict-tool schema derivation pins (drift pin vs EscalationDisclosure)."""
 
+import hashlib
 import json
 from typing import Any, cast
 
+import pytest
+
 from broker.protocol.schemas import EscalationDisclosure
 from broker.session.ask import ASK_TOOLS
+from broker.session.clarify import CLARIFY_TOOLS
 from broker.session.triage import (
     GROUNDING_TOOLS,
     TRIAGE_TOOLS,
@@ -87,3 +91,38 @@ def test_ask_and_triage_escalate_schemas_identical() -> None:
     triage_escalate = next(t for t in TRIAGE_TOOLS if t["name"] == "escalate")
     ask_escalate = next(t for t in ASK_TOOLS if t["name"] == "escalate")
     assert ask_escalate["input_schema"] == triage_escalate["input_schema"]
+
+
+@pytest.mark.parametrize(
+    "name,tools,expected_hash",
+    [
+        (
+            "TRIAGE_TOOLS",
+            TRIAGE_TOOLS,
+            "fdc3d7d14fbc4f05c589d52447411519a0e8dadbcb10f70790fd26e98de89c00",
+        ),
+        (
+            "GROUNDING_TOOLS",
+            GROUNDING_TOOLS,
+            "dfa68f06bf238ed5b9ca4efd439195e0188c547de316aaa18fc4bcc68c5f74d8",
+        ),
+        (
+            "ASK_TOOLS",
+            ASK_TOOLS,
+            "4064d42c4dbbd34f056deee7b169c3ee059c716b969be9897e652a6328c470ca",
+        ),
+        (
+            "CLARIFY_TOOLS",
+            CLARIFY_TOOLS,
+            "7922e2977f47e925989419ff12aab1c7de308116ba3c8b9a110940f63d6e8d42",
+        ),
+    ],
+)
+def test_tool_schema_pin(
+    name: str, tools: list[dict[str, Any]], expected_hash: str
+) -> None:
+    digest = hashlib.sha256(json.dumps(tools, sort_keys=True).encode()).hexdigest()
+    assert digest == expected_hash, (
+        f"LLM-visible tool schema changed ({name}); review the dumped schema "
+        "and update the pin"
+    )

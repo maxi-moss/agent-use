@@ -1,6 +1,8 @@
 """MasterLLM with a scripted fake llm_call and a recording MasterRuntime
 subclass — proves the plumbing never rewrites developer or broker text."""
 
+import hashlib
+import json
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -431,6 +433,15 @@ def test_master_tools_are_strict_and_complete() -> None:
         schema = cast(dict[str, Any], tool["input_schema"])
         assert schema["additionalProperties"] is False
         assert sorted(schema["required"]) == sorted(schema["properties"])
+
+
+def test_master_tools_schema_pin() -> None:
+    digest = hashlib.sha256(
+        json.dumps(MASTER_TOOLS, sort_keys=True).encode()
+    ).hexdigest()
+    assert digest == (
+        "8bf925a90880f609878b64a2910a91d5e50598f9d1fbde8319e4266eec64d668"
+    ), "LLM-visible tool schema changed; review the dumped schema and update the pin"
 
 
 def test_clarify_escalation_args_are_closed() -> None:
