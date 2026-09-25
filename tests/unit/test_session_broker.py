@@ -60,6 +60,7 @@ from broker.session.broker import (
     PHRASE_TRIAGE,
     SessionBroker,
 )
+from broker.decision_log import DecisionKind, read_rows
 from broker.config import (
     AdoptedSession,
     ClassifierConfig,
@@ -405,6 +406,15 @@ async def decision_log_text(h: "Harness") -> str:
         timeout_s=5.0,
     )
     return cast(str, resp.payload["text"])
+
+
+def logged_retractions(h: "Harness") -> list[tuple[str | None, str | None]]:
+    """Each retraction in the decision log as (escalation id, Solution line)."""
+    return [
+        (row.escalation_id, row.task_summary)
+        for row in read_rows(h.broker.decision_log_path)
+        if row.kind is DecisionKind.RETRACTED
+    ]
 
 
 async def wait_state(
@@ -1056,6 +1066,9 @@ async def test_menu_answered_in_pane_retracts_and_resets_budget(
         "escalation_id": raised.payload["escalation_id"],
         "reason": "answered in pane",
     }
+    assert logged_retractions(harness) == [
+        (raised.payload["escalation_id"], "User answered the questions in the pane")
+    ]
     budget = await harness.master.wait_for(T_BUDGET_UPDATE)
     assert budget.payload == {"count": 0}
     assert harness.broker.budget_count == 0
@@ -1318,6 +1331,12 @@ async def test_late_injected_answer_retracts_without_budget_reset(
         "escalation_id": escalation.payload["escalation_id"],
         "reason": "the broker's answer was recorded late",
     }
+    assert logged_retractions(harness) == [
+        (
+            escalation.payload["escalation_id"],
+            "User answered the questions in the pane",
+        )
+    ]
     await asyncio.sleep(0.1)
     assert len(harness.master.of_type(T_BUDGET_UPDATE)) == 1
     assert harness.broker.budget_count == 1
@@ -1408,6 +1427,7 @@ async def test_stop_that_resolves_an_escalation_still_triages_its_turn(
     )
     retract = await harness.master.wait_for(T_ESCALATION_RETRACT)
     assert retract.payload["escalation_id"] == escalation_id
+    assert logged_retractions(harness) == [(escalation_id, "User answered in the pane")]
     await harness.master.wait_for(T_BUDGET_UPDATE, count=2)
     assert harness.run.drive_calls() == [
         ["herdr", "agent", "prompt", "s1", "use oauth"],
@@ -2025,6 +2045,9 @@ async def test_send_prompt_supersedes_a_decision_escalation(
         "escalation_id": escalation_id,
         "reason": "superseded by a developer prompt",
     }
+    assert logged_retractions(harness) == [
+        (escalation_id, "Superseded by a developer prompt")
+    ]
     budget = await harness.master.wait_for(T_BUDGET_UPDATE)
     assert budget.payload == {"count": 0}
     assert harness.run.drive_calls() == [
@@ -2144,6 +2167,9 @@ async def test_a_newer_menu_retracts_the_one_it_replaced_first(
     retract = harness.master.of_type(T_PANE_RETRACT)
     assert [r.payload["escalation_id"] for r in retract] == [
         first.payload["escalation_id"]
+    ]
+    assert logged_retractions(harness) == [
+        (first.payload["escalation_id"], "Replaced by a newer question")
     ]
     # Retract before raise: the master holds one question per session.
     order = [e.id for e in harness.master.received]

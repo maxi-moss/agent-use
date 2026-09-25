@@ -53,6 +53,29 @@ def test_escalation_carries_reason_and_next_kept_action_as_solution() -> None:
     assert "go with B" not in [ev.label for ev in out.history]  # raw prose never shown
 
 
+def test_retraction_closes_only_its_own_escalation() -> None:
+    out = _build(
+        SessionState.COMPLETED,
+        _row(
+            DecisionKind.ESCALATION_RAISED, task_summary="Reason X", escalation_id="e1"
+        ),
+        _row(
+            DecisionKind.ESCALATION_RAISED, task_summary="Reason Q", escalation_id="q1"
+        ),
+        _row(
+            DecisionKind.RETRACTED,
+            task_summary="User answered the questions in the pane",
+            escalation_id="q1",
+        ),
+        _row(DecisionKind.ANSWERED, task_summary="Did Y"),
+    )
+    assert [ev.resolution for ev in out.history] == [
+        "Did Y",
+        "User answered the questions in the pane",
+        None,
+    ]
+
+
 def test_escalation_without_follow_up_gets_fallback() -> None:
     out = _build(
         SessionState.STOPPED,
@@ -172,7 +195,6 @@ def test_ignored_kinds_produce_no_events() -> None:
         _row(DecisionKind.NO_ACTION),
         _row(DecisionKind.CLARIFIED, detail="because"),
         _row(DecisionKind.ASK_VERIFIED, detail="tool-1"),
-        _row(DecisionKind.RETRACTED, detail="e1"),
         _row(DecisionKind.ADOPTED, detail="count=3"),
     )
     assert out.history == ()
