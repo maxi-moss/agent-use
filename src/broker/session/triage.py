@@ -4,6 +4,9 @@ Pydantic models are the single source of truth for tool inputs; JSON schemas
 are DERIVED (model_json_schema) then strictified. The escalate tool's field
 set is pinned against EscalationDisclosure by a unit test so the wire schema
 and the tool schema cannot drift apart.
+
+Class names, field names, `Field` descriptions and docstrings of these models
+are sent to the model.
 """
 
 import logging

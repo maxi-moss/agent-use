@@ -5,6 +5,9 @@ escalate tool on purpose — both raise the same wire payload — and stays
 inside the session stack: nothing here touches the permission or master
 stacks. Answers are option labels copied verbatim (never indices), validated
 against the questions before anything leaves the broker.
+
+Class names, field names, `Field` descriptions and docstrings of these models
+are sent to the model.
 """
 
 from typing import Any, cast
