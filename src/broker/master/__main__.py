@@ -123,7 +123,7 @@ def main() -> None:
         # 3. Reconcile the registry: probe, classify, retract — never spawn.
         warnings.extend(asyncio.run(reconcile_registry(registry, queue, panes)))
 
-        llm_call = bind_call_turn(build_client(cfg))
+        llm_call = bind_call_turn(build_client())
 
     # 4. Runtime and app built before run; runtime.serve() starts in on_mount.
     app = BrokerMasterApp(

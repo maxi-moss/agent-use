@@ -372,7 +372,7 @@ class SessionBroker:
         # Bind FIRST — hooks may fire before the pane exists.
         server = await serve_unix(Path(self.cfg.socket_path), self.handle)
         if self._llm_call is None:
-            self._llm_call = _bind_llm(llm_module.build_client(self.broker_cfg))
+            self._llm_call = _bind_llm(llm_module.build_client())
         if self._retrieve is None:
             self._retrieve = _bind_retrieve(self._paths, self.broker_cfg.embedding)
         self.watchdog.start()
