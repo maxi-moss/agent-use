@@ -29,7 +29,7 @@ from broker.master.pane_escalations import PaneEscalations
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry
 from broker.master.runtime import MasterRuntime
-from broker.master.testmode import load_scenario, run_scenario
+from broker.master.testmode import load_scenario, run_scenario, scenario_names
 from broker.master.tui.chat_log import ChatMessage, ThinkingIndicator
 from broker.master.tui.fleet import FLEET_WIDTH, FleetSidebar, SessionRowWidget
 from broker.master.tui.messages import LLMReply, ViewEventMessage
@@ -223,9 +223,7 @@ class BrokerMasterApp(App[None]):
 
     def _scenario_names(self) -> list[str]:
         assert self.scenarios_dir is not None  # reached only in test mode
-        if not self.scenarios_dir.is_dir():
-            return []
-        return sorted(p.stem for p in self.scenarios_dir.glob("*.json"))
+        return scenario_names(self.scenarios_dir)
 
     async def _run_scenario(self, name: str) -> None:
         assert self.scenarios_dir is not None  # reached only in test mode

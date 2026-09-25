@@ -61,6 +61,29 @@ from broker.protocol.schemas import (
 
 _POLL_INTERVAL_S = 0.01
 
+SCENARIO_DIR = Path(__file__).parent / "scenarios"
+
+
+def scenario_names(directory: Path = SCENARIO_DIR) -> list[str]:
+    """Return the sorted scenario names available in a directory.
+
+    Args:
+        directory: Directory to scan for ``*.json`` scenario files.
+
+    Returns:
+        The scenario names (file stems), sorted.
+
+    Raises:
+        ScenarioError: The directory does not exist or holds no
+            ``*.json`` files.
+    """
+    if not directory.is_dir():
+        raise ScenarioError(f"scenario directory not found: {directory}")
+    names = sorted(p.stem for p in directory.glob("*.json"))
+    if not names:
+        raise ScenarioError(f"no scenario files in {directory}")
+    return names
+
 
 def load_scenario(path: Path) -> Scenario:
     """Load and validate a scenario file, failing loud on any problem.

@@ -37,7 +37,7 @@ from broker.master.viewmodel import (
     PaneEscalationArrived,
     PaneRequest,
     ProposalArrived,
-    SessionStatusChanged,
+    SessionStateChanged,
 )
 from broker.protocol import client
 from broker.protocol.constants import (
@@ -1036,7 +1036,7 @@ async def test_probe_of_a_settled_session_keeps_it_settled(home: Path) -> None:
         server.close()
     assert registry.get("s1").state is SessionState.COMPLETED
     assert [
-        (m.session_id, m.state) for m in posts if isinstance(m, SessionStatusChanged)
+        (m.session_id, m.state) for m in posts if isinstance(m, SessionStateChanged)
     ] == [("s1", SessionState.COMPLETED)]
     row = runtime.build_fleet_view().rows[0]
     assert row.task_activity == ""
@@ -1143,7 +1143,7 @@ async def test_repopulate_from_brokers_recovers_pending_proposal(
         server.close()
         await server.wait_closed()
 
-    assert runtime.proposals["pr1"].session_name == "s1"
+    assert runtime.proposals["pr1"].session_id == "s1"
     arrived = [m for m in posts if isinstance(m, ProposalArrived)]
     assert [(m.session_id, m.proposal_id) for m in arrived] == [("s1", "pr1")]
     assert "add a health endpoint" in arrived[0].rendered
@@ -1747,6 +1747,43 @@ async def test_proposal_rendered_verbatim_and_tracked(
     assert "the exact grounding summary" in arrived[0].rendered
     assert "## Retrieved code\n- a.py::f (seed 0.81)\n- a.py::g" in arrived[0].rendered
     assert runtime.registry.get("s1").state == "awaiting_approval"
+    # The badge reaches the sidebar on this push, not on some later unrelated
+    # one — the developer needs to see it the moment it arrives.
+    row = [m for m in posts if isinstance(m, FleetUpdated)][-1].view.rows[0]
+    assert row.badges == (Attention.PROPOSAL,)
+
+
+async def test_second_proposal_from_a_session_replaces_its_first(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    runtime, _ = rt
+    assert (
+        await send(
+            runtime,
+            T_PROMPT_PROPOSAL,
+            {
+                "proposal_id": "p1",
+                "proposed_prompt": "first attempt",
+                "grounding_summary": "g1",
+            },
+        )
+    ).ok
+    assert (
+        await send(
+            runtime,
+            T_PROMPT_PROPOSAL,
+            {
+                "proposal_id": "p2",
+                "proposed_prompt": "second attempt",
+                "grounding_summary": "g2",
+            },
+        )
+    ).ok
+    assert list(runtime.proposals) == ["p2"]
+    row = [row for row in runtime.build_fleet_view().rows if row.session_id == "s1"][
+        0
+    ]
+    assert row.badges == (Attention.PROPOSAL,)
 
 
 async def test_approve_prompt_stores_the_title_and_it_reaches_the_fleet_row(
@@ -1878,6 +1915,8 @@ async def test_reassign_spawns_a_broker_that_adopts_the_live_session(
     record = _bind_session(runtime)
     result = await runtime.reassign_session("s1", "take it from here")
     assert "reassigned" in result
+    # -I isolates the subprocess from the developer's PYTHONPATH and cwd.
+    assert spawn.argvs[-1][1:4] == ("-I", "-m", "broker.session")
     config = spawn.config()
     assert config["name"] == "s1"
     # The SAME socket path: BROKER_SOCKET was baked into the pane's
@@ -1897,6 +1936,38 @@ async def test_reassign_spawns_a_broker_that_adopts_the_live_session(
     assert reloaded.budget_count == 0
     assert reloaded.state == "spawning"
     assert reloaded.pid is not None  # the new broker, not the dead one
+
+
+async def test_reassign_does_not_resurrect_a_session_ended_during_its_stop_wait(
+    rt: tuple[MasterRuntime, list[Any]], spawn: RecordingSpawn
+) -> None:
+    runtime, _ = rt
+    record = _bind_session(runtime)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingShutdown:
+        async def handler(self, env: Envelope) -> Response:
+            entered.set()
+            await release.wait()
+            return Response(id=env.id, ok=True, payload={})
+
+    stub = BlockingShutdown()
+    server = await serve_unix(Path(record.socket_path), stub.handler)
+    try:
+        reassign = asyncio.create_task(runtime.reassign_session("s1", "new task"))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        # The broker reports its own end while reassign is still waiting on
+        # the shutdown reply — the session must not come back from that.
+        assert (await send(runtime, T_SESSION_ENDED, {})).ok
+        assert "s1" not in runtime.registry.records
+        release.set()
+        with pytest.raises(KeyError):
+            await reassign
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert "s1" not in runtime.registry.records
 
 
 class SpawnWatchingSettings(RecordingSpawn):
@@ -2369,14 +2440,14 @@ async def test_set_state_is_idempotent(
 
     monkeypatch.setattr(runtime.registry, "save", counting_save)
     assert (await send(runtime, T_LIVE_STATUS, {"state": "escalated"})).ok
-    changed = [m for m in posts if isinstance(m, SessionStatusChanged)]
+    changed = [m for m in posts if isinstance(m, SessionStateChanged)]
     assert len(changed) == 1
     assert len(saves) == 1
     fleet_count = len([m for m in posts if isinstance(m, FleetUpdated)])
     # The same state again: no second announcement, no second save — but the
     # snapshot still publishes for the activity/perm side of the push.
     assert (await send(runtime, T_LIVE_STATUS, {"state": "escalated"})).ok
-    changed = [m for m in posts if isinstance(m, SessionStatusChanged)]
+    changed = [m for m in posts if isinstance(m, SessionStateChanged)]
     assert len(changed) == 1
     assert len(saves) == 1
     assert (

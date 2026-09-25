@@ -79,7 +79,6 @@ class AgentInfo(BaseModel):
 
     pane_id: str | None = None
     name: str | None = None
-    interactive_ready: bool = False
     agent_status: str = "unknown"
     agent_session: AgentSession | None = None
 
@@ -96,7 +95,6 @@ class AgentStartResult(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    interactive_ready: bool = False
     agent_session: AgentSession | None = None
 
     @model_validator(mode="before")

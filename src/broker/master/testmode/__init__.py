@@ -12,13 +12,11 @@ from anthropic.types import (
 )
 
 from broker.llm import TurnResult
-from broker.master.testmode.fake_broker import FakeBrokerClient, FakeSessionSocket
-from broker.master.testmode.runner import load_scenario, run_scenario
-from broker.master.testmode.schemas import (
-    Scenario,
-    ScenarioError,
-    ScenarioReport,
-    StepResult,
+from broker.master.testmode.runner import (
+    SCENARIO_DIR,
+    load_scenario,
+    run_scenario,
+    scenario_names,
 )
 
 _TEST_MODE_REPLY = "test mode — LLM disabled; type /inject <scenario>"
@@ -38,13 +36,9 @@ async def test_mode_llm_call(
 
 
 __all__ = [
-    "FakeBrokerClient",
-    "FakeSessionSocket",
-    "Scenario",
-    "ScenarioError",
-    "ScenarioReport",
-    "StepResult",
+    "SCENARIO_DIR",
     "load_scenario",
     "run_scenario",
+    "scenario_names",
     "test_mode_llm_call",
 ]
