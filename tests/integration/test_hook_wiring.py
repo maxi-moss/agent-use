@@ -28,7 +28,7 @@ from broker.herdr import driver
 from broker.index.schemas import GroundingContext
 from broker.llm import ToolCall
 from broker.permission import PermissionModule
-from broker.permission.llm import ToolCall as PermissionToolCall
+from broker.permission.classifier import PermissionToolCall
 from broker.protocol import client
 from broker.protocol.constants import (
     ENV_BROKER_HOOK_LOG,
@@ -208,7 +208,7 @@ class Harness:
         """Swap in a module whose classification path is gone."""
         self.broker.permission = DeadPermission(
             self.cfg.classifier,
-            session_name=self.cfg.name,
+            session_id=self.cfg.name,
             master_socket_path=self.cfg.master_socket_path,
             log_path=self.broker.permission_log_path,
             intent=self.cfg.intent,
@@ -299,7 +299,7 @@ async def start_harness(
         retrieve=FakeRetriever(),
         permission=PermissionModule(
             cfg.classifier,
-            session_name=cfg.name,
+            session_id=cfg.name,
             master_socket_path=cfg.master_socket_path,
             log_path=BrokerPaths(home).session_permissions(cfg.name),
             intent=cfg.intent,

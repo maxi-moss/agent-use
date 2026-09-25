@@ -22,7 +22,7 @@ from broker.index.retrieval import RetrievalError
 from broker.index.schemas import ContextSymbol, GroundingContext, SymbolKind
 from broker.llm import LLMCallError, ToolCall
 from broker.permission import PermissionModule
-from broker.permission.llm import ToolCall as PermissionToolCall
+from broker.permission.classifier import PermissionToolCall
 from broker.protocol import client
 from broker.protocol.constants import (
     MAX_LINE_BYTES,
@@ -272,7 +272,7 @@ class SpyPermission(PermissionModule):
     def __init__(self, log_path: Path, master_socket_path: str) -> None:
         super().__init__(
             ClassifierConfig(),
-            session_name="s1",
+            session_id="s1",
             master_socket_path=master_socket_path,
             log_path=log_path,
             intent="the raw intent",
@@ -527,7 +527,7 @@ async def _harness(
         retrieve=retriever,
         permission=PermissionModule(
             cfg.classifier,
-            session_name=cfg.name,
+            session_id=cfg.name,
             master_socket_path=cfg.master_socket_path,
             log_path=BrokerPaths(home).session_permissions(cfg.name),
             intent=cfg.intent,

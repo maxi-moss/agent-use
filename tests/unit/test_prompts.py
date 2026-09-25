@@ -8,7 +8,7 @@ from anthropic.types import ToolParam
 
 from broker import prompts
 from broker.master.llm import MASTER_TOOLS
-from broker.permission.llm import PERMISSION_TOOLS
+from broker.permission.classifier import PERMISSION_TOOLS
 from broker.session.ask import ASK_TOOLS
 from broker.session.clarify import CLARIFY_TOOLS
 from broker.session.triage import GROUNDING_TOOLS, TRIAGE_TOOLS

@@ -358,7 +358,7 @@ class SessionBroker:
         self.permission_log_path = self._paths.session_permissions(cfg.name)
         self.permission = permission or PermissionModule(
             cfg.classifier,
-            session_name=cfg.name,
+            session_id=cfg.name,
             master_socket_path=cfg.master_socket_path,
             log_path=self.permission_log_path,
             intent=cfg.intent,

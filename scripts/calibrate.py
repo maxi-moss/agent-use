@@ -29,15 +29,15 @@ from broker.calibration.schemas import (
 )
 from broker.config import BrokerConfig, ClassifierConfig
 from broker.llm import LLMCallError, build_client, call_tool
-from broker.permission.llm import (
+from broker.permission.classifier import (
+    AllowCall,
     PermissionCallError,
+    PermissionEscalateCall,
     bind,
     build_classifier_client,
     classify,
     render_suggestions,
 )
-from broker.permission.schemas import AllowCall
-from broker.permission.schemas import EscalateCall as PermissionEscalateCall
 from broker.session.triage import (
     AnswerCall,
     CompleteCall,
@@ -99,7 +99,7 @@ async def run_questions(cases: list[QuestionCase]) -> None:
 async def run_permissions(cases: list[PermissionCase]) -> None:
     """Run the permission leg against the pinned classifier model."""
     cfg = ClassifierConfig()
-    caller = bind(build_classifier_client(cfg))
+    caller = bind(build_classifier_client())
     print(f"permissions ({cfg.model_id}): {len(cases)} cases")
     escalations = 0
     for case in cases:

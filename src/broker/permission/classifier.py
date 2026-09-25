@@ -1,9 +1,14 @@
-"""Anthropic client discipline for the permission classifier, standalone.
+"""The permission classifier: its two calls, its client and its judgement.
 
 The strict-tool derivation and the client construction here duplicate the
 shapes the session broker uses, deliberately and without sharing them: the
 classifier runs on its own small model, and a shared helper is exactly how that
 model would get quietly re-pinned to the session's.
+
+Both calls carry only reasoning: the decision is the tool name, and the
+reasoning is what the developer reads in the permission log. Class names, field
+names, `Field` descriptions and docstrings of the call models are sent to the
+model.
 
 Rules encoded here:
 - AsyncAnthropic(max_retries=0) — the SDK default of 2 silently retries.
@@ -26,12 +31,11 @@ from anthropic.types import (
     ToolChoiceParam,
     ToolParam,
 )
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from broker import llm_timing
 from broker import prompts
 from broker.config import ClassifierConfig
-from broker.permission.schemas import AllowCall, EscalateCall, PermissionResult
 from broker.protocol.schemas import PermissionSuggestion
 
 
@@ -40,7 +44,7 @@ class PermissionCallError(Exception):
 
 
 @dataclass
-class ToolCall:
+class PermissionToolCall:
     name: str
     input: dict[str, Any]
 
@@ -57,7 +61,7 @@ class PermissionCaller(Protocol):
         messages: list[MessageParam],
         tools: list[ToolParam],
         tool_choice: ToolChoiceParam,
-    ) -> ToolCall:
+    ) -> PermissionToolCall:
         """Make one call against the model and return its tool call."""
         ...
 
@@ -117,6 +121,20 @@ def strict_tool(
     }
 
 
+class AllowCall(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reasoning: str
+
+
+class PermissionEscalateCall(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reasoning: str
+
+
+PermissionResult = AllowCall | PermissionEscalateCall
+
 PERMISSION_TOOLS: list[ToolParam] = [
     strict_tool(
         "allow",
@@ -130,31 +148,29 @@ PERMISSION_TOOLS: list[ToolParam] = [
         "Hand the tool call to the developer, who answers the prompt already"
         " on screen. Use when being wrong about the call would be expensive"
         " or would not come back, or when you are unsure.",
-        EscalateCall,
+        PermissionEscalateCall,
     ),
 ]
 
 _TOOL_MODELS: dict[str, type[PermissionResult]] = {
     "allow": AllowCall,
-    "escalate": EscalateCall,
+    "escalate": PermissionEscalateCall,
 }
 
-FORCED_ONE: ToolChoiceParam = {"type": "any", "disable_parallel_tool_use": True}
+PERMISSION_FORCED_ONE: ToolChoiceParam = {
+    "type": "any",
+    "disable_parallel_tool_use": True,
+}
 
 _PERMISSION_PROMPT = prompts.load("permission")
 
 
-def build_classifier_client(cfg: ClassifierConfig) -> AsyncAnthropic:
+def build_classifier_client() -> AsyncAnthropic:
     """Construct the classifier's own Anthropic client.
-
-    Args:
-        cfg: Unused by the client itself; accepted so the classifier's
-            construction site stands on its own.
 
     Returns:
         A client that never retries.
     """
-    del cfg  # unused; accepted so this construction site stands on its own
     return AsyncAnthropic(max_retries=0)
 
 
@@ -184,7 +200,7 @@ async def call_tool(
     messages: Iterable[MessageParam],
     tools: Iterable[ToolParam],
     tool_choice: ToolChoiceParam,
-) -> ToolCall:
+) -> PermissionToolCall:
     """Make one forced tool call and return the single tool_use block.
 
     Args:
@@ -230,7 +246,7 @@ async def call_tool(
             f"expected exactly one tool_use block, got {len(blocks)} "
             f"(request={response._request_id})"  # pyright: ignore[reportPrivateUsage]
         )
-    return ToolCall(
+    return PermissionToolCall(
         name=blocks[0].name, input=cast(dict[str, Any], blocks[0].input)
     )
 
@@ -253,7 +269,7 @@ def bind(client: AsyncAnthropic) -> PermissionCaller:
         messages: list[MessageParam],
         tools: list[ToolParam],
         tool_choice: ToolChoiceParam,
-    ) -> ToolCall:
+    ) -> PermissionToolCall:
         """Invoke the bound client and return its single tool call."""
         return await call_tool(
             client,
@@ -268,7 +284,7 @@ def bind(client: AsyncAnthropic) -> PermissionCaller:
     return call
 
 
-def assemble_context(
+def assemble_permission_context(
     intent: str, tool_name: str, tool_input: dict[str, Any], suggestions: str
 ) -> tuple[list[TextBlockParam], list[MessageParam]]:
     """Assemble the system blocks and messages for one classifier call.
@@ -340,7 +356,7 @@ async def classify(
         PermissionCallError: The LLM called an unknown tool, or the tool input
             failed validation.
     """
-    system, messages = assemble_context(
+    system, messages = assemble_permission_context(
         intent, tool_name, tool_input, suggestions
     )
     call = await llm_call(
@@ -349,7 +365,7 @@ async def classify(
         system=system,
         messages=messages,
         tools=PERMISSION_TOOLS,
-        tool_choice=FORCED_ONE,
+        tool_choice=PERMISSION_FORCED_ONE,
     )
     model = _TOOL_MODELS.get(call.name)
     if model is None:

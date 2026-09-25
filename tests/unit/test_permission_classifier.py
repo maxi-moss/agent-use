@@ -20,16 +20,17 @@ from anthropic.types import (
 )
 
 from broker.config import ClassifierConfig
-from broker.permission.llm import (
+from broker.permission.classifier import (
     PERMISSION_TOOLS,
+    AllowCall,
     PermissionCallError,
-    ToolCall,
+    PermissionEscalateCall,
+    PermissionToolCall,
     build_classifier_client,
     call_tool,
     classify,
     render_suggestions,
 )
-from broker.permission.schemas import AllowCall, EscalateCall
 from broker.protocol.schemas import AddDirectoriesSuggestion
 
 CFG = ClassifierConfig()
@@ -85,7 +86,7 @@ def as_client(fake: FakeClient) -> AsyncAnthropic:
 
 
 class FakeLLM:
-    def __init__(self, result: ToolCall) -> None:
+    def __init__(self, result: PermissionToolCall) -> None:
         self.result = result
         self.calls: list[dict[str, Any]] = []
 
@@ -98,7 +99,7 @@ class FakeLLM:
         messages: list[MessageParam],
         tools: list[ToolParam],
         tool_choice: ToolChoiceParam,
-    ) -> ToolCall:
+    ) -> PermissionToolCall:
         self.calls.append(
             {
                 "model": model,
@@ -149,13 +150,13 @@ def test_permission_tools_schema_pin() -> None:
         json.dumps(PERMISSION_TOOLS, sort_keys=True).encode()
     ).hexdigest()
     assert digest == (
-        "ebdf2c7ce4289e3110c215dffe8553d6c589561d1d913883ab4a4e539a032a11"
+        "a8cebcdaa69483b5361272b13d35e182ad51d6b8ee5e07c06d8a03c4215652f6"
     ), "LLM-visible tool schema changed; review the dumped schema and update the pin"
 
 
 def test_client_has_zero_retries(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    assert build_classifier_client(CFG).max_retries == 0
+    assert build_classifier_client().max_retries == 0
 
 
 async def test_refusal_raises_before_content_indexing() -> None:
@@ -202,29 +203,29 @@ async def _run(fake: FakeLLM) -> Any:
 
 @pytest.mark.parametrize(
     "name,expected_type",
-    [("allow", AllowCall), ("escalate", EscalateCall)],
+    [("allow", AllowCall), ("escalate", PermissionEscalateCall)],
 )
 async def test_each_tool_maps_to_its_model(
     name: str, expected_type: type[Any]
 ) -> None:
-    fake = FakeLLM(ToolCall(name=name, input={"reasoning": "r"}))
+    fake = FakeLLM(PermissionToolCall(name=name, input={"reasoning": "r"}))
     assert isinstance(await _run(fake), expected_type)
 
 
 async def test_unknown_tool_name_raises() -> None:
-    fake = FakeLLM(ToolCall(name="deny", input={"reasoning": "r"}))
+    fake = FakeLLM(PermissionToolCall(name="deny", input={"reasoning": "r"}))
     with pytest.raises(PermissionCallError):
         await _run(fake)
 
 
 async def test_invalid_tool_input_raises() -> None:
-    fake = FakeLLM(ToolCall(name="allow", input={}))
+    fake = FakeLLM(PermissionToolCall(name="allow", input={}))
     with pytest.raises(PermissionCallError):
         await _run(fake)
 
 
 async def test_the_classifier_model_is_forced_and_pinned() -> None:
-    fake = FakeLLM(ToolCall(name="allow", input={"reasoning": "r"}))
+    fake = FakeLLM(PermissionToolCall(name="allow", input={"reasoning": "r"}))
     await _run(fake)
     assert fake.calls[0]["model"] == "claude-haiku-4-5"
     assert fake.calls[0]["tool_choice"] == {
