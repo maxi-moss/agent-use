@@ -34,7 +34,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 HERDR = "herdr"
 FREE_TEXT_ANSWER = "probe free text answer"
@@ -112,11 +112,23 @@ def run_herdr(argv: list[str], timeout_s: float) -> str:
     return proc.stdout
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Narrow a JSON value to an object, treating anything else as empty."""
+    return cast(dict[str, Any], value) if isinstance(value, dict) else {}
+
+
+def _content_blocks(message: dict[str, Any]) -> list[Any]:
+    """Return a transcript message's content blocks, or an empty list."""
+    content = message.get("content")
+    return cast(list[Any], content) if isinstance(content, list) else []
+
+
 def unwrap(stdout: str) -> Any:
     """Decode herdr JSON output, stripping the optional result envelope."""
     parsed: Any = json.loads(stdout)
-    if isinstance(parsed, dict) and "result" in parsed:
-        return parsed["result"]
+    envelope = _as_dict(parsed)
+    if "result" in envelope:
+        return envelope["result"]
     return parsed
 
 
@@ -130,19 +142,22 @@ def seed_trust(project_path: Path, backup_dir: Path) -> None:
     target = Path.home() / ".claude.json"
     data: dict[str, Any] = {}
     if target.exists():
-        data = json.loads(target.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
+        raw: Any = json.loads(target.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
             raise ProbeFailure(f"{target} is not a JSON object; refusing")
+        data = cast(dict[str, Any], raw)
         shutil.copy2(target, backup_dir / "claude.json.probe-backup")
-    projects = data.setdefault("projects", {})
-    if not isinstance(projects, dict):
+    raw_projects: Any = data.setdefault("projects", {})
+    if not isinstance(raw_projects, dict):
         raise ProbeFailure(f"{target}: 'projects' is not an object; refusing")
-    entry = projects.setdefault(str(project_path), {})
-    if not isinstance(entry, dict):
+    projects = cast(dict[str, Any], raw_projects)
+    raw_entry: Any = projects.setdefault(str(project_path), {})
+    if not isinstance(raw_entry, dict):
         raise ProbeFailure(
             f"{target}: projects[{str(project_path)!r}] is not an object; "
             "refusing"
         )
+    entry = cast(dict[str, Any], raw_entry)
     entry["hasTrustDialogAccepted"] = True
     fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=".claude.json.")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -219,7 +234,7 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
             continue
         parsed: Any = json.loads(line)
         if isinstance(parsed, dict):
-            out.append(parsed)
+            out.append(cast(dict[str, Any], parsed))
     return out
 
 
@@ -227,29 +242,31 @@ def transcript_answers(records: list[dict[str, Any]]) -> dict[str, Any]:
     """Map tool_use_id -> structured answers for every ask result present."""
     ask_ids: set[str] = set()
     for rec in records:
-        message = rec.get("message") or {}
-        for block in message.get("content") or []:
+        for raw_block in _content_blocks(_as_dict(rec.get("message"))):
+            if not isinstance(raw_block, dict):
+                continue
+            block = cast(dict[str, Any], raw_block)
             if (
-                isinstance(block, dict)
-                and block.get("type") == "tool_use"
+                block.get("type") == "tool_use"
                 and block.get("name") == "AskUserQuestion"
             ):
                 ask_ids.add(block["id"])
     answers: dict[str, Any] = {}
     for rec in records:
-        message = rec.get("message") or {}
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        for block in content:
+        for raw_block in _content_blocks(_as_dict(rec.get("message"))):
+            if not isinstance(raw_block, dict):
+                continue
+            block = cast(dict[str, Any], raw_block)
             if (
-                isinstance(block, dict)
-                and block.get("type") == "tool_result"
-                and block.get("tool_use_id") in ask_ids
+                block.get("type") != "tool_result"
+                or block.get("tool_use_id") not in ask_ids
             ):
-                result = rec.get("toolUseResult")
-                if isinstance(result, dict):
-                    answers[block["tool_use_id"]] = result.get("answers")
+                continue
+            result = rec.get("toolUseResult")
+            if isinstance(result, dict):
+                answers[block["tool_use_id"]] = cast(
+                    dict[str, Any], result
+                ).get("answers")
     return answers
 
 
@@ -257,12 +274,12 @@ def find_duration_ms(node: Any) -> list[Any]:
     """Collect every duration_ms value anywhere in a JSON structure."""
     found: list[Any] = []
     if isinstance(node, dict):
-        for key, value in node.items():
+        for key, value in cast(dict[str, Any], node).items():
             if key == "duration_ms":
                 found.append(value)
             found.extend(find_duration_ms(value))
     elif isinstance(node, list):
-        for item in node:
+        for item in cast(list[Any], node):
             found.extend(find_duration_ms(item))
     return found
 
@@ -354,7 +371,11 @@ def check(answers: dict[str, Any], injected: list[dict[str, Any]], root: Path) -
         raise ProbeFailure(f"expected 3 PostToolUse echoes, got {len(posts)}")
     for post in posts:
         response = post.get("tool_response")
-        echoed = response.get("answers") if isinstance(response, dict) else None
+        echoed = (
+            cast(dict[str, Any], response).get("answers")
+            if isinstance(response, dict)
+            else None
+        )
         expected = by_id.get(str(post.get("tool_use_id")))
         if echoed != expected:
             raise ProbeFailure(
@@ -390,11 +411,13 @@ def main() -> int:
         )
         return 2
 
-    root = Path(tempfile.mkdtemp(prefix=f"ask-probe-{os.getpid()}-", dir="/private/tmp"))
+    root = Path(
+        tempfile.mkdtemp(prefix=f"ask-probe-{os.getpid()}-", dir="/private/tmp")
+    )
     proj = write_project(root)
     seed_trust(proj, root)
     tdir = transcript_dir_for(proj)
-    before = set(tdir.glob("*.jsonl")) if tdir.exists() else set()
+    before: set[Path] = set(tdir.glob("*.jsonl")) if tdir.exists() else set()
 
     pane_id: str | None = None
     agent = f"ask-probe-{os.getpid()}"
@@ -432,8 +455,7 @@ def main() -> int:
         if pane_id is not None:
             run_herdr(["pane", "close", pane_id], HERDR_CMD_TIMEOUT_S)
         return 1
-    if pane_id is not None:
-        run_herdr(["pane", "close", pane_id], HERDR_CMD_TIMEOUT_S)
+    run_herdr(["pane", "close", pane_id], HERDR_CMD_TIMEOUT_S)
     print("PROBE OK: updatedInput answered all three menus; picker never rendered")
     print(f"artifacts: {root}")
     return 0
