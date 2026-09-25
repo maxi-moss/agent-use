@@ -53,6 +53,20 @@ markers = [
 
 [tool.importlinter]
 root_packages = ["broker"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "process and package layering"
+type = "layers"
+containers = ["broker"]
+exhaustive = true
+layers = [
+    "master | session | hook",
+    "permission | index",
+    "llm | claude | herdr | transcript | prompts | decision_log | calibration",
+    "config | paths | logging_setup | llm_timing | (atomic_json)",
+    "protocol",
+]
 
 [[tool.importlinter.contracts]]
 name = "transcript.raw is only importable by transcript.adapter"
@@ -61,81 +75,45 @@ protected_modules = ["broker.transcript.raw"]
 allowed_importers = ["broker.transcript.adapter"]
 
 [[tool.importlinter.contracts]]
-name = "hook may only import broker.protocol.constants"
+name = "hook imports only broker.protocol.constants"
 type = "forbidden"
 source_modules = ["broker.hook"]
-forbidden_modules = [
-    "broker.protocol",
-    "broker.transcript",
-    "broker.herdr",
-    "broker.claude",
-    "broker.master",
-    "broker.session",
-    "broker.permission",
-    "broker.prompts",
-    "broker.llm",
-    "broker.config",
-    "broker.logging_setup",
-    "broker.paths",
-    "broker.index",
-    "broker.decision_log",
-]
+forbidden_modules = ["broker.*"]
 ignore_imports = ["broker.hook.** -> broker.protocol.constants"]
 
 [[tool.importlinter.contracts]]
-name = "session brokers never import the master or Claude Code config writers"
+name = "hook-path modules import no third-party package"
 type = "forbidden"
-source_modules = ["broker.session"]
-forbidden_modules = [
-    "broker.master",
-    "broker.claude.settings",
-    "broker.claude.trust",
-]
+source_modules = ["broker.hook", "broker.protocol.constants"]
+forbidden_modules = ["pydantic", "anthropic", "openai", "textual", "rich", "tree_sitter"]
 
 [[tool.importlinter.contracts]]
-name = "master never imports session broker internals (spawn is by subprocess)"
-type = "forbidden"
-source_modules = ["broker.master"]
-forbidden_modules = ["broker.session"]
+name = "only the master imports the Claude Code shared-config writers"
+type = "protected"
+protected_modules = ["broker.claude.settings", "broker.claude.trust"]
+allowed_importers = ["broker.master"]
 
 [[tool.importlinter.contracts]]
-name = "permission imports neither broker internals nor the shared llm"
+name = "permission imports neither transcript nor the shared llm"
 type = "forbidden"
 source_modules = ["broker.permission"]
-forbidden_modules = [
-    "broker.session",
-    "broker.master",
-    "broker.transcript",
-    "broker.llm",
-]
+forbidden_modules = ["broker.transcript", "broker.llm"]
 
 [[tool.importlinter.contracts]]
 name = "session reaches permission only through its public interface"
 type = "protected"
-protected_modules = [
-    "broker.permission.module",
-    "broker.permission.llm",
-    "broker.permission.schemas",
-    "broker.permission.permission_log",
-]
+protected_modules = ["broker.permission.*"]
 allowed_importers = ["broker.permission"]
 
 [[tool.importlinter.contracts]]
-name = "index imports none of the broker's runtime surfaces"
+name = "index imports only config, paths and logging_setup"
 type = "forbidden"
 source_modules = ["broker.index"]
-forbidden_modules = [
-    "broker.session",
-    "broker.master",
-    "broker.permission",
-    "broker.llm",
-    "broker.llm_timing",
-    "broker.herdr",
-    "broker.claude",
-    "broker.protocol",
-    "broker.transcript",
-    "broker.hook",
-    "broker.prompts",
+forbidden_modules = ["broker.*"]
+ignore_imports = [
+    "broker.index.** -> broker.config",
+    "broker.index.** -> broker.paths",
+    "broker.index.** -> broker.logging_setup",
 ]
 
 [[tool.importlinter.contracts]]
@@ -143,3 +121,31 @@ name = "only the session broker consumes the index"
 type = "protected"
 protected_modules = ["broker.index"]
 allowed_importers = ["broker.session"]
+
+[[tool.importlinter.contracts]]
+name = "view model imports only broker.protocol.constants"
+type = "forbidden"
+source_modules = ["broker.master.viewmodel"]
+forbidden_modules = ["broker.*", "broker.master.*", "textual", "rich"]
+ignore_imports = ["broker.master.viewmodel -> broker.protocol.constants"]
+
+[[tool.importlinter.contracts]]
+name = "master outside tui is frontend-free"
+type = "forbidden"
+source_modules = ["broker.master"]
+forbidden_modules = ["textual", "rich"]
+ignore_imports = [
+    "broker.master.tui.** -> textual",
+    "broker.master.tui.** -> rich",
+]
+
+[[tool.importlinter.contracts]]
+name = "master entrypoint above tui above core"
+type = "layers"
+containers = ["broker.master"]
+exhaustive = true
+layers = [
+    "__main__",
+    "tui",
+    "testmode : llm : runtime : queue : registry : pane_escalations : outcome : notifier : viewmodel",
+]

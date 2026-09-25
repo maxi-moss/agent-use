@@ -5,7 +5,6 @@ the schema pin is what stops the two drifting apart unnoticed.
 """
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, cast
 
 import anthropic
@@ -30,8 +29,6 @@ from broker.permission.llm import (
 )
 from broker.permission.schemas import AllowCall, EscalateCall
 from broker.protocol.schemas import AddDirectoriesSuggestion
-
-PACKAGE = Path(__file__).parent.parent.parent / "src" / "broker" / "permission"
 
 CFG = ClassifierConfig()
 
@@ -241,12 +238,3 @@ def test_unknown_suggestion_arm_renders_as_itself() -> None:
     assert "/repo" in rendered
     assert "somethingNew" in rendered
     assert render_suggestions([]) == "(none)"
-
-
-def test_package_never_imports_the_shared_llm_or_broker_internals() -> None:
-    """The classifier's model must not be re-pinnable through a shared helper."""
-    forbidden = ("broker.llm", "broker.session", "broker.master", "broker.transcript")
-    for path in sorted(PACKAGE.glob("*.py")):
-        text = path.read_text(encoding="utf-8")
-        for name in forbidden:
-            assert name not in text, f"{path.name} references {name}"
