@@ -64,7 +64,7 @@ layers = [
     "master | session | hook",
     "permission | index",
     "llm | claude | herdr | transcript | prompts | decision_log | calibration",
-    "config | paths | logging_setup | llm_timing | (atomic_json)",
+    "config | paths | logging_setup | llm_timing | atomic_json",
     "protocol",
 ]
 

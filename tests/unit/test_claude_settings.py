@@ -1,12 +1,13 @@
 """settings.py: idempotent registration, foreign-entry preservation, repair."""
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from broker.claude.atomic import AtomicWriteError
+from broker.atomic_json import AtomicWriteError
 from broker.claude.settings import (
     BROKER_HOOK_MARKER,
     hook_entry,
@@ -113,6 +114,22 @@ def test_verify_and_repair_clean_reports_nothing(tmp_path: Path) -> None:
     report = verify_and_repair(EVENTS, COMMAND, target)
     assert report.repaired_events == []
     assert report.warnings == []
+
+
+def test_repeat_verify_keeps_file_and_pre_change_backup(tmp_path: Path) -> None:
+    target = tmp_path / "settings.json"
+    original = json.dumps({"hooks": {"PreToolUse": [FAKE_HERDR_ENTRY]}})
+    target.write_text(original)
+    backup = tmp_path / "settings.json.broker-backup"
+    verify_and_repair(EVENTS, COMMAND, target)
+    for written in (target, backup):
+        os.utime(written, ns=(1_000_000_000, 1_000_000_000))
+
+    report = verify_and_repair(EVENTS, COMMAND, target)
+    assert report.repaired_events == []
+    assert target.stat().st_mtime_ns == 1_000_000_000
+    assert backup.stat().st_mtime_ns == 1_000_000_000
+    assert backup.read_text() == original
 
 
 def test_session_permissions_creates_file_and_parents(tmp_path: Path) -> None:

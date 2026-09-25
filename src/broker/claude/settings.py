@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
-from broker.claude.atomic import atomic_update_json
+from broker.atomic_json import atomic_update_json
 from broker.claude.paths import settings_path
 from broker.protocol.constants import HOOK_SETTINGS_TIMEOUT
 
@@ -127,7 +127,7 @@ def register_hooks(
         _ensure_registered(data, events, command)
         return data
 
-    atomic_update_json(target, mutate)
+    atomic_update_json(target, mutate, backup=True)
 
 
 def write_session_permissions(path: Path, rules: dict[str, Any]) -> None:
@@ -153,7 +153,7 @@ def write_session_permissions(path: Path, rules: dict[str, Any]) -> None:
         data["permissions"] = permissions
         return data
 
-    atomic_update_json(path, mutate)
+    atomic_update_json(path, mutate, backup=False)
 
 
 def verify_and_repair(
@@ -182,7 +182,7 @@ def verify_and_repair(
         report.repaired_events = _ensure_registered(data, events, command)
         return data
 
-    atomic_update_json(target, mutate)
+    atomic_update_json(target, mutate, backup=True)
     if report.repaired_events:
         report.warnings.append(
             f"re-registered broker hook entries for {report.repaired_events}"

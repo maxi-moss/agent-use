@@ -13,7 +13,7 @@ from typing import Any, cast
 
 from pydantic import ValidationError
 
-from broker.claude.atomic import atomic_update_json
+from broker.atomic_json import atomic_update_json
 from broker.protocol.schemas import EscalationPayload
 
 
@@ -173,4 +173,4 @@ class EscalationQueue:
             data["queue"] = queue
             return data
 
-        atomic_update_json(self._path, mutate)
+        atomic_update_json(self._path, mutate, backup=False)

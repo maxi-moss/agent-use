@@ -13,7 +13,7 @@ from typing import Any, cast
 
 from pydantic import ValidationError
 
-from broker.claude.atomic import atomic_update_json
+from broker.atomic_json import atomic_update_json
 from broker.protocol.schemas import PANE_ESCALATION_ADAPTER, PaneEscalationPayload
 
 
@@ -144,4 +144,4 @@ class PaneEscalations:
             data["pane_escalations"] = entries
             return data
 
-        atomic_update_json(self._path, mutate)
+        atomic_update_json(self._path, mutate, backup=False)
