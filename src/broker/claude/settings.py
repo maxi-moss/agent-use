@@ -7,6 +7,7 @@ registration.
 """
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -57,7 +58,7 @@ def _entry_is_ours(entry: Any) -> bool:
 
 
 def _ensure_registered(
-    data: dict[str, Any], events: list[str], command: str
+    data: dict[str, Any], events: Sequence[str], command: str
 ) -> list[str]:
     """Bring our entry for each event up to ``command``, adding it if absent.
 
@@ -105,7 +106,7 @@ def _ensure_registered(
 
 
 def register_hooks(
-    events: list[str], command: str, path: Path | None = None
+    events: Sequence[str], command: str, path: Path | None = None
 ) -> None:
     """Register our hook entry for ``events`` in Claude Code's settings.
 
@@ -157,7 +158,7 @@ def write_session_permissions(path: Path, rules: dict[str, Any]) -> None:
 
 
 def verify_and_repair(
-    events: list[str],
+    events: Sequence[str],
     command: str,
     path: Path | None = None,
     *,
@@ -196,7 +197,7 @@ def verify_and_repair(
 
 
 def _check_shadow(
-    candidate: Path, events: list[str], report: RepairReport
+    candidate: Path, events: Sequence[str], report: RepairReport
 ) -> None:
     """Warn when ``candidate`` shadows our registration for any of ``events``.
 

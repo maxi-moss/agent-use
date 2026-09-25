@@ -26,6 +26,7 @@ from broker.claude.settings import register_hooks, verify_and_repair
 from broker.herdr import driver
 from broker.paths import BrokerPaths
 from broker.llm import build_client
+from broker.protocol.constants import HookEventName
 from broker.master.llm import bind_call_turn
 from broker.master.pane_escalations import PaneEscalations, PaneStoreError
 from broker.master.queue import EscalationQueue, QueueError
@@ -37,21 +38,6 @@ from broker.master.tui.app import BrokerMasterApp
 TEST_MODE_ANCHOR = "%test-mode"
 TEST_MODE_WARNING = "TEST MODE — synthetic traffic only; LLM disabled"
 STATUS_TIMEOUT_S = 10.0
-
-# Core hook events plus observability extras
-EVENTS = [
-    "SessionStart",
-    "SessionEnd",
-    "UserPromptSubmit",
-    "Stop",
-    "StopFailure",
-    "Notification",
-    "PreToolUse",
-    "PostToolUse",
-    "PreCompact",
-    "PostCompact",
-    "PermissionRequest",
-]
 
 
 def _fail(reason: str) -> NoReturn:
@@ -124,12 +110,14 @@ def main() -> None:
             f'[ -n "$BROKER_SOCKET" ] || exit 0; '
             f"exec {sys.executable} -m broker.hook  # broker-hook"
         )
-        register_hooks(EVENTS, command)
+        register_hooks(list(HookEventName), command)
         candidates = [
             Path(record.cwd) / ".claude" / "settings.json"
             for record in registry.records.values()
         ]
-        report = verify_and_repair(EVENTS, command, shadow_candidates=candidates)
+        report = verify_and_repair(
+            list(HookEventName), command, shadow_candidates=candidates
+        )
         warnings = list(report.warnings)
 
         # 3. Reconcile the registry: probe, classify, retract — never spawn.

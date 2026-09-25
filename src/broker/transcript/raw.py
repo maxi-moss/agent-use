@@ -10,6 +10,8 @@ is the adapter's job — this module never holds cross-record state.
 
 from typing import Any, cast
 
+from broker.protocol.constants import ASK_USER_QUESTION
+
 # Keep-known rule: only these top-level record types are recognised.
 # Everything else — including future types — is discarded, counted, never fatal.
 KNOWN_RECORD_TYPES = frozenset({"assistant", "user"})
@@ -126,7 +128,7 @@ def _map_tool_use(block: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
     tool_input = _as_dict(block.get("input"))
     if not isinstance(block_id, str) or tool_input is None:
         return None
-    if name == "AskUserQuestion":
+    if name == ASK_USER_QUESTION:
         questions = _as_list(tool_input.get("questions"))
         if questions is None:
             return None

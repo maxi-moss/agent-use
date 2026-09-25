@@ -43,8 +43,11 @@ def _record_failure(text: str) -> None:
 try:
     from broker.protocol.constants import (
         ASK_DECISION_ANSWER,
+        ASK_USER_QUESTION,
         DECISION_ALLOW,
+        ENV_BROKER_SOCKET,
         HOOK_WAIT_SECONDS,
+        HookEventName,
         MAX_LINE_BYTES,
         PROTOCOL_VERSION,
         T_ASK_QUESTION,
@@ -59,13 +62,11 @@ except Exception:
     _record_failure(traceback.format_exc())
     sys.exit(0)
 
-ASK_USER_QUESTION = "AskUserQuestion"
-
 # PermissionRequest's own nested shape. Claude Code validates it and treats
 # PreToolUse's flat permissionDecision shape here as if nothing was printed.
 _ALLOW_OUTPUT = {
     "hookSpecificOutput": {
-        "hookEventName": "PermissionRequest",
+        "hookEventName": HookEventName.PERMISSION_REQUEST,
         "decision": {"behavior": "allow", "message": "broker approved"},
     }
 }
@@ -107,21 +108,24 @@ def main() -> None:
     if not isinstance(raw_payload, dict):
         return
     payload = cast(dict[str, Any], raw_payload)
-    sock_path = os.environ.get("BROKER_SOCKET")
+    sock_path = os.environ.get(ENV_BROKER_SOCKET)
     if not sock_path:
         return  # isolation gate
 
     event = payload.get("hook_event_name")
-    if event == "PreToolUse" and payload.get("tool_name") != ASK_USER_QUESTION:
+    if (
+        event == HookEventName.PRE_TOOL_USE
+        and payload.get("tool_name") != ASK_USER_QUESTION
+    ):
         # PreToolUse fires on every tool call. Returning here — above the
         # socket — is what keeps ordinary tool calls free of any broker cost:
         # no connection, no wait. The decision path is PermissionRequest.
         return
 
     timeout = _timeout_seconds()
-    blocking = event in ("PermissionRequest", "PreToolUse")
+    blocking = event in (HookEventName.PERMISSION_REQUEST, HookEventName.PRE_TOOL_USE)
 
-    if event == "PermissionRequest":
+    if event == HookEventName.PERMISSION_REQUEST:
         envelope = {
             "v": PROTOCOL_VERSION,
             "id": uuid.uuid4().hex,
@@ -140,7 +144,7 @@ def main() -> None:
                 ),
             },
         }
-    elif event == "PreToolUse":
+    elif event == HookEventName.PRE_TOOL_USE:
         envelope = {
             "v": PROTOCOL_VERSION,
             "id": uuid.uuid4().hex,
@@ -178,7 +182,7 @@ def main() -> None:
             return
         decision_payload = cast(dict[str, Any], raw_decision)
 
-        if event == "PermissionRequest":
+        if event == HookEventName.PERMISSION_REQUEST:
             if decision_payload.get("decision") == DECISION_ALLOW:
                 # The sanctioned stdout write for permissions. Anything but an
                 # explicit allow (escalated / malformed / timeout) prints
@@ -196,7 +200,7 @@ def main() -> None:
             json.dumps(
                 {
                     "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
+                        "hookEventName": HookEventName.PRE_TOOL_USE,
                         "permissionDecision": "allow",
                         "permissionDecisionReason": "broker answered",
                         "updatedInput": updated,

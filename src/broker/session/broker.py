@@ -21,7 +21,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, assert_never, cast
 
 from anthropic import AsyncAnthropic
 from anthropic.types import (
@@ -54,8 +54,11 @@ from broker.protocol import client
 from broker.protocol.constants import (
     ACTIVE_STATES,
     ASK_DECISION_ANSWER,
+    ASK_USER_QUESTION,
     DECISION_ALLOW,
     DECISION_ESCALATED,
+    ENV_BROKER_SOCKET,
+    HookEventName,
     NACK_STALE_PROPOSAL,
     NACK_WRONG_STATE,
     SessionState,
@@ -159,8 +162,6 @@ CLARIFY_TIMEOUT_S = 45.0
 # still prompts on the risky ones, so the hook's escalation path survives;
 # "bypassPermissions" would silently approve every escalation.
 CLAUDE_AGENT_ARGS = ["--model", "opus", "--permission-mode", "auto"]
-
-ASK_USER_QUESTION = "AskUserQuestion"
 
 # Dashboard activity phrases, one per LLM call site.
 PHRASE_GROUNDING = "constructing the prompt…"
@@ -470,7 +471,7 @@ class SessionBroker:
             cfg.anchor_pane,
             direction="right",
             cwd=Path(cfg.cwd),
-            env={"BROKER_SOCKET": cfg.socket_path},
+            env={ENV_BROKER_SOCKET: cfg.socket_path},
             focus=False,
             timeout_s=15.0,
         )
@@ -1055,46 +1056,55 @@ class SessionBroker:
             hook: Validated hook payload; ``raw`` is the untyped hook JSON.
         """
         raw = hook.raw
-        name = hook.hook_event_name
-        if name == "SessionStart":
-            self._bind_session(raw)
-        elif name == "Stop":
-            self._set_perm_pending(False)
-            message = str(raw.get("last_assistant_message", "") or "")
-            self.queue.put_nowait(lambda: self._on_turn_end(message))
-        elif name == "StopFailure":
-            error_class = str(
-                raw.get("matcher") or raw.get("error") or "stop_failure"
-            )
-            detail = str(raw.get("message") or raw)
-            # Surfaced, NOT a completed turn.
-            self.queue.put_nowait(lambda: self._fatal(error_class, detail))
-        elif name in {"UserPromptSubmit", "PostToolUse"}:
-            if name == "PostToolUse":
+        try:
+            event = HookEventName(hook.hook_event_name)
+        except ValueError:
+            logger.warning("unrecognized hook event %r", hook.hook_event_name)
+            return
+        match event:
+            case HookEventName.SESSION_START:
+                self._bind_session(raw)
+            case HookEventName.STOP:
                 self._set_perm_pending(False)
-                tool_name, tool_input = _raw_tool(raw)
-                self.permission.note_tool_completed(tool_name, tool_input)
-                if tool_name == ASK_USER_QUESTION:
-                    self._verify_ask(raw)
-            else:
-                self.permission.note_developer_input()
-            if self._open_menu is not None:
-                self.queue.put_nowait(self._check_menu_answered)
-            if self.state == SessionState.ESCALATED:
-                self.queue.put_nowait(self._check_out_of_band_resolution)
-        elif name == "Notification":
-            self._log(DecisionKind.NOTIFICATION, "", str(raw.get("message", "")))
-            if raw.get("notification_type") == "permission_prompt":
-                self._set_perm_pending(True)
-        elif name == "SessionEnd":
-            self.permission.note_session_ended()
-            self._set_state(SessionState.STOPPED)
-            self._log(DecisionKind.SESSION_END, "", "SessionEnd hook received")
-            self.queue.put_nowait(self._on_session_end)
-        elif name in {"PreCompact", "PostCompact"}:
-            self._log(DecisionKind.COMPACTION, "", name)  # continue normally
-        else:
-            logger.debug("unhandled hook event %s", name)
+                message = str(raw.get("last_assistant_message", "") or "")
+                self.queue.put_nowait(lambda: self._on_turn_end(message))
+            case HookEventName.STOP_FAILURE:
+                error_class = str(
+                    raw.get("matcher") or raw.get("error") or "stop_failure"
+                )
+                detail = str(raw.get("message") or raw)
+                # Surfaced, NOT a completed turn.
+                self.queue.put_nowait(lambda: self._fatal(error_class, detail))
+            case HookEventName.USER_PROMPT_SUBMIT | HookEventName.POST_TOOL_USE:
+                if event == HookEventName.POST_TOOL_USE:
+                    self._set_perm_pending(False)
+                    tool_name, tool_input = _raw_tool(raw)
+                    self.permission.note_tool_completed(tool_name, tool_input)
+                    if tool_name == ASK_USER_QUESTION:
+                        self._verify_ask(raw)
+                else:
+                    self.permission.note_developer_input()
+                if self._open_menu is not None:
+                    self.queue.put_nowait(self._check_menu_answered)
+                if self.state == SessionState.ESCALATED:
+                    self.queue.put_nowait(self._check_out_of_band_resolution)
+            case HookEventName.NOTIFICATION:
+                self._log(DecisionKind.NOTIFICATION, "", str(raw.get("message", "")))
+                if raw.get("notification_type") == "permission_prompt":
+                    self._set_perm_pending(True)
+            case HookEventName.SESSION_END:
+                self.permission.note_session_ended()
+                self._set_state(SessionState.STOPPED)
+                self._log(DecisionKind.SESSION_END, "", "SessionEnd hook received")
+                self.queue.put_nowait(self._on_session_end)
+            case HookEventName.PRE_COMPACT | HookEventName.POST_COMPACT:
+                self._log(DecisionKind.COMPACTION, "", event)  # continue normally
+            case HookEventName.PRE_TOOL_USE | HookEventName.PERMISSION_REQUEST:
+                # The hook routes these as permission_request/ask_question,
+                # never as a hook_event; _dispatch_hook should never see them.
+                logger.error("hook never routes %s through _dispatch_hook", event)
+            case _:
+                assert_never(event)
 
     def _bind_session(self, raw: dict[str, Any]) -> None:
         """Bind the Claude session id and transcript path from SessionStart.
@@ -1152,7 +1162,7 @@ class SessionBroker:
                 self.broker_cfg,
                 intent=self._intent(),
                 events=events,
-                event_name="Stop",
+                event_name=HookEventName.STOP,
                 last_assistant_message=last_assistant_message,
             )
         if not isinstance(result, EscalateCall):
