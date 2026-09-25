@@ -21,6 +21,7 @@ from anthropic.types import (
 
 from broker.config import ClassifierConfig
 from broker.permission.classifier import (
+    PERMISSION_CALL_TIMEOUT_S,
     PERMISSION_TOOLS,
     AllowCall,
     PermissionCallError,
@@ -42,6 +43,7 @@ CALL_KWARGS: dict[str, Any] = {
     "messages": [],
     "tools": [],
     "tool_choice": {"type": "any", "disable_parallel_tool_use": True},
+    "timeout_s": PERMISSION_CALL_TIMEOUT_S,
 }
 
 

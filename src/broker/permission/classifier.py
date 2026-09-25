@@ -162,6 +162,10 @@ PERMISSION_FORCED_ONE: ToolChoiceParam = {
     "disable_parallel_tool_use": True,
 }
 
+# Named and bounded like every other wait (global rule); permission-owned, not
+# shared with the session or master call timeouts.
+PERMISSION_CALL_TIMEOUT_S = 15.0
+
 _PERMISSION_PROMPT = prompts.load("permission")
 
 
@@ -200,6 +204,7 @@ async def call_tool(
     messages: Iterable[MessageParam],
     tools: Iterable[ToolParam],
     tool_choice: ToolChoiceParam,
+    timeout_s: float,
 ) -> PermissionToolCall:
     """Make one forced tool call and return the single tool_use block.
 
@@ -211,6 +216,7 @@ async def call_tool(
         messages: Conversation sent to the model.
         tools: Tool definitions offered.
         tool_choice: How the model may use them; a forcing choice is expected.
+        timeout_s: Deadline passed straight to the SDK call.
 
     Returns:
         The tool the model called, with its input.
@@ -227,6 +233,7 @@ async def call_tool(
             messages=list(messages),
             tools=list(tools),
             tool_choice=tool_choice,
+            timeout=timeout_s,
         )
     except anthropic.AnthropicError as exc:
         raise PermissionCallError(f"{type(exc).__name__}: {exc}") from exc
@@ -279,6 +286,7 @@ def bind(client: AsyncAnthropic) -> PermissionCaller:
             messages=messages,
             tools=tools,
             tool_choice=tool_choice,
+            timeout_s=PERMISSION_CALL_TIMEOUT_S,
         )
 
     return call

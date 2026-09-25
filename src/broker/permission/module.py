@@ -43,6 +43,11 @@ from broker.protocol.schemas import (
 logger = logging.getLogger(__name__)
 
 MASTER_TIMEOUT_S = 10.0
+# Named and bounded like every other wait (global rule). Sits under
+# HOOK_WAIT_SECONDS (30) so the hook never gives up while the module still
+# intends to answer; permission-owned, not shared with the session or master
+# call timeouts.
+PERMISSION_DECISION_TIMEOUT_S = 20.0
 
 _ASK_REASON = (
     "the session is putting a question to the developer; that question travels"
@@ -129,14 +134,30 @@ class PermissionModule:
         key = _call_key(tool_name, tool_input)
         started = time.monotonic()
         try:
-            result = await classifier.classify(
-                self._caller(),
-                self.cfg,
-                intent=self.intent,
-                tool_name=tool_name,
-                tool_input=tool_input,
-                suggestions=classifier.render_suggestions(suggestions),
+            async with asyncio.timeout(PERMISSION_DECISION_TIMEOUT_S):
+                result = await classifier.classify(
+                    self._caller(),
+                    self.cfg,
+                    intent=self.intent,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    suggestions=classifier.render_suggestions(suggestions),
+                )
+        except TimeoutError:
+            reason = (
+                "permission decision exceeded PERMISSION_DECISION_TIMEOUT_S "
+                f"({PERMISSION_DECISION_TIMEOUT_S:.0f} s)"
             )
+            logger.warning(reason)
+            self._append(
+                tool_name,
+                tool_input,
+                DECISION_ESCALATED,
+                reason,
+                self.cfg.model_id,
+                _elapsed_ms(started),
+            )
+            return DECISION_ESCALATED
         except Exception as exc:
             logger.warning("permission classification failed: %s", exc)
             self._append(

@@ -22,6 +22,7 @@ from anthropic.types import (
 
 from broker.config import ClassifierConfig
 from broker.permission import PermissionModule
+from broker.permission import module as permission_module
 from broker.permission.classifier import PermissionCallError, PermissionToolCall
 from broker.protocol.constants import (
     DECISION_ALLOW,
@@ -206,6 +207,23 @@ async def test_askuserquestion_gate_no_inference(home: Path) -> None:
     written = entries(log)
     assert len(written) == 1
     assert written[0]["model_id"] is None
+
+
+async def test_classifier_past_the_deadline_resolves_to_escalated(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(permission_module, "PERMISSION_DECISION_TIMEOUT_S", 0.05)
+    llm = FakeLLM()
+    llm.never_resolve = True
+    async with _module(home, llm) as (module, master, log):
+        async with asyncio.timeout(2.0):
+            decision = await module.decide("Bash", PUSH_INPUT, [])
+        await asyncio.sleep(SETTLE_S)
+    assert decision == DECISION_ESCALATED
+    written = entries(log)
+    assert len(written) == 1
+    assert written[0]["decision"] == DECISION_ESCALATED
+    assert master.received == []
 
 
 def _completed(module: PermissionModule) -> None:
