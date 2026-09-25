@@ -27,18 +27,17 @@ from broker.master.llm import (
     MasterLLM,
 )
 from broker.master.pane_escalations import PaneEscalations
-from broker.master.queue import EscalationQueue
-from broker.master.registry import Registry, SessionRecord
-from broker.paths import BrokerPaths
-from broker.protocol.constants import SessionState
-from broker.master.runtime import (
-    MasterRuntime,
-    PendingProposal,
+from broker.master.payload_render import (
     render_escalation,
     render_permission_escalation,
     render_proposal,
     render_question_escalation,
 )
+from broker.master.queue import EscalationQueue
+from broker.master.registry import Registry, SessionRecord
+from broker.paths import BrokerPaths
+from broker.protocol.constants import SessionState
+from broker.master.runtime import MasterRuntime, PendingProposal
 from broker.protocol.schemas import (
     EscalationPayload,
     PermissionEscalationPayload,

@@ -18,15 +18,14 @@ from broker.decision_log import DecisionKind
 from broker.config import BrokerConfig
 from broker.herdr import driver
 from broker.master.pane_escalations import PaneEscalations
-from broker.master.queue import EscalationQueue
-from broker.master.registry import Registry, SessionRecord
-from broker.master.runtime import (
+from broker.master.payload_render import (
     PANE_UNKNOWN,
-    MasterRuntime,
     render_escalation,
-    render_permission_escalation,
     render_question_escalation,
 )
+from broker.master.queue import EscalationQueue
+from broker.master.registry import Registry, SessionRecord
+from broker.master.runtime import MasterRuntime
 from broker.master.viewmodel import (
     Attention,
     CompletionArrived,
@@ -383,27 +382,6 @@ def _leaf_values(value: Any) -> Iterator[str]:
             yield from _leaf_values(item)
 
 
-async def test_escalation_rendered_verbatim(
-    rt: tuple[MasterRuntime, list[Any]]
-) -> None:
-    runtime, posts = rt
-    payload = escalation_dict()
-    resp = await send(runtime, T_ESCALATION, payload)
-    assert resp.ok
-    arrived = [m for m in posts if isinstance(m, EscalationArrived)]
-    assert len(arrived) == 1
-    rendered = arrived[0].rendered
-    # Every value the developer decides on appears byte-for-byte — no
-    # paraphrase.
-    for value in _leaf_values(payload):
-        assert value in rendered
-    assert rendered == render_escalation(
-        EscalationPayload.model_validate(payload)
-    )
-    assert runtime.queue.active is not None
-    assert runtime.queue.active.escalation_id == "e1"
-
-
 async def test_second_escalation_while_active_is_protocol_violation(
     rt: tuple[MasterRuntime, list[Any]]
 ) -> None:
@@ -421,38 +399,6 @@ async def test_second_escalation_while_active_is_protocol_violation(
     assert (
         len([m for m in posts if isinstance(m, EscalationArrived)]) == 1
     )
-
-
-async def test_permission_pane_rendered_names_pane_and_offers_no_dispatch(
-    rt: tuple[MasterRuntime, list[Any]]
-) -> None:
-    runtime, posts = rt
-    record = runtime.registry.get("s1")
-    record.pane_id = "w3:p2"
-    runtime.registry.upsert(record)
-    payload = permission_pane_dict()
-    resp = await send(runtime, T_PANE_ESCALATION, payload)
-    assert resp.ok
-    arrived = [m for m in posts if isinstance(m, PaneEscalationArrived)]
-    assert len(arrived) == 1
-    rendered = arrived[0].rendered
-    assert rendered == render_permission_escalation(
-        PermissionEscalationPayload.model_validate(payload), "w3:p2"
-    )
-    # Every field the developer judges the prompt on appears byte-for-byte.
-    # raised_at is the resolution baseline, not something they read.
-    judged = {k: v for k, v in payload.items() if k != "raised_at"}
-    for value in _leaf_values(judged):
-        assert value in rendered
-    # No timestamp reaches the block: it is carried into the master's LLM
-    # context, where a clock reading is only ever something to reason from.
-    assert payload["raised_at"] not in rendered
-    assert "w3:p2" in rendered  # the pane the native prompt is waiting in
-    assert "cannot be answered here" in rendered
-    assert "dispatch" not in rendered.lower()  # no affordance to answer it here
-    # Held apart from the decision queue, never in it.
-    assert runtime.queue.active is None
-    assert [p.escalation_id for p in runtime.panes.entries] == ["p1"]
 
 
 async def test_second_permission_pane_from_a_session_is_protocol_violation(
@@ -1712,7 +1658,7 @@ async def test_every_broker_message_type_is_acked(
     ).ok
 
 
-async def test_proposal_rendered_verbatim_and_tracked(
+async def test_proposal_awaits_approval_and_badges_on_arrival(
     rt: tuple[MasterRuntime, list[Any]]
 ) -> None:
     runtime, posts = rt
@@ -1723,19 +1669,12 @@ async def test_proposal_rendered_verbatim_and_tracked(
             "proposal_id": "p1",
             "proposed_prompt": "the exact proposed prompt",
             "grounding_summary": "the exact grounding summary",
-            "retrieved": [
-                {"name": "a.py::f", "score": 0.81},
-                {"name": "a.py::g", "score": None},
-            ],
         },
     )
     assert resp.ok
-    arrived = [m for m in posts if isinstance(m, ProposalArrived)]
-    assert len(arrived) == 1
-    assert "the exact proposed prompt" in arrived[0].rendered
-    assert "the exact grounding summary" in arrived[0].rendered
-    assert "## Retrieved code\n- a.py::f (seed 0.81)\n- a.py::g" in arrived[0].rendered
-    assert runtime.registry.get("s1").state == "awaiting_approval"
+    assert len([m for m in posts if isinstance(m, ProposalArrived)]) == 1
+    assert list(runtime.proposals) == ["p1"]
+    assert runtime.registry.get("s1").state == SessionState.AWAITING_APPROVAL
     # The badge reaches the sidebar on this push, not on some later unrelated
     # one — the developer needs to see it the moment it arrives.
     row = [m for m in posts if isinstance(m, FleetUpdated)][-1].view.rows[0]

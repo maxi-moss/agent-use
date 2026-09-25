@@ -37,12 +37,12 @@ from broker.llm import (
     call_turn,
     strict_tool,
 )
-from broker.master.runtime import (
-    MasterRuntime,
+from broker.master.payload_render import (
     render_escalation,
     render_pane_escalation,
     render_proposal,
 )
+from broker.master.runtime import MasterRuntime
 
 MAX_TOOL_ROUNDS = 6
 
