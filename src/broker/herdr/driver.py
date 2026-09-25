@@ -170,7 +170,7 @@ def _unwrap_result(parsed: Any) -> Any:
     return cast(Any, parsed)
 
 
-def status(*, timeout_s: float = 10.0) -> HerdrStatus:
+def status(*, timeout_s: float) -> HerdrStatus:
     """Read the herdr client/server status.
 
     Args:
@@ -341,63 +341,6 @@ def agent_prompt(target: str, text: str, *, timeout_s: float) -> None:
     """
     _check_identifier(target, "agent target")
     _run([HERDR, "agent", "prompt", target, text], timeout_s)
-
-
-def pane_send_keys(pane_id: str, *keys: str, timeout_s: float) -> None:
-    """Send literal keystrokes to a pane.
-
-    Args:
-        pane_id: Pane to send to.
-        *keys: Key names, e.g. ``"enter"``; each is flag-checked in turn.
-        timeout_s: Wall-clock limit for the subprocess.
-
-    Raises:
-        ValueError: The pane id or any key looks like a flag.
-    """
-    _check_identifier(pane_id, "pane id")
-    for key in keys:
-        _check_identifier(key, "key")
-    _run([HERDR, "pane", "send-keys", pane_id, *keys], timeout_s)
-
-
-def agent_wait(
-    target: str, *, until: list[str], timeout_ms: int
-) -> dict[str, Any]:
-    """Block until an agent reaches one of the ``until`` states.
-
-    Requires an explicit timeout; herdr waits block forever without one.
-
-    Args:
-        target: Agent name or id.
-        until: Agent states to wait for; each becomes its own ``--until`` flag.
-        timeout_ms: herdr's wait timeout, in milliseconds.
-
-    Returns:
-        The parsed result object, or ``{}`` when herdr printed nothing usable.
-
-    Raises:
-        ValueError: ``until`` is empty, or the target or a state looks like a
-            flag.
-    """
-    _check_identifier(target, "agent target")
-    if not until:
-        raise ValueError("agent_wait requires at least one --until state")
-    argv = [HERDR, "agent", "wait", target]
-    for state in until:
-        _check_identifier(state, "wait state")
-        argv += ["--until", state]
-    argv += ["--timeout", str(timeout_ms)]
-    stdout = _run(argv, timeout_s=timeout_ms / 1000 + _HERDR_WAIT_GRACE_S)
-    parsed: Any = _parse_json(stdout) if stdout.strip() else {}
-    if isinstance(parsed, dict):
-        return cast(dict[str, Any], parsed)
-    return {}
-
-
-def pane_close(pane_id: str, *, timeout_s: float) -> None:
-    """Close the pane with the given id."""
-    _check_identifier(pane_id, "pane id")
-    _run([HERDR, "pane", "close", pane_id], timeout_s)
 
 
 def notification_show(

@@ -36,6 +36,7 @@ from broker.master.tui.app import BrokerMasterApp
 
 TEST_MODE_ANCHOR = "%test-mode"
 TEST_MODE_WARNING = "TEST MODE — synthetic traffic only; LLM disabled"
+STATUS_TIMEOUT_S = 10.0
 
 # Core hook events plus observability extras
 EVENTS = [
@@ -85,7 +86,7 @@ def main() -> None:
         if shutil.which("herdr") is None:
             _fail("`herdr` is not on PATH")
         try:
-            if not driver.status().compatible:
+            if not driver.status(timeout_s=STATUS_TIMEOUT_S).compatible:
                 _fail("herdr client/server report incompatible")
         except Exception as exc:
             _fail(f"`herdr status` failed: {exc}")
