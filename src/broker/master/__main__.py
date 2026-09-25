@@ -1,9 +1,9 @@
-"""broker-master entrypoint. Startup sequence — ORDER IS BINDING:
-environment assertions → hook registration (user level) + verify-and-repair →
+"""broker.master entrypoint. Startup sequence — ORDER IS BINDING:
+environment assertions → hook verify-and-repair (user level) →
 registry reconciliation (probe, classify, retract — never spawn) →
 runtime/app built → App.run() (the socket server starts inside on_mount).
 
-The registry file is READ before hook registration only to supply candidate
+The registry file is READ before hook verify-and-repair only to supply candidate
 shadow paths (known cwds are needed here); reconciliation and its save happen
 in their bound position, after verify-and-repair and before the app is built,
 so a dead session's retracted escalation and open pane escalations are gone
@@ -22,7 +22,7 @@ from typing import NoReturn
 from broker import config as broker_config
 from broker import llm_timing
 from broker import logging_setup
-from broker.claude.settings import register_hooks, verify_and_repair
+from broker.claude.settings import broker_hook_command, verify_and_repair
 from broker.herdr import driver
 from broker.paths import BrokerPaths
 from broker.llm import build_client
@@ -30,7 +30,7 @@ from broker.protocol.constants import HookEventName
 from broker.master.llm import bind_call_turn
 from broker.master.pane_escalations import PaneEscalations, PaneStoreError
 from broker.master.queue import EscalationQueue, QueueError
-from broker.master.registry import Registry
+from broker.master.registry import Registry, RegistryError
 from broker.master.runtime import reconcile_registry
 from broker.master.testmode import SCENARIO_DIR, test_mode_llm_call
 from broker.master.tui.app import BrokerMasterApp
@@ -41,12 +41,12 @@ STATUS_TIMEOUT_S = 10.0
 
 
 def _fail(reason: str) -> NoReturn:
-    print(f"broker-master: {reason}", file=sys.stderr)
+    print(f"broker.master: {reason}", file=sys.stderr)
     raise SystemExit(1)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="broker-master")
+    parser = argparse.ArgumentParser(prog="broker.master")
     parser.add_argument(
         "--anchor", help="anchor pane id (overrides HERDR_PANE_ID)"
     )
@@ -86,11 +86,17 @@ def main() -> None:
     else:
         anchor = args.anchor or os.environ.get("HERDR_PANE_ID") or TEST_MODE_ANCHOR
 
-    cfg = broker_config.load()
+    try:
+        cfg = broker_config.load()
+    except broker_config.ConfigError as exc:
+        _fail(str(exc))
     paths = BrokerPaths(cfg.broker_home)
     logging_setup.configure(paths.master_log)
     llm_timing.configure(paths.llm_timings, "master")
-    registry = Registry.load(paths.registry)
+    try:
+        registry = Registry.load(paths.registry)
+    except RegistryError as exc:
+        _fail(str(exc))
     try:
         queue = EscalationQueue.load(paths.escalation_queue)
     except QueueError as exc:
@@ -104,13 +110,9 @@ def main() -> None:
         warnings = [TEST_MODE_WARNING]
         llm_call = test_mode_llm_call
     else:
-        # 2. Hook registration at USER level (never project-level),
-        #    then verify-and-repair with candidate shadow paths.
-        command = (
-            f'[ -n "$BROKER_SOCKET" ] || exit 0; '
-            f"exec {sys.executable} -m broker.hook  # broker-hook"
-        )
-        register_hooks(list(HookEventName), command)
+        # 2. Hook verify-and-repair at USER level (never project-level),
+        #    with candidate shadow paths.
+        command = broker_hook_command(sys.executable)
         candidates = [
             Path(record.cwd) / ".claude" / "settings.json"
             for record in registry.records.values()

@@ -2,6 +2,9 @@
 
 import json
 import os
+import subprocess
+import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -10,11 +13,13 @@ import pytest
 from broker.atomic_json import AtomicWriteError
 from broker.claude.settings import (
     BROKER_HOOK_MARKER,
+    broker_hook_command,
     hook_entry,
-    register_hooks,
     verify_and_repair,
     write_session_permissions,
 )
+from broker.protocol.constants import ENV_BROKER_SOCKET
+
 COMMAND = "/usr/bin/env python3 -m broker.hook  # broker-hook"
 EVENTS = ["PreToolUse", "Stop", "SessionStart"]
 
@@ -39,13 +44,13 @@ FAKE_HERDR_ENTRY: dict[str, Any] = {
 
 def test_command_without_marker_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
-        register_hooks(EVENTS, "python3 -m something.else", tmp_path / "s.json")
+        verify_and_repair(EVENTS, "python3 -m something.else", tmp_path / "s.json")
 
 
 def test_registration_idempotent(tmp_path: Path) -> None:
     target = tmp_path / "settings.json"
-    register_hooks(EVENTS, COMMAND, target)
-    register_hooks(EVENTS, COMMAND, target)  # double-register
+    verify_and_repair(EVENTS, COMMAND, target)
+    verify_and_repair(EVENTS, COMMAND, target)  # double-register
     data = json.loads(target.read_text())
     for event in EVENTS:
         ours = [
@@ -66,7 +71,7 @@ def test_foreign_entries_survive_byte_identical(tmp_path: Path) -> None:
         },
     }
     target.write_text(json.dumps(before, indent=2))
-    register_hooks(EVENTS, COMMAND, target)
+    verify_and_repair(EVENTS, COMMAND, target)
     data = json.loads(target.read_text())
     # foreign entries verbatim
     assert data["hooks"]["PreToolUse"][0] == FAKE_HERDR_ENTRY
@@ -78,7 +83,7 @@ def test_foreign_entries_survive_byte_identical(tmp_path: Path) -> None:
 
 def test_verify_and_repair_readds_removed_entry(tmp_path: Path) -> None:
     target = tmp_path / "settings.json"
-    register_hooks(EVENTS, COMMAND, target)
+    verify_and_repair(EVENTS, COMMAND, target)
 
     # simulate an upgrade/manual edit removing one of our entries
     data = json.loads(target.read_text())
@@ -96,7 +101,7 @@ def test_verify_and_repair_readds_removed_entry(tmp_path: Path) -> None:
 
 def test_changed_command_rewrites_existing_entry(tmp_path: Path) -> None:
     target = tmp_path / "settings.json"
-    register_hooks(EVENTS, COMMAND, target)
+    verify_and_repair(EVENTS, COMMAND, target)
 
     new_command = f'[ -n "$BROKER_SOCKET" ] || exit 0; exec {COMMAND}'
     report = verify_and_repair(EVENTS, new_command, target)
@@ -110,7 +115,7 @@ def test_changed_command_rewrites_existing_entry(tmp_path: Path) -> None:
 
 def test_verify_and_repair_clean_reports_nothing(tmp_path: Path) -> None:
     target = tmp_path / "settings.json"
-    register_hooks(EVENTS, COMMAND, target)
+    verify_and_repair(EVENTS, COMMAND, target)
     report = verify_and_repair(EVENTS, COMMAND, target)
     assert report.repaired_events == []
     assert report.warnings == []
@@ -171,3 +176,46 @@ def test_session_permissions_refuses_incomplete_rules(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         write_session_permissions(target, {"allow": ["Read"]})
     assert not target.exists()
+
+
+def _run_hook_command(
+    env_socket: str | None, cwd: Path
+) -> subprocess.CompletedProcess[str]:
+    """Run the registered hook command under ``sh`` with an empty payload."""
+    env = {k: v for k, v in os.environ.items() if k != ENV_BROKER_SOCKET}
+    if env_socket is not None:
+        env[ENV_BROKER_SOCKET] = env_socket
+    return subprocess.run(
+        ["sh", "-c", broker_hook_command(sys.executable)],
+        input="{}",
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=cwd,
+        timeout=30,
+    )
+
+
+def _absent_socket() -> str:
+    """Return a socket path under ``/private/tmp`` that nothing listens on."""
+    return f"/private/tmp/broker-absent-{uuid.uuid4().hex[:12]}.sock"
+
+
+def test_hook_command_is_silent_without_a_live_broker(tmp_path: Path) -> None:
+    for env_socket in (None, _absent_socket()):
+        result = _run_hook_command(env_socket, tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == ""
+
+
+def test_hook_command_ignores_a_broker_package_in_the_session_cwd(
+    tmp_path: Path,
+) -> None:
+    shadow = tmp_path / "broker" / "hook"
+    shadow.mkdir(parents=True)
+    (tmp_path / "broker" / "__init__.py").write_text("")
+    (shadow / "__init__.py").write_text("")
+    (shadow / "__main__.py").write_text('print("shadow hook ran")\n')
+    result = _run_hook_command(_absent_socket(), tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
