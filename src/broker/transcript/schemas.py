@@ -8,7 +8,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, TypeAdapter
 
-VALIDATED_AGAINST = "2.1.220"
+TRANSCRIPT_VALIDATED_AGAINST = "2.1.220"
 
 
 class Option(BaseModel):
@@ -34,7 +34,7 @@ class AssistantText(BaseModel):
     text: str
 
 
-class AskUserQuestion(BaseModel):
+class AskUserQuestionUse(BaseModel):
     kind: Literal["ask_user_question"]
     id: str
     questions: list[Question]
@@ -53,7 +53,7 @@ class AskUserAnswer(BaseModel):
     answers: dict[str, str | list[str]] | None = None
 
 
-class ExitPlanMode(BaseModel):
+class ExitPlanModeUse(BaseModel):
     kind: Literal["exit_plan_mode"]
     id: str
     plan: str
@@ -69,25 +69,16 @@ class ExitPlanResult(BaseModel):
     rejected: bool = False
 
 
-class CompactionBoundary(BaseModel):
-    # Shape PROVISIONAL pending a real captured /compact record.
-    kind: Literal["compaction_boundary"]
-
-
 TranscriptEvent = Annotated[
     UserPrompt
     | AssistantText
-    | AskUserQuestion
+    | AskUserQuestionUse
     | AskUserAnswer
-    | ExitPlanMode
-    | ExitPlanResult
-    | CompactionBoundary,
+    | ExitPlanModeUse
+    | ExitPlanResult,
     Field(discriminator="kind"),
 ]
 
 # Module-level by requirement: per-call construction rebuilds the core schema.
 # The alias is a type, not a model — it has no .model_validate.
-_EVENT: TypeAdapter[TranscriptEvent] = TypeAdapter(TranscriptEvent)
-
-# Public name for consumers (adapter, tests).
-EVENT_ADAPTER = _EVENT
+EVENT_ADAPTER: TypeAdapter[TranscriptEvent] = TypeAdapter(TranscriptEvent)

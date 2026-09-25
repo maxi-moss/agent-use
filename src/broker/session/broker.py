@@ -129,7 +129,7 @@ from broker.session.triage import (
     triage,
 )
 from broker.session.watchdog import Watchdog
-from broker.transcript.adapter import read_cleaned
+from broker.transcript.adapter import ReadReport, read_cleaned
 from broker.transcript.schemas import (
     AskUserAnswer,
     AssistantText,
@@ -324,6 +324,8 @@ class SessionBroker:
         self.pane_id: str | None = None
         self.claude_session_id: str | None = None
         self.transcript_path: str | None = None
+        self._logged_drift_warnings: set[str] = set()
+        self._logged_drift_versions: set[frozenset[str]] = set()
         self.budget_count = cfg.budget_count
         self.intent = cfg.intent  # replaced outright on reactivation
         self.approved_prompt: str | None = None
@@ -1841,7 +1843,33 @@ class SessionBroker:
             raise FatalSessionError(
                 "transcript_unbound", "no transcript path bound"
             )
-        return read_cleaned(Path(self.transcript_path))
+        events, report = read_cleaned(Path(self.transcript_path))
+        self._log_transcript_drift(report)
+        return events
+
+    def _log_transcript_drift(self, report: ReadReport) -> None:
+        """Log each new transcript drift signal once, to the diagnostic log only.
+
+        Args:
+            report: What the adapter lost or flagged on one transcript read.
+        """
+        for warning in report.warnings:
+            if warning not in self._logged_drift_warnings:
+                self._logged_drift_warnings.add(warning)
+                logger.warning("transcript drift: %s", warning)
+        if not report.skipped_records and not report.unknown_types:
+            return
+        versions = frozenset(report.versions)
+        if versions in self._logged_drift_versions:
+            return
+        self._logged_drift_versions.add(versions)
+        logger.warning(
+            "transcript versions %s: %d records failed validation, "
+            "unknown record types %s",
+            sorted(versions),
+            report.skipped_records,
+            dict(report.unknown_types),
+        )
 
     def _native_prompt(self) -> str | None:
         """Name the native prompt open in the pane, or ``None`` when there is none."""

@@ -7,14 +7,13 @@ from typing import Any
 from broker.transcript.adapter import (
     ReadReport,
     read_cleaned,
-    read_cleaned_with_report,
     render,
 )
 from broker.transcript.schemas import (
-    VALIDATED_AGAINST,
+    TRANSCRIPT_VALIDATED_AGAINST,
     AskUserAnswer,
-    AskUserQuestion,
-    ExitPlanMode,
+    AskUserQuestionUse,
+    ExitPlanModeUse,
     ExitPlanResult,
 )
 
@@ -29,8 +28,8 @@ APPROVED_PLAN_SYNTHETIC = FIXTURES / "approved-exit-plan.jsonl"
 
 
 def test_minimal_ask_user_question_answered() -> None:
-    events = read_cleaned(MINIMAL_ASK)
-    questions = [e for e in events if isinstance(e, AskUserQuestion)]
+    events, _ = read_cleaned(MINIMAL_ASK)
+    questions = [e for e in events if isinstance(e, AskUserQuestionUse)]
     answers = [e for e in events if isinstance(e, AskUserAnswer)]
     assert len(questions) == 2
     assert len(answers) == 2
@@ -49,7 +48,7 @@ def test_minimal_ask_user_question_answered() -> None:
 
 
 def test_rejected_ask_user_question_is_error_path() -> None:
-    events = read_cleaned(REJECTED_ASK)
+    events, _ = read_cleaned(REJECTED_ASK)
     answers = [e for e in events if isinstance(e, AskUserAnswer)]
     assert len(answers) == 1
     assert answers[0].rejected is True
@@ -57,8 +56,8 @@ def test_rejected_ask_user_question_is_error_path() -> None:
 
 def test_ask_prose_variants_pass_through_verbatim() -> None:
     """Multi-question batch and multiSelect comma-join answers arrive as raw prose."""
-    events = read_cleaned(ASK_VARIANTS)
-    questions = [e for e in events if isinstance(e, AskUserQuestion)]
+    events, _ = read_cleaned(ASK_VARIANTS)
+    questions = [e for e in events if isinstance(e, AskUserQuestionUse)]
     answers = {a.id: a for a in events if isinstance(a, AskUserAnswer)}
     assert len(questions) == 3
     assert set(answers) == {q.id for q in questions}
@@ -74,8 +73,8 @@ def test_ask_prose_variants_pass_through_verbatim() -> None:
 
 
 def test_structured_answers_on_answered_and_rejected() -> None:
-    events = read_cleaned(MINIMAL_ASK)
-    questions = [e for e in events if isinstance(e, AskUserQuestion)]
+    events, _ = read_cleaned(MINIMAL_ASK)
+    questions = [e for e in events if isinstance(e, AskUserQuestionUse)]
     answers = {a.id: a for a in events if isinstance(a, AskUserAnswer)}
     answered = answers[questions[0].id]
     assert answered.answers == {
@@ -88,8 +87,8 @@ def test_structured_answers_on_answered_and_rejected() -> None:
 
 def test_native_multiselect_answer_is_joined_str() -> None:
     """A native-UI multiSelect answer arrives as one comma-joined str, not a list."""
-    events = read_cleaned(ASK_VARIANTS)
-    questions = [e for e in events if isinstance(e, AskUserQuestion)]
+    events, _ = read_cleaned(ASK_VARIANTS)
+    questions = [e for e in events if isinstance(e, AskUserQuestionUse)]
     answers = {a.id: a for a in events if isinstance(a, AskUserAnswer)}
     multi = answers[questions[1].id]
     assert multi.answers is not None
@@ -102,7 +101,7 @@ def test_native_multiselect_answer_is_joined_str() -> None:
 
 
 def test_rejected_ask_answers_is_none() -> None:
-    events = read_cleaned(REJECTED_ASK)
+    events, _ = read_cleaned(REJECTED_ASK)
     answers = [e for e in events if isinstance(e, AskUserAnswer)]
     assert len(answers) == 1
     assert answers[0].rejected is True
@@ -112,7 +111,7 @@ def test_rejected_ask_answers_is_none() -> None:
 def test_ill_typed_answer_entries_dropped_entry_wise(tmp_path: Path) -> None:
     question_record: dict[str, Any] = {
         "type": "assistant",
-        "version": VALIDATED_AGAINST,
+        "version": TRANSCRIPT_VALIDATED_AGAINST,
         "message": {
             "content": [
                 {
@@ -130,7 +129,7 @@ def test_ill_typed_answer_entries_dropped_entry_wise(tmp_path: Path) -> None:
     }
     answer_record: dict[str, Any] = {
         "type": "user",
-        "version": VALIDATED_AGAINST,
+        "version": TRANSCRIPT_VALIDATED_AGAINST,
         "message": {
             "role": "user",
             "content": [
@@ -149,22 +148,22 @@ def test_ill_typed_answer_entries_dropped_entry_wise(tmp_path: Path) -> None:
     p.write_text(
         json.dumps(question_record) + "\n" + json.dumps(answer_record) + "\n"
     )
-    events = read_cleaned(p)
+    events, _ = read_cleaned(p)
     answers = [e for e in events if isinstance(e, AskUserAnswer)]
     assert len(answers) == 1
     assert answers[0].answers == {"a": "x", "b": ["y", "z"]}
 
 
 def test_multiselect_absent_defaults_false() -> None:
-    events = read_cleaned(MULTISELECT_ABSENT)
-    questions = [e for e in events if isinstance(e, AskUserQuestion)]
+    events, _ = read_cleaned(MULTISELECT_ABSENT)
+    questions = [e for e in events if isinstance(e, AskUserQuestionUse)]
     flags = [q.multiSelect for e in questions for q in e.questions]
     assert False in flags  # at least one record lacked the key -> default
 
 
 def test_exit_plan_mode_inputs_and_rejected_results() -> None:
-    events = read_cleaned(EXIT_PLAN)
-    plans = [e for e in events if isinstance(e, ExitPlanMode)]
+    events, _ = read_cleaned(EXIT_PLAN)
+    plans = [e for e in events if isinstance(e, ExitPlanModeUse)]
     results = {r.id: r for r in events if isinstance(r, ExitPlanResult)}
     assert len(plans) == 3
     for plan in plans:
@@ -176,14 +175,14 @@ def test_exit_plan_mode_inputs_and_rejected_results() -> None:
 
 def test_approved_exit_plan_synthetic_fixture() -> None:
     """SYNTHETIC shape — replaced by the real developer capture."""
-    events = read_cleaned(APPROVED_PLAN_SYNTHETIC)
+    events, _ = read_cleaned(APPROVED_PLAN_SYNTHETIC)
     results = [e for e in events if isinstance(e, ExitPlanResult)]
     assert len(results) == 1
     assert results[0].rejected is False
 
 
 def test_render_sections() -> None:
-    events = read_cleaned(MINIMAL_ASK)
+    events, _ = read_cleaned(MINIMAL_ASK)
     rendered = render(events)
     assert "## user\n" in rendered
     assert "## assistant\n" in rendered
@@ -193,15 +192,15 @@ def test_render_sections() -> None:
 
 
 def test_version_collected_and_warning_shape() -> None:
-    _, report = read_cleaned_with_report(MINIMAL_ASK)
+    _, report = read_cleaned(MINIMAL_ASK)
     assert isinstance(report, ReadReport)
-    assert VALIDATED_AGAINST in report.versions
+    assert TRANSCRIPT_VALIDATED_AGAINST in report.versions
     # this fixture is pure 2.1.220 -> no version warning
     assert report.warnings == []
 
 
 def test_unknown_types_counted_not_fatal() -> None:
-    _, report = read_cleaned_with_report(MINIMAL_ASK)
+    _, report = read_cleaned(MINIMAL_ASK)
     assert report.unknown_types["ai-title"] > 0
     assert "assistant" not in report.unknown_types
     assert "user" not in report.unknown_types

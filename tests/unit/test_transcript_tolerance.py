@@ -5,19 +5,14 @@ from typing import Any
 
 import pytest
 
-from broker.transcript import adapter, raw
-from broker.transcript.adapter import (
-    TranscriptParseError,
-    read_cleaned,
-    read_cleaned_with_report,
-)
-from broker.transcript.schemas import EVENT_ADAPTER
+from broker.transcript import raw
+from broker.transcript.adapter import TranscriptParseError, read_cleaned
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "transcripts"
 
 
 def test_unknown_top_level_type_skipped() -> None:
-    events, report = read_cleaned_with_report(FIXTURES / "unknown-type.jsonl")
+    events, report = read_cleaned(FIXTURES / "unknown-type.jsonl")
     assert report.unknown_types["future-thing"] == 1
     assert [e.kind for e in events] == ["user_prompt", "assistant_text"]
 
@@ -37,14 +32,14 @@ def test_unknown_kind_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
         return mapped
 
     monkeypatch.setattr(raw, "map_line", drifted)
-    events, report = read_cleaned_with_report(FIXTURES / "unknown-type.jsonl")
+    events, report = read_cleaned(FIXTURES / "unknown-type.jsonl")
     assert report.skipped_records == 1
     assert [e.kind for e in events] == ["user_prompt"]
 
 
 def test_unknown_fields_ignored() -> None:
     """extra='ignore' is the unknown-field tolerance rule — never extra='forbid'."""
-    events, report = read_cleaned_with_report(FIXTURES / "unknown-type.jsonl")
+    events, report = read_cleaned(FIXTURES / "unknown-type.jsonl")
     # every fixture record carries fields the models do not declare
     # (version, uuid, isSidechain ...) and still validates
     assert len(events) == 2
@@ -63,7 +58,8 @@ def test_nonempty_file_zero_events_raises() -> None:
 
 
 def test_empty_file_yields_zero_events_without_raising() -> None:
-    assert read_cleaned(FIXTURES / "empty-file.jsonl") == []
+    events, _ = read_cleaned(FIXTURES / "empty-file.jsonl")
+    assert events == []
 
 
 def test_version_mismatch_warns_not_fatal(tmp_path: Path) -> None:
@@ -72,7 +68,7 @@ def test_version_mismatch_warns_not_fatal(tmp_path: Path) -> None:
         '{"type": "user", "version": "9.9.9", "origin": {"kind": "human"}, '
         '"message": {"role": "user", "content": "hi"}}\n'
     )
-    events, report = read_cleaned_with_report(p)
+    events, report = read_cleaned(p)
     assert len(events) == 1
     assert "9.9.9" in report.versions
     assert any("9.9.9" in w for w in report.warnings)
@@ -88,10 +84,5 @@ def test_unmatched_tool_results_are_stripped(tmp_path: Path) -> None:
         '"content": [{"type": "tool_result", "tool_use_id": "toolu_bash", '
         '"content": "ran ok"}]}}\n'
     )
-    events = read_cleaned(p)
+    events, _ = read_cleaned(p)
     assert [e.kind for e in events] == ["user_prompt"]
-
-
-def test_render_handles_compaction_boundary() -> None:
-    event = EVENT_ADAPTER.validate_python({"kind": "compaction_boundary"})
-    assert adapter.render([event]) == "## [compaction boundary]\n\n"
