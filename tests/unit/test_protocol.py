@@ -1,4 +1,4 @@
-"""Protocol package tests: stdlib-only constants, envelope round-trip, Literal sync."""
+"""Protocol package tests: stdlib-only constants, socket-map coverage, Literal sync."""
 
 import subprocess
 import sys
@@ -10,6 +10,8 @@ from pydantic import ValidationError
 
 from broker.protocol import constants
 from broker.protocol.schemas import (
+    MASTER_SOCKET_PAYLOADS,
+    SESSION_SOCKET_PAYLOADS,
     AddDirectoriesSuggestion,
     PermissionDecisionPayload,
     PermissionEscalationPayload,
@@ -37,6 +39,17 @@ def test_constants_import_without_pydantic() -> None:
         [sys.executable, "-c", code], capture_output=True, text=True
     )
     assert proc.returncode == 0, proc.stderr
+
+
+def test_every_message_type_in_exactly_one_socket_map() -> None:
+    """A type missing from both maps has no validator; one in both is ambiguous."""
+    message_types = {
+        value for name, value in vars(constants).items() if name.startswith("T_")
+    }
+    assert SESSION_SOCKET_PAYLOADS.keys().isdisjoint(MASTER_SOCKET_PAYLOADS)
+    assert SESSION_SOCKET_PAYLOADS.keys() | MASTER_SOCKET_PAYLOADS.keys() == (
+        message_types
+    )
 
 
 def test_decision_literals_match_constants() -> None:

@@ -6,10 +6,11 @@ propagate — the caller decides how to fail loud.
 
 import asyncio
 import contextlib
+import uuid
 from pathlib import Path
 
 from broker.protocol.constants import MAX_LINE_BYTES
-from broker.protocol.schemas import Envelope, Response
+from broker.protocol.schemas import Envelope, Response, WireMessage
 
 
 async def request(path: Path, env: Envelope, *, timeout_s: float) -> Response:
@@ -41,3 +42,29 @@ async def request(path: Path, env: Envelope, *, timeout_s: float) -> Response:
     if not line:
         raise ConnectionError(f"no reply from {path}")
     return Response.model_validate_json(line)
+
+
+async def send(
+    path: Path, payload: WireMessage, *, session_id: str | None, timeout_s: float
+) -> Response:
+    """Send one message as a fresh envelope of its own type and wait for the reply.
+
+    Args:
+        path: Unix socket to connect to.
+        payload: Message to send; its ``MESSAGE_TYPE`` becomes the envelope type.
+        session_id: Sender identity carried on the envelope.
+        timeout_s: Hard deadline for the whole exchange.
+
+    Returns:
+        The peer's decoded reply.
+
+    Raises:
+        ConnectionError: The peer closed without sending a reply line.
+    """
+    env = Envelope(
+        id=uuid.uuid4().hex,
+        type=payload.MESSAGE_TYPE,
+        session_id=session_id,
+        payload=payload.model_dump(),
+    )
+    return await request(path, env, timeout_s=timeout_s)

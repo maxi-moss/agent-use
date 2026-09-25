@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 
 from broker.protocol import client
-from broker.protocol.constants import T_STATUS
-from broker.protocol.schemas import Envelope, Response
+from broker.protocol.constants import T_SEND_PROMPT, T_STATUS
+from broker.protocol.schemas import Envelope, Response, SendPromptPayload
 from broker.protocol.server import serve_unix
 
 
@@ -60,6 +60,23 @@ async def test_envelope_round_trip(
     assert resp.id == env.id
     assert resp.payload == {"echo": {"text": "hi"}}
     assert handler.received == [env]
+
+
+async def test_send_types_envelope_from_payload(
+    echo_server: tuple[Path, RecordingHandler],
+) -> None:
+    sock_path, handler = echo_server
+    resp = await client.send(
+        sock_path, SendPromptPayload(text="hi"), session_id="s1", timeout_s=5.0
+    )
+    assert resp.ok is True
+    (env,) = handler.received
+    assert resp.id == env.id
+    assert (env.type, env.session_id, env.payload) == (
+        T_SEND_PROMPT,
+        "s1",
+        {"text": "hi"},
+    )
 
 
 async def test_oversized_line_closes_connection_not_server(
