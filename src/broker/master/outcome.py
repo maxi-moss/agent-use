@@ -60,10 +60,13 @@ def build_outcome(
     """
     history: list[OutcomeEvent] = []
     # Events whose Solution/Result is the next kept action (answered/completed).
-    # Sound for escalations because triage runs only while DRIVING, so nothing is
-    # kept between a raise and its resolution; a developer prompt's result is the
-    # next kept action by definition.
+    # Sound for dispatched escalations because triage runs only while DRIVING, so
+    # nothing is kept between a raise and its dispatch; a developer prompt's result
+    # is the next kept action by definition. A retracted escalation was resolved
+    # outside the broker, so the next kept action is unrelated to it; its
+    # retraction row closes it instead.
     pending: list[int] = []
+    open_escalations: dict[str, int] = {}
     headline = ""
     supporting = ""
     fatal: DecisionRow | None = None
@@ -72,6 +75,7 @@ def build_outcome(
         for idx in pending:
             history[idx] = replace(history[idx], resolution=summary)
         pending.clear()
+        open_escalations.clear()
 
     for row in rows:
         if row.kind is DecisionKind.ANSWERED:
@@ -85,12 +89,21 @@ def build_outcome(
             supporting = row.supporting or supporting
             history.append(OutcomeEvent("terminal", row.ts, "Task completed"))
         elif row.kind is DecisionKind.ESCALATION_RAISED:
+            if row.escalation_id is not None:
+                open_escalations[row.escalation_id] = len(history)
             pending.append(len(history))
             history.append(
                 OutcomeEvent(
                     "escalation", row.ts, "Escalation", detail=row.task_summary or ""
                 )
             )
+        elif (
+            row.kind is DecisionKind.RETRACTED
+            and row.escalation_id in open_escalations
+        ):
+            idx = open_escalations.pop(row.escalation_id)
+            pending.remove(idx)
+            history[idx] = replace(history[idx], resolution=row.task_summary)
         elif row.kind is DecisionKind.DEVELOPER_PROMPT:
             pending.append(len(history))
             history.append(OutcomeEvent("developer", row.ts, "Developer instruction"))
