@@ -4,6 +4,9 @@ Structural thin-master rule: the escalation block enters the context as the
 runtime-rendered string, byte-identical — this layer never sees a payload it
 could re-summarise. tool_choice is auto (never forced): the loop exits on a
 text-only response, and forced choice would suppress that text.
+
+Class names, field names, `Field` descriptions and docstrings of these models
+are sent to the model.
 """
 
 import json

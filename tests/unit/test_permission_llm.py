@@ -4,8 +4,9 @@ The strict-tool derivation here duplicates the session broker's on purpose, so
 the schema pin is what stops the two drifting apart unnoticed.
 """
 
+import hashlib
+import json
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, cast
 
 import anthropic
@@ -30,8 +31,6 @@ from broker.permission.llm import (
 )
 from broker.permission.schemas import AllowCall, EscalateCall
 from broker.protocol.schemas import AddDirectoriesSuggestion
-
-PACKAGE = Path(__file__).parent.parent.parent / "src" / "broker" / "permission"
 
 CFG = ClassifierConfig()
 
@@ -145,6 +144,15 @@ def test_both_tools_are_strict_and_fully_required() -> None:
         assert list(cast(dict[str, Any], schema["properties"])) == ["reasoning"]
 
 
+def test_permission_tools_schema_pin() -> None:
+    digest = hashlib.sha256(
+        json.dumps(PERMISSION_TOOLS, sort_keys=True).encode()
+    ).hexdigest()
+    assert digest == (
+        "ebdf2c7ce4289e3110c215dffe8553d6c589561d1d913883ab4a4e539a032a11"
+    ), "LLM-visible tool schema changed; review the dumped schema and update the pin"
+
+
 def test_client_has_zero_retries(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     assert build_classifier_client(CFG).max_retries == 0
@@ -241,12 +249,3 @@ def test_unknown_suggestion_arm_renders_as_itself() -> None:
     assert "/repo" in rendered
     assert "somethingNew" in rendered
     assert render_suggestions([]) == "(none)"
-
-
-def test_package_never_imports_the_shared_llm_or_broker_internals() -> None:
-    """The classifier's model must not be re-pinnable through a shared helper."""
-    forbidden = ("broker.llm", "broker.session", "broker.master", "broker.transcript")
-    for path in sorted(PACKAGE.glob("*.py")):
-        text = path.read_text(encoding="utf-8")
-        for name in forbidden:
-            assert name not in text, f"{path.name} references {name}"

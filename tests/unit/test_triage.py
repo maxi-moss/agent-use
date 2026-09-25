@@ -1,5 +1,7 @@
 """triage() + ground_intent() against a fake LLM caller."""
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any, cast
 
@@ -212,6 +214,15 @@ def test_exactly_two_cache_breakpoints() -> None:
     assert "cache_control" in system[0]
     content = cast(list[dict[str, Any]], messages[0]["content"])
     assert "cache_control" in content[1]
+
+
+def test_assembled_context_schema_pin() -> None:
+    system, messages = assemble_context(prompts.load("triage"), "i", list(EVENTS), "w")
+    payload = {"system": system, "messages": messages}
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    assert digest == (
+        "e50f429144d92cb925a44e5c132df69689fd3b6ccacfaaa9ab472d2e814f733a"
+    ), "LLM-visible context bytes changed; review assemble_context and update the pin"
 
 
 async def test_ground_intent_orders_intent_claude_md_relevant_code(

@@ -5,4 +5,5 @@
 #
 # The list is raw-only literals; keys that are also public schema fields
 # (multiSelect, question, header, options) are deliberately NOT listed.
-rg -n "parentUuid|isSidechain|toolUseResult|toolDenialKind|promptSource|sourceToolAssistantUUID|planFilePath|allowedPrompts" src/broker --glob '!src/broker/transcript/raw.py' && exit 1 || exit 0
+rg -n "parentUuid|isSidechain|toolUseResult|toolDenialKind|promptSource|sourceToolAssistantUUID|planFilePath|allowedPrompts" src/broker --glob '!src/broker/transcript/raw.py'
+case $? in 1) exit 0;; *) exit 1;; esac

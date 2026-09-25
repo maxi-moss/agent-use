@@ -3,6 +3,9 @@
 Reuses the session broker's own LLM seam and triage's context assembly — one
 forced-tool call, exactly like triage. Never resolves the escalation and never
 writes to the pane.
+
+Class names, field names, `Field` descriptions and docstrings of these models
+are sent to the model.
 """
 
 import logging
