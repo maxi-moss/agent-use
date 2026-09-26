@@ -40,7 +40,6 @@ class SessionRecord(BaseModel):
     approved_prompt: str | None = None  # the AUTHORITATIVE intent record
     title: str = ""  # short task label set at approval; shown in the fleet
     budget_count: int = 0  # persisted; survives broker death
-    pid: int | None = None
 
 
 class RegistryError(Exception):

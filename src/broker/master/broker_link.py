@@ -1,14 +1,29 @@
-"""Master-side probes for a session's broker process: socket liveness and
-what a replacement broker needs to adopt a session it did not spawn.
+"""The master's link to each session broker: the processes it spawned and
+every socket call it makes to them.
 """
 
 import asyncio
 import contextlib
+import sys
 from pathlib import Path
 
-from broker.config import AdoptedSession
+from broker.claude.settings import write_session_permissions
+from broker.claude.trust import seed_trust
+from broker.config import (
+    AdoptedSession,
+    BrokerConfig,
+    ResumedTask,
+    SessionBrokerConfig,
+    SessionModelConfig,
+)
 from broker.master.registry import SessionRecord
+from broker.paths import BrokerPaths
+from broker.protocol import client
+from broker.protocol.schemas import Response, ShutdownPayload, WireMessage, parse_nack
 
+REQUEST_TIMEOUT_S = 10.0
+STOP_WAIT_S = 10.0
+SOCKET_POLL_S = 0.1
 SOCKET_PROBE_TIMEOUT_S = 2.0
 
 
@@ -70,3 +85,189 @@ def adoption_fields(record: SessionRecord) -> AdoptedSession:
         claude_session_id=claude_session_id,
         transcript_path=transcript_path,
     )
+
+
+class BrokerLink:
+    def __init__(
+        self,
+        paths: BrokerPaths,
+        cfg: BrokerConfig,
+        master_socket_path: Path,
+        claude_json: Path,
+    ) -> None:
+        """Hold what a spawned broker is configured from.
+
+        Args:
+            paths: Layout of the broker home.
+            cfg: Broker configuration.
+            master_socket_path: Socket every spawned broker reports to.
+            claude_json: Claude Code's ``~/.claude.json`` state file.
+        """
+        self.paths = paths
+        self.cfg = cfg
+        self.master_socket_path = master_socket_path
+        self._claude_json = claude_json
+        self._procs: dict[str, asyncio.subprocess.Process] = {}
+
+    async def spawn(
+        self,
+        record: SessionRecord,
+        *,
+        adopt: AdoptedSession | None,
+        resume: ResumedTask | None,
+    ) -> int:
+        """Start a session-broker subprocess for ``record`` and track it.
+
+        Args:
+            record: Supplies the identity, socket, cwd, intent and budget the
+                broker starts from.
+            adopt: Pane, Claude session and transcript of a running session the
+                broker takes over; ``None`` starts a fresh one.
+            resume: Approved prompt and completed-ness the broker resumes
+                instead of grounding; ``None`` grounds a new task.
+
+        Returns:
+            The spawned process's pid.
+        """
+        if adopt is None:
+            # BEFORE spawn — the dialog eats input.
+            seed_trust(Path(record.cwd), self._claude_json)
+        settings_path = self.paths.session_claude_settings(record.name)
+        # The rules have to be on disk before the session reads them: the
+        # master is the only writer of anything outside the repo.
+        write_session_permissions(
+            settings_path, self.cfg.permission_rules.model_dump()
+        )
+        config = SessionBrokerConfig(
+            name=record.name,
+            socket_path=record.socket_path,
+            master_socket_path=str(self.master_socket_path),
+            broker_home=self.paths.home,
+            cwd=record.cwd,
+            anchor_pane=record.anchor_pane,
+            intent=record.intent,
+            budget_count=record.budget_count,
+            session_model=SessionModelConfig(
+                model_id=self.cfg.model_id, max_tokens=self.cfg.max_tokens
+            ),
+            classifier=self.cfg.classifier,
+            embedding=self.cfg.embedding,
+            watchdog_seconds=self.cfg.watchdog_seconds,
+            budget_max=self.cfg.budget_max,
+            claude_settings_path=str(settings_path),
+            adopt=adopt,
+            resume=resume,
+        )
+        # By module string, never by import — keeps the module boundary
+        # structural. -I isolates the subprocess from the master's cwd and
+        # PYTHONPATH.
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-I",
+            "-m",
+            "broker.session",
+            "--config-json",
+            config.model_dump_json(),
+        )
+        self._procs[record.name] = proc
+        return proc.pid
+
+    async def stop(self, record: SessionRecord) -> None:
+        """Ask a session's broker to shut down and wait for the process to exit.
+
+        Only a process this master spawned is waited on or terminated.
+
+        Args:
+            record: Registry record of the session to stop.
+
+        Raises:
+            RuntimeError: The spawned process was still running
+                ``STOP_WAIT_S`` after it was terminated.
+        """
+        with contextlib.suppress(ConnectionError, TimeoutError, OSError):
+            await self.request(record, ShutdownPayload(), timeout_s=REQUEST_TIMEOUT_S)
+        proc = self._procs.get(record.name)
+        if proc is None:
+            return
+        try:
+            async with asyncio.timeout(STOP_WAIT_S):
+                await proc.wait()
+        except TimeoutError:
+            proc.terminate()
+            try:
+                async with asyncio.timeout(STOP_WAIT_S):
+                    await proc.wait()
+            except TimeoutError:
+                raise RuntimeError(
+                    f"session {record.name}: broker pid {proc.pid} still "
+                    f"running {STOP_WAIT_S:.0f} s after terminate"
+                ) from None
+        if self._procs.get(record.name) is proc:
+            del self._procs[record.name]
+
+    def forget(self, name: str) -> None:
+        """Stop tracking a session's broker process without waiting on it."""
+        self._procs.pop(name, None)
+
+    async def require_socket_free(self, record: SessionRecord) -> None:
+        """Block until nothing answers on a session's socket.
+
+        The replacement broker binds the same path, and a unix socket rebind
+        over a live listener succeeds silently — two brokers would then split
+        the pane's hook traffic between them.
+
+        Args:
+            record: Registry record of the session being reassigned.
+
+        Raises:
+            RuntimeError: A broker was still accepting connections after
+                ``STOP_WAIT_S``.
+        """
+        path = Path(record.socket_path)
+        deadline = asyncio.get_running_loop().time() + STOP_WAIT_S
+        while await broker_is_listening(path):
+            if asyncio.get_running_loop().time() >= deadline:
+                raise RuntimeError(
+                    f"session {record.name}: a broker is still serving "
+                    f"{path} after {STOP_WAIT_S:.0f} s — refusing to reassign"
+                )
+            await asyncio.sleep(SOCKET_POLL_S)
+
+    async def deliver(
+        self, record: SessionRecord, payload: WireMessage, *, rejection: str
+    ) -> str | None:
+        """Send ``payload`` to a session's broker, reporting a NACK.
+
+        Args:
+            record: Registry record of the target session.
+            payload: Message to send.
+            rejection: Message returned when the session NACKs.
+
+        Returns:
+            ``None`` when the session ACKed, otherwise ``rejection``, with the
+            broker's own reason appended when it sent one.
+        """
+        resp = await self.request(record, payload, timeout_s=REQUEST_TIMEOUT_S)
+        if resp.ok:
+            return None
+        reason = parse_nack(resp).error
+        if reason:
+            rejection = f"{rejection}: {reason}"
+        return rejection
+
+    async def request(
+        self, record: SessionRecord, payload: WireMessage, *, timeout_s: float
+    ) -> Response:
+        """Send ``payload`` to a session's broker and return its reply.
+
+        Args:
+            record: Registry record of the target session.
+            payload: Message to send.
+            timeout_s: Hard deadline for the whole exchange.
+
+        Returns:
+            The broker's reply, ACK or NACK.
+        """
+        return await client.send(
+            Path(record.socket_path), payload, session_id=None, timeout_s=timeout_s
+        )
