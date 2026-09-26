@@ -9,7 +9,12 @@ import pytest
 from pydantic import ValidationError
 
 from broker.protocol import constants
-from broker.protocol.constants import NackCode
+from broker.protocol.constants import (
+    BROKER_OWNED_STATES,
+    MASTER_OWNED_STATES,
+    NackCode,
+    SessionState,
+)
 from broker.protocol.schemas import (
     MASTER_SOCKET_PAYLOADS,
     SESSION_SOCKET_PAYLOADS,
@@ -54,6 +59,12 @@ def test_every_message_type_in_exactly_one_socket_map() -> None:
     assert SESSION_SOCKET_PAYLOADS.keys() | MASTER_SOCKET_PAYLOADS.keys() == (
         message_types
     )
+
+
+def test_broker_and_master_owned_states_partition_session_state() -> None:
+    """Every state has exactly one owner; a state in both or neither is a bug."""
+    assert BROKER_OWNED_STATES.isdisjoint(MASTER_OWNED_STATES)
+    assert BROKER_OWNED_STATES | MASTER_OWNED_STATES == set(SessionState)
 
 
 def test_decision_literals_match_constants() -> None:
