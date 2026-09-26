@@ -47,7 +47,7 @@ from broker.master.viewmodel import (
     SessionRow,
     SessionStateChanged,
 )
-from broker.master.pane_escalations import PaneEscalations, PaneProtocolViolation
+from broker.master.pane_escalations import PaneEscalations
 from broker.master.payload_render import (
     PANE_UNKNOWN,
     pane_label,
@@ -476,21 +476,22 @@ class MasterRuntime:
     async def _on_pane_escalation(
         self, session_id: str, p: PaneEscalationPayload
     ) -> NackPayload | None:
-        """Hold one pane escalation and announce it at once.
+        """Hold one pane escalation, superseding its predecessor, and announce it.
 
         Args:
             session_id: Session whose pane shows the native prompt.
             p: The pane escalation.
 
         Returns:
-            ``None`` once held, otherwise the refusal.
+            ``None``; a pane escalation is never refused.
         """
-        try:
-            self.panes.accept(p)
-        except PaneProtocolViolation as exc:
-            self.emit(Notice(f"PROTOCOL VIOLATION: {exc}"))
-            return NackPayload(
-                error=str(exc), reason_code=NackCode.PROTOCOL_VIOLATION
+        superseded = self.panes.accept(p)
+        if superseded is not None:
+            self.emit(
+                Notice(
+                    f"{p.kind} escalation {superseded.escalation_id} from "
+                    f"session {session_id} superseded by {p.escalation_id}"
+                )
             )
         self._publish_fleet()
         await self._announce_pane_escalation(p)

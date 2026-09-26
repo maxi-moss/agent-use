@@ -21,6 +21,7 @@ from anthropic.types import (
 )
 
 from broker.config import ClassifierConfig
+from broker.master.pane_escalations import PaneEscalations
 from broker.permission import PermissionModule
 from broker.permission import module as permission_module
 from broker.permission.classifier import PermissionCallError, PermissionToolCall
@@ -31,7 +32,7 @@ from broker.protocol.constants import (
     T_PANE_ESCALATION,
     T_PANE_RETRACT,
 )
-from broker.protocol.schemas import Envelope, Response
+from broker.protocol.schemas import PANE_ESCALATION_ADAPTER, Envelope, Response
 from broker.protocol.server import serve_unix
 
 CFG = ClassifierConfig()
@@ -286,31 +287,50 @@ async def test_second_escalation_supersedes_the_first(home: Path) -> None:
         await asyncio.sleep(SETTLE_S)
     assert retract.payload["escalation_id"] == first.payload["escalation_id"]
     assert second.payload["tool_input"] == DEPLOY_INPUT
-    # The slot is one-per-session, so the retraction has to land first or the
-    # replacement is refused for capacity by the escalation it replaces.
     order = [e.type for e in master.received]
     assert order.index(T_PANE_RETRACT) < order.index(T_PANE_ESCALATION, 1)
     written = entries(log)
     assert [e["reason"] for e in written] == ["publishes to a remote", "deploys"]
 
 
-async def test_slot_occupied_nack_is_routine(home: Path) -> None:
-    master = StubMaster(
-        nack={
-            "error": "an escalation is already live",
-            "reason_code": NackCode.SLOT_OCCUPIED,
-        }
-    )
-    llm = FakeLLM(ESCALATE, ESCALATE_2)
-    async with _module(home, llm, master=master) as (module, _, log):
-        assert await module.decide("Bash", PUSH_INPUT, []) == DECISION_ESCALATED
+class StoreMaster(StubMaster):
+    """Holds raises in the real master pane store and drops the first retract."""
+
+    def __init__(self, store_path: Path) -> None:
+        super().__init__()
+        self.store = PaneEscalations(store_path)
+        self.retract_dropped = False
+
+    async def __call__(self, env: Envelope) -> Response | None:
+        self.received.append(env)
+        if env.type == T_PANE_ESCALATION:
+            self.store.accept(PANE_ESCALATION_ADAPTER.validate_python(env.payload))
+        elif env.type == T_PANE_RETRACT:
+            if self.retract_dropped:
+                self.store.retract(env.payload["escalation_id"])
+            else:
+                self.retract_dropped = True
+        return Response(id=env.id, ok=True)
+
+
+async def test_lost_retract_does_not_wedge_later_raises(home: Path) -> None:
+    master = StoreMaster(home / "pane-escalations.json")
+    llm = FakeLLM(ESCALATE, ESCALATE_2, ESCALATE)
+    async with _module(home, llm, master=master) as (module, _, _log):
+        await module.decide("Bash", PUSH_INPUT, [])
         await master.wait_for(T_PANE_ESCALATION)
-        await asyncio.sleep(SETTLE_S)  # the refusal lands and frees the slot
-        assert await module.decide("Bash", DEPLOY_INPUT, []) == DECISION_ESCALATED
-        # A refused raise is not a live escalation, so the next one still goes.
-        await master.wait_for(T_PANE_ESCALATION, count=2)
-    written = entries(log)
-    assert [e["reason"] for e in written] == ["publishes to a remote", "deploys"]
+        await module.decide("Bash", DEPLOY_INPUT, [])
+        second = await master.wait_for(T_PANE_ESCALATION, count=2)
+        await asyncio.sleep(SETTLE_S)
+        assert [p.escalation_id for p in master.store.entries] == [
+            second.payload["escalation_id"]
+        ]
+        await module.decide("Bash", READ_INPUT, [])
+        third = await master.wait_for(T_PANE_ESCALATION, count=3)
+        await asyncio.sleep(SETTLE_S)
+    assert [p.escalation_id for p in master.store.entries] == [
+        third.payload["escalation_id"]
+    ]
 
 
 async def test_reply_arrives_with_master_unreachable(home: Path) -> None:
@@ -337,7 +357,7 @@ async def test_set_intent_changes_what_calls_are_judged_against(
     assert "rewrite the billing exporter" in llm.sent_text(1)
 
 
-async def test_non_capacity_nack_still_frees_the_slot(home: Path) -> None:
+async def test_refused_escalation_frees_the_slot(home: Path) -> None:
     master = StubMaster(
         nack={"error": "payload rejected", "reason_code": NackCode.MALFORMED}
     )

@@ -15,7 +15,6 @@ import time
 import uuid
 from collections.abc import Coroutine
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -28,16 +27,13 @@ from broker.protocol.constants import (
     ASK_USER_QUESTION,
     DECISION_ALLOW,
     DECISION_ESCALATED,
-    NackCode,
-    T_PANE_ESCALATION,
-    T_PANE_RETRACT,
 )
 from broker.protocol.schemas import (
-    Envelope,
     PaneRetractPayload,
     PermissionEscalationPayload,
     PermissionSuggestion,
     Response,
+    WireMessage,
     parse_nack,
 )
 
@@ -280,7 +276,6 @@ class PermissionModule:
             tool_input=tool_input,
             task_intent=self.intent,
             reason=reason,
-            raised_at=datetime.now(UTC).isoformat(timespec="seconds"),
             permission_suggestions=suggestions,
         )
         superseded = self._live
@@ -295,10 +290,6 @@ class PermissionModule:
         payload: PermissionEscalationPayload,
     ) -> None:
         """Retract the escalation this one replaces, then raise this one.
-
-        The two sends are sequential because the master holds one slot per
-        session: overlapping them would let the raise arrive first and be
-        refused for capacity by the very escalation it supersedes.
 
         Args:
             superseded: Escalation being replaced, or ``None`` on a first raise.
@@ -337,33 +328,21 @@ class PermissionModule:
     ) -> None:
         """Send one permission escalation and release the slot if it is refused.
 
-        A capacity refusal is routine rather than a failure: the session's
-        prompt is already in the pane, so the developer sees the decision
-        either way.
-
         Args:
             payload: The escalation to raise.
         """
-        response = await self._send(
-            T_PANE_ESCALATION, payload.model_dump(), payload.escalation_id
-        )
+        response = await self._send(payload, payload.escalation_id)
         if response is not None and response.ok:
             return
         try:
             if response is not None:
                 nack = parse_nack(response)
-                if nack.reason_code == NackCode.SLOT_OCCUPIED:
-                    logger.info(
-                        "permission escalation %s refused for capacity",
-                        payload.escalation_id,
-                    )
-                else:
-                    logger.error(
-                        "permission escalation %s refused: %s (%s)",
-                        payload.escalation_id,
-                        nack.error,
-                        nack.reason_code,
-                    )
+                logger.error(
+                    "permission escalation %s refused: %s (%s)",
+                    payload.escalation_id,
+                    nack.error,
+                    nack.reason_code,
+                )
         finally:
             # Nothing is waiting with the developer, so the slot must not stay
             # claimed — a later call has to be free to raise.
@@ -375,36 +354,33 @@ class PermissionModule:
         Args:
             payload: The retraction to send.
         """
-        await self._send(
-            T_PANE_RETRACT, payload.model_dump(), payload.escalation_id
-        )
+        await self._send(payload, payload.escalation_id)
 
     async def _send(
-        self, msg_type: str, payload: dict[str, Any], escalation_id: str
+        self, payload: WireMessage, escalation_id: str
     ) -> Response | None:
-        """Send one envelope to the master and wait for its reply.
+        """Send one message to the master and wait for its reply.
 
         Args:
-            msg_type: Protocol message type constant.
-            payload: Already-serialized payload for that type.
+            payload: Message to send; its ``MESSAGE_TYPE`` becomes the
+                envelope type.
             escalation_id: Escalation the send concerns, for the diagnostic log.
 
         Returns:
             The master's reply, or ``None`` when the master was unreachable.
         """
-        env = Envelope(
-            id=uuid.uuid4().hex,
-            type=msg_type,
-            session_id=self.session_id,
-            payload=payload,
-        )
         try:
-            return await client.request(
-                self.master_socket_path, env, timeout_s=MASTER_TIMEOUT_S
+            return await client.send(
+                self.master_socket_path,
+                payload,
+                session_id=self.session_id,
+                timeout_s=MASTER_TIMEOUT_S,
             )
         except Exception:
             logger.exception(
-                "could not send %s for escalation %s", msg_type, escalation_id
+                "could not send %s for escalation %s",
+                payload.MESSAGE_TYPE,
+                escalation_id,
             )
             return None
 

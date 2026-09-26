@@ -155,7 +155,6 @@ PERMISSION_ESCALATION = PermissionEscalationPayload.model_validate(
         "tool_input": {"command": "git push"},
         "task_intent": "intent",
         "reason": "publishes work outside the machine",
-        "raised_at": "2026-07-29T12:00:00+00:00",
     }
 )
 

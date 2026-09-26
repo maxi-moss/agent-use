@@ -273,7 +273,6 @@ def permission_pane_dict(
         "tool_input": {"command": "command-value"},
         "task_intent": "task-intent-value",
         "reason": "reason-value",
-        "raised_at": "2026-07-29T12:00:00+00:00",
         "permission_suggestions": [
             {"type": "setMode", "mode": "mode-value"}
         ],
@@ -440,23 +439,22 @@ async def test_second_escalation_while_active_is_protocol_violation(
     )
 
 
-async def test_second_permission_pane_from_a_session_is_protocol_violation(
+async def test_second_permission_pane_from_a_session_supersedes_the_first(
     rt: tuple[MasterRuntime, list[Any]]
 ) -> None:
     runtime, posts = rt
     assert (
         await send(runtime, T_PANE_ESCALATION, permission_pane_dict("p1"))
     ).ok
-    resp = await send(
-        runtime, T_PANE_ESCALATION, permission_pane_dict("p2")
-    )
-    # The permission module retracts the old prompt before raising the next.
-    assert not resp.ok
-    assert resp.payload["reason_code"] == NackCode.PROTOCOL_VIOLATION
-    assert [p.escalation_id for p in runtime.panes.entries] == ["p1"]
+    # No retract of p1 arrived first: a lost retract must not wedge the slot.
     assert (
-        len([m for m in posts if isinstance(m, PaneEscalationArrived)]) == 1
-    )
+        await send(runtime, T_PANE_ESCALATION, permission_pane_dict("p2"))
+    ).ok
+    assert [p.escalation_id for p in runtime.panes.entries] == ["p2"]
+    arrived = [m for m in posts if isinstance(m, PaneEscalationArrived)]
+    assert [m.escalation_id for m in arrived] == ["p1", "p2"]
+    notices = [m.text for m in posts if isinstance(m, Notice)]
+    assert "permission escalation p1 from session s1 superseded by p2" in notices
 
 
 async def test_permission_pane_never_waits_behind_a_decision(

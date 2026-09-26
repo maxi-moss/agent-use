@@ -3,8 +3,9 @@
 A pane escalation reports a native prompt — a permission prompt or an
 AskUserQuestion menu — that the developer answers in the session's own pane;
 the master only shows it and never answers it. At most one of each kind is
-live per session, and none waits behind another. Every mutation persists
-before it returns, so an open prompt survives a master restart.
+live per session, a newer raise replaces the older, and none waits behind
+another. Every mutation persists before it returns, so an open prompt
+survives a master restart.
 """
 
 import json
@@ -20,10 +21,6 @@ from broker.protocol.schemas import PANE_ESCALATION_ADAPTER, PaneEscalationPaylo
 
 class PaneStoreError(Exception):
     """The persisted pane-escalation file could not be read or validated."""
-
-
-class PaneProtocolViolation(Exception):
-    """A session raised a pane escalation while its previous one of that kind is live."""
 
 
 class PaneEscalations:
@@ -91,25 +88,31 @@ class PaneEscalations:
             (p for p in self._entries if p.escalation_id == escalation_id), None
         )
 
-    def accept(self, payload: PaneEscalationPayload) -> None:
-        """Hold ``payload`` and persist it.
+    def accept(
+        self, payload: PaneEscalationPayload
+    ) -> PaneEscalationPayload | None:
+        """Hold and persist ``payload``, superseding its session's live one of that kind.
 
         Args:
             payload: The pane escalation to show the developer.
 
-        Raises:
-            PaneProtocolViolation: The session already has a live pane
-                escalation of this kind; its raiser retracts the old one
-                before raising the next.
+        Returns:
+            The superseded entry, or ``None`` when none of this session and
+            kind was live.
         """
-        for entry in self._entries:
-            if entry.session_id == payload.session_id and entry.kind == payload.kind:
-                raise PaneProtocolViolation(
-                    f"{payload.kind} escalation {payload.escalation_id} arrived "
-                    f"while {entry.escalation_id} is live"
-                )
+        superseded = next(
+            (
+                entry
+                for entry in self._entries
+                if entry.session_id == payload.session_id
+                and entry.kind == payload.kind
+            ),
+            None,
+        )
+        self._entries = [e for e in self._entries if e is not superseded]
         self._entries.append(payload)
         self.save()
+        return superseded
 
     def retract(self, escalation_id: str) -> PaneEscalationPayload | None:
         """Clear a pane escalation whose native prompt is no longer open.

@@ -58,12 +58,11 @@ ASK_DECISION_ANSWER = "answer"
 class NackCode(StrEnum):
     """Machine-readable refusal reasons carried beside a NACK's error string.
 
-    Closed set: a sender that cannot tell a capacity refusal from a protocol
+    Closed set: a sender that cannot tell a routine refusal from a protocol
     violation has to treat both as bugs.
     """
 
     PROTOCOL_VIOLATION = "protocol_violation"
-    SLOT_OCCUPIED = "slot_occupied"
     MALFORMED = "malformed"
     UNKNOWN_SESSION = "unknown_session"
     STALE_PROPOSAL = "stale_proposal"
