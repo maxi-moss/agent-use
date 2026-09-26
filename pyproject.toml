@@ -120,7 +120,7 @@ ignore_imports = [
 name = "only the session broker consumes the index"
 type = "protected"
 protected_modules = ["broker.index"]
-allowed_importers = ["broker.session"]
+allowed_importers = ["broker.session.broker", "broker.session.grounding"]
 
 [[tool.importlinter.contracts]]
 name = "view model imports only broker.protocol.constants"

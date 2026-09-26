@@ -31,7 +31,8 @@ from broker.permission.classifier import (
     build_classifier_client,
     render_suggestions,
 )
-from broker.session.triage import FORCED_ONE, TRIAGE_TOOLS
+from broker.session.llm_stack import FORCED_ONE
+from broker.session.triage import TRIAGE_TOOLS
 
 SYSTEM: list[TextBlockParam] = [
     {

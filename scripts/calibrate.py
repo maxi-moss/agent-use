@@ -38,13 +38,8 @@ from broker.permission.classifier import (
     classify,
     render_suggestions,
 )
-from broker.session.triage import (
-    AnswerCall,
-    CompleteCall,
-    EscalateCall,
-    NoActionCall,
-    triage,
-)
+from broker.session.llm_stack import EscalateCall
+from broker.session.triage import AnswerCall, CompleteCall, NoActionCall, triage
 
 CALIBRATION_DIR = Path(__file__).parent.parent / "calibration-cases"
 

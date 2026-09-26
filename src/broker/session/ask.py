@@ -1,10 +1,11 @@
 """AskUserQuestion decisions: answer the agent's menu, or escalate it.
 
 The session stack's second call site, beside triage. It shares triage's
-escalate tool on purpose — both raise the same wire payload — and stays
-inside the session stack: nothing here touches the permission or master
-stacks. Answers are option labels copied verbatim (never indices), validated
-against the questions before anything leaves the broker.
+escalate model from ``llm_stack`` on purpose — both raise the same wire
+payload — and stays inside the session stack: nothing here touches the
+permission or master stacks. Answers are option labels copied verbatim
+(never indices), validated against the questions before anything leaves the
+broker.
 
 Class names, field names, `Field` descriptions and docstrings of these models
 are sent to the model.
@@ -19,7 +20,7 @@ from broker import llm_timing
 from broker import prompts
 from broker.config import SessionModelConfig
 from broker.llm import LLMCaller, LLMCallError, ToolCall, strict_tool
-from broker.session.triage import (
+from broker.session.llm_stack import (
     FORCED_ONE,
     EscalateCall,
     assemble_context,

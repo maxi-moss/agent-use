@@ -11,7 +11,8 @@ from broker.master.llm import MASTER_TOOLS
 from broker.permission.classifier import PERMISSION_TOOLS
 from broker.session.ask import ASK_TOOLS
 from broker.session.clarify import CLARIFY_TOOLS
-from broker.session.triage import GROUNDING_TOOLS, TRIAGE_TOOLS
+from broker.session.grounding import GROUNDING_TOOLS
+from broker.session.triage import TRIAGE_TOOLS
 
 PROMPT_DIR = Path(__file__).parent.parent.parent / "src" / "broker" / "prompts"
 NAMES = ["triage", "master", "grounding", "permission", "ask", "clarify"]

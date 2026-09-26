@@ -11,13 +11,13 @@ from broker.session.ask import (
     AnswerQuestionsCall,
     AnswerValidationError,
     AskInputError,
-    EscalateCall,
     ask_once,
     decide_questions,
     parse_questions,
     render_questions,
     validate_answers,
 )
+from broker.session.llm_stack import EscalateCall
 from broker.transcript.schemas import Option, Question
 
 MODEL_CFG = SessionModelConfig(model_id="test-model", max_tokens=8192)

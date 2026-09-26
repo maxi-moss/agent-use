@@ -1,8 +1,8 @@
 """Clarify: answer one read-only question about a live escalation.
 
-Reuses the session broker's own LLM seam and triage's context assembly — one
-forced-tool call, exactly like triage. Never resolves the escalation and never
-writes to the pane.
+Reuses the session broker's own LLM seam and the session stack's context
+assembly — one forced-tool call, exactly like triage. Never resolves the
+escalation and never writes to the pane.
 
 Class names, field names, `Field` descriptions and docstrings of these models
 are sent to the model.
@@ -17,7 +17,7 @@ from broker import prompts
 from broker.config import SessionModelConfig
 from broker.llm import LLMCaller, LLMCallError, ToolCall, strict_tool
 from broker.protocol.schemas import EscalationDisclosure, EscalationPayload
-from broker.session.triage import FORCED_ONE, assemble_context
+from broker.session.llm_stack import FORCED_ONE, assemble_context
 from broker.transcript.schemas import TranscriptEvent
 
 logger = logging.getLogger(__name__)

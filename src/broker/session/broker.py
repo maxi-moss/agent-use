@@ -23,25 +23,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, assert_never, cast
 
-from anthropic import AsyncAnthropic
-from anthropic.types import (
-    MessageParam,
-    TextBlockParam,
-    ToolChoiceParam,
-    ToolParam,
-)
 from pydantic import ValidationError
 
 from broker import decision_log
 from broker.decision_log import DecisionLogKind, DecisionLogRow
 from broker import llm as llm_module
-from broker.index.embedding import EmbeddingError, OpenAIEmbedder
-from broker.index.retrieval import RetrievalError, retrieve as retrieve_code
-from broker.index.schemas import GroundingContext
+from broker.index.embedding import EmbeddingError
+from broker.index.retrieval import RetrievalError
 from broker.llm import LLMCallError, LLMCaller, ToolCall
 from broker.config import (
     AdoptedSession,
-    EmbeddingConfig,
     ResumedTask,
     SessionBrokerConfig,
 )
@@ -119,16 +110,13 @@ from broker.protocol.schemas import (
     parse_nack,
 )
 from broker.session import ask, clarify
-from broker.session.triage import (
-    AnswerCall,
-    CompleteCall,
-    EscalateCall,
-    NoActionCall,
+from broker.session.grounding import (
     Retriever,
-    disclosure_of,
+    bind_index_retriever,
     ground_intent,
-    triage,
 )
+from broker.session.llm_stack import EscalateCall, bind_call_tool, disclosure_of
+from broker.session.triage import AnswerCall, CompleteCall, NoActionCall, triage
 from broker.session.watchdog import Watchdog
 from broker.transcript.adapter import ReadReport, read_cleaned
 from broker.transcript.schemas import (
@@ -245,65 +233,6 @@ class FatalSessionError(Exception):
         self.detail = detail
 
 
-def _bind_llm(client: AsyncAnthropic) -> LLMCaller[ToolCall]:
-    """Adapt an Anthropic client into the keyword-only ``LLMCaller`` shape.
-
-    Args:
-        client: Anthropic client passed through to ``llm.call_tool``.
-
-    Returns:
-        A callable that forwards every triage call to that one client.
-    """
-
-    async def call(
-        *,
-        model: str,
-        max_tokens: int,
-        system: list[TextBlockParam],
-        messages: list[MessageParam],
-        tools: list[ToolParam],
-        tool_choice: ToolChoiceParam,
-    ) -> ToolCall:
-        """Invoke the bound client and return its single tool call."""
-        return await llm_module.call_tool(
-            client,
-            model=model,
-            max_tokens=max_tokens,
-            system=system,
-            messages=messages,
-            tools=tools,
-            tool_choice=tool_choice,
-        )
-
-    return call
-
-
-def _bind_retrieve(paths: BrokerPaths, embedding: EmbeddingConfig) -> Retriever:
-    """Bind index retrieval to this broker home and the pinned embedding model.
-
-    The embedder is built per call so a missing ``OPENAI_API_KEY`` fails at
-    grounding time, loudly, rather than at broker start.
-
-    Args:
-        paths: Resolves the repository's index file.
-        embedding: The model pinned in ``broker.config``, as sent by the master.
-
-    Returns:
-        A callable matching ``Retriever``.
-    """
-
-    async def call(intent: str, cwd: Path) -> GroundingContext:
-        repo = cwd.resolve()
-        return await retrieve_code(
-            intent,
-            repo,
-            index_path=paths.index_db(repo),
-            embedder=OpenAIEmbedder.from_env(embedding),
-        )
-
-    return call
-
-
 class SessionBroker:
     def __init__(
         self,
@@ -391,9 +320,9 @@ class SessionBroker:
         # Bind FIRST — hooks may fire before the pane exists.
         server = await serve_unix(Path(self.cfg.socket_path), self.handle)
         if self._llm_call is None:
-            self._llm_call = _bind_llm(llm_module.build_client())
+            self._llm_call = bind_call_tool(llm_module.build_client())
         if self._retrieve is None:
-            self._retrieve = _bind_retrieve(self._paths, self.cfg.embedding)
+            self._retrieve = bind_index_retriever(self._paths, self.cfg.embedding)
         self.watchdog.start()
         self._status_task = asyncio.create_task(self._status_sender())
         drive = self._run_task = asyncio.create_task(self._drive())
@@ -787,7 +716,7 @@ class SessionBroker:
                 tool_use_id, payload.tool_input, f"{type(exc).__name__}: {exc}"
             )
             return escalated
-        if isinstance(result, ask.EscalateCall):
+        if isinstance(result, EscalateCall):
             self._escalate_menu(
                 tool_use_id,
                 payload.tool_input,
