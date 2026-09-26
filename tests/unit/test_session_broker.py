@@ -1657,7 +1657,7 @@ async def test_clarify_escalation_cancelled_by_retract(harness: Harness) -> None
     await launch(harness)
     escalation_id = await escalate_via_stop(harness)
     broker = harness.broker
-    escalation = broker._decision_escalation  # pyright: ignore[reportPrivateUsage]
+    escalation = broker.escalation_flow.live
     assert escalation is not None
     harness.llm.never_resolve = True
     asking = asyncio.create_task(
@@ -1688,7 +1688,7 @@ async def test_clarify_escalation_cancelled_by_retract(harness: Harness) -> None
 async def test_clarify_escalation_timeout_fails_loud_and_cancels_the_call(
     harness: Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("broker.session.broker.CLARIFY_TIMEOUT_S", 0.1)
+    monkeypatch.setattr("broker.session.decision_escalation.CLARIFY_TIMEOUT_S", 0.1)
     await launch(harness)
     escalation_id = await escalate_via_stop(harness)
     harness.llm.never_resolve = True
@@ -1700,7 +1700,7 @@ async def test_clarify_escalation_timeout_fails_loud_and_cancels_the_call(
         )
     )
     broker = harness.broker
-    escalation = broker._decision_escalation  # pyright: ignore[reportPrivateUsage]
+    escalation = broker.escalation_flow.live
     assert escalation is not None
     in_flight = escalation.clarify_tasks
     async with asyncio.timeout(5.0):
