@@ -7,6 +7,7 @@ and tool table separately).
 
 import hashlib
 import json
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 import pytest
@@ -16,7 +17,13 @@ from pydantic import BaseModel, ConfigDict
 from broker import prompts
 from broker.config import SessionModelConfig
 from broker.llm import LLMCallError, ToolCall
-from broker.session.llm_stack import assemble_context, forced_call
+from broker.session.llm_stack import (
+    FORCED_ONE,
+    SESSION_CALL_TIMEOUT_S,
+    assemble_context,
+    bind_call_tool,
+    forced_call,
+)
 from broker.transcript.adapter import render
 from broker.transcript.schemas import AssistantText, UserPrompt
 
@@ -106,6 +113,48 @@ def test_exactly_two_cache_breakpoints() -> None:
     assert "cache_control" in system[0]
     content = cast(list[dict[str, Any]], messages[0]["content"])
     assert "cache_control" in content[1]
+
+
+@dataclass
+class _FakeBlock:
+    type: str
+    name: str = ""
+    input: dict[str, Any] = field(default_factory=dict[str, Any])
+
+
+class _FakeResponse:
+    def __init__(self) -> None:
+        self.stop_reason = "tool_use"
+        self.content = [_FakeBlock(type="tool_use", name="probe", input={})]
+        self._request_id = "req_test"
+
+
+class _FakeMessages:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any) -> _FakeResponse:
+        self.calls.append(kwargs)
+        return _FakeResponse()
+
+
+class _FakeClient:
+    def __init__(self, messages: _FakeMessages) -> None:
+        self.messages = messages
+
+
+async def test_bind_call_tool_passes_the_session_timeout() -> None:
+    messages = _FakeMessages()
+    llm_call = bind_call_tool(cast(Any, _FakeClient(messages)))
+    await llm_call(
+        model="test-model",
+        max_tokens=8192,
+        system=[],
+        messages=[],
+        tools=[],
+        tool_choice=FORCED_ONE,
+    )
+    assert messages.calls[0]["timeout"] == SESSION_CALL_TIMEOUT_S
 
 
 def test_assembled_context_schema_pin() -> None:

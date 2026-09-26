@@ -96,6 +96,10 @@ def disclosure_of(call: EscalateCall) -> EscalationDisclosure:
 
 FORCED_ONE: ToolChoiceParam = {"type": "any", "disable_parallel_tool_use": True}
 
+# Named and bounded like every other wait (global rule); session-owned, not
+# shared with the permission or master call timeouts.
+SESSION_CALL_TIMEOUT_S = 60.0
+
 
 def assemble_context(
     system_prompt: str,
@@ -199,4 +203,4 @@ def bind_call_tool(client: AsyncAnthropic) -> LLMCaller[ToolCall]:
     Returns:
         A callable that forwards each forced-tool call to that one client.
     """
-    return functools.partial(call_tool, client)
+    return functools.partial(call_tool, client, timeout_s=SESSION_CALL_TIMEOUT_S)

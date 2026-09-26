@@ -46,6 +46,10 @@ from broker.master.runtime import MasterRuntime
 
 MAX_TOOL_ROUNDS = 6
 
+# Named and bounded like every other wait (global rule); master-owned, not
+# shared with the session or permission call timeouts.
+MASTER_CALL_TIMEOUT_S = 60.0
+
 
 class SpawnSessionArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -475,6 +479,7 @@ def bind_call_turn(client: AsyncAnthropic) -> LLMCaller[TurnResult]:
             messages=messages,
             tools=tools,
             tool_choice=tool_choice,
+            timeout_s=MASTER_CALL_TIMEOUT_S,
         )
 
     return call

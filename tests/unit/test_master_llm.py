@@ -5,6 +5,7 @@ import hashlib
 import json
 import tempfile
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -21,10 +22,13 @@ from anthropic.types import (
 from broker.config import BrokerConfig
 from broker.llm import ToolCall, TurnResult
 from broker.master.llm import (
+    AUTO_ONE,
+    MASTER_CALL_TIMEOUT_S,
     MAX_TOOL_ROUNDS,
     MASTER_TOOLS,
     ClarifyEscalationArgs,
     MasterLLM,
+    bind_call_turn,
 )
 from broker.master.pane_escalations import PaneEscalations
 from broker.master.payload_render import (
@@ -458,3 +462,44 @@ def test_clarify_escalation_args_are_closed() -> None:
         ClarifyEscalationArgs.model_validate(
             {"escalation_id": "e1", "question": "q", "decision": "B"}
         )
+
+
+@dataclass
+class _FakeBlock:
+    type: str
+    text: str = ""
+
+
+class _FakeResponse:
+    def __init__(self) -> None:
+        self.stop_reason = "end_turn"
+        self.content = [_FakeBlock(type="text", text="ok")]
+        self._request_id = "req_test"
+
+
+class _FakeMessages:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any) -> _FakeResponse:
+        self.calls.append(kwargs)
+        return _FakeResponse()
+
+
+class _FakeClient:
+    def __init__(self, messages: _FakeMessages) -> None:
+        self.messages = messages
+
+
+async def test_bind_call_turn_passes_the_master_timeout() -> None:
+    messages = _FakeMessages()
+    llm_call = bind_call_turn(cast(Any, _FakeClient(messages)))
+    await llm_call(
+        model="test-model",
+        max_tokens=8192,
+        system=[],
+        messages=[],
+        tools=[],
+        tool_choice=AUTO_ONE,
+    )
+    assert messages.calls[0]["timeout"] == MASTER_CALL_TIMEOUT_S

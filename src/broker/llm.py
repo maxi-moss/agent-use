@@ -138,6 +138,7 @@ async def _create(
     messages: Iterable[MessageParam],
     tools: Iterable[ToolParam],
     tool_choice: ToolChoiceParam,
+    timeout_s: float,
 ) -> anthropic.types.Message:
     """Issue one Messages request and return it only if it is usable.
 
@@ -149,6 +150,7 @@ async def _create(
         messages: Conversation sent to the model.
         tools: Tool definitions offered.
         tool_choice: How the model may use them.
+        timeout_s: Deadline passed straight to the SDK call.
 
     Returns:
         The response message.
@@ -164,6 +166,7 @@ async def _create(
             messages=list(messages),
             tools=list(tools),
             tool_choice=tool_choice,
+            timeout=timeout_s,
         )
     except anthropic.AnthropicError as exc:
         raise LLMCallError(f"{type(exc).__name__}: {exc}") from exc
@@ -184,6 +187,7 @@ async def call_tool(
     messages: Iterable[MessageParam],
     tools: Iterable[ToolParam],
     tool_choice: ToolChoiceParam,
+    timeout_s: float,
 ) -> ToolCall:
     """Make one forced tool call and return the single tool_use block.
 
@@ -195,6 +199,7 @@ async def call_tool(
         messages: Conversation sent to the model.
         tools: Tool definitions offered.
         tool_choice: How the model may use them; a forcing choice is expected.
+        timeout_s: Deadline passed straight to the SDK call.
 
     Returns:
         The tool the model called, with its input.
@@ -210,6 +215,7 @@ async def call_tool(
         messages=messages,
         tools=tools,
         tool_choice=tool_choice,
+        timeout_s=timeout_s,
     )
     if response.stop_reason != "tool_use":
         raise LLMCallError(
@@ -236,6 +242,7 @@ async def call_turn(
     messages: Iterable[MessageParam],
     tools: Iterable[ToolParam],
     tool_choice: ToolChoiceParam,
+    timeout_s: float,
 ) -> TurnResult:
     """Take one assistant turn under tool_choice auto.
 
@@ -247,6 +254,7 @@ async def call_turn(
         messages: Conversation sent to the model.
         tools: Tool definitions offered.
         tool_choice: How the model may use them; auto is the intended choice.
+        timeout_s: Deadline passed straight to the SDK call.
 
     Returns:
         The turn's concatenated text and its tool calls, in order.
@@ -263,6 +271,7 @@ async def call_turn(
         messages=messages,
         tools=tools,
         tool_choice=tool_choice,
+        timeout_s=timeout_s,
     )
     result = TurnResult()
     text_parts: list[str] = []

@@ -59,6 +59,7 @@ CALL_KWARGS: dict[str, Any] = {
     "messages": [],
     "tools": [],
     "tool_choice": {"type": "any", "disable_parallel_tool_use": True},
+    "timeout_s": 60.0,
 }
 
 
