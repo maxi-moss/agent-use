@@ -11,7 +11,7 @@ import asyncio
 import contextlib
 import logging
 import sys
-import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -59,36 +59,25 @@ from broker.master.queue import EscalationProtocolViolation, EscalationQueue
 from broker.master.registry import Registry, SessionRecord
 from broker.protocol import client
 from broker.protocol.constants import (
-    NACK_MALFORMED,
-    NACK_PROTOCOL_VIOLATION,
-    NACK_UNKNOWN_SESSION,
+    NackCode,
     PaneKind,
     SessionState,
-    T_APPROVE_PROMPT,
-    T_CLARIFY_ESCALATION,
     T_BUDGET_UPDATE,
     T_COMPLETION,
     T_DECISION_DELIVERED,
     T_DECISION_UNDELIVERED,
-    T_DISPATCH_DECISION,
     T_ESCALATION,
     T_ESCALATION_RETRACT,
     T_FATAL_ERROR,
-    T_GET_DECISION_LOG,
-    T_GET_PERMISSION_LOG,
     T_LIVE_STATUS,
     T_PANE_ESCALATION,
     T_PANE_RETRACT,
     T_PROMPT_PROPOSAL,
     T_PROMPT_UNDELIVERED,
-    T_REACTIVATE,
-    T_SEND_PROMPT,
     T_SESSION_ENDED,
-    T_SHUTDOWN,
-    T_STATUS,
 )
 from broker.protocol.schemas import (
-    PANE_ESCALATION_ADAPTER,
+    MASTER_SOCKET_PAYLOADS,
     ApprovePromptPayload,
     ClarifyEscalationReplyPayload,
     ClarifyEscalationRequestPayload,
@@ -96,6 +85,7 @@ from broker.protocol.schemas import (
     CompletionPayload,
     DecisionDeliveredPayload,
     DecisionLogPayload,
+    DecisionLogRequestPayload,
     DecisionUndeliveredPayload,
     DispatchDecisionPayload,
     Envelope,
@@ -103,15 +93,25 @@ from broker.protocol.schemas import (
     EscalationRetractPayload,
     FatalErrorPayload,
     LiveStatusPayload,
+    NackPayload,
     PaneEscalationPayload,
     PaneRetractPayload,
+    PermissionEscalationPayload,
     PermissionLogPayload,
+    PermissionLogRequestPayload,
     PromptProposalPayload,
     PromptUndeliveredPayload,
+    QuestionEscalationPayload,
     ReactivatePayload,
     Response,
     SendPromptPayload,
+    SessionEndedPayload,
+    ShutdownPayload,
     StatusPayload,
+    StatusRequestPayload,
+    WireMessage,
+    nack_response,
+    parse_nack,
 )
 from broker.protocol.server import serve_unix
 
@@ -124,6 +124,8 @@ CLARIFY_ESCALATION_TIMEOUT_S = 60.0
 STOP_WAIT_S = 10.0
 SOCKET_POLL_S = 0.1
 AGENT_PROBE_TIMEOUT_S = 5.0
+
+_Handler = Callable[[str, Any], Awaitable[NackPayload | None]]
 
 # Failures the on-demand status probe absorbs into a warning line: a session
 # that cannot be reached must not fail the whole listing.
@@ -272,6 +274,7 @@ class MasterRuntime:
         cfg: BrokerConfig,
         *,
         anchor_pane: str,
+        claude_json: Path,
     ) -> None:
         """Wire the runtime to its frontend sink, its persisted stores and the config.
 
@@ -282,11 +285,14 @@ class MasterRuntime:
             panes: Loaded open pane escalations.
             cfg: Broker configuration.
             anchor_pane: Herdr pane every spawned session is anchored to.
+            claude_json: Claude Code's ``~/.claude.json`` state file, resolved
+                once by the composition root.
         """
         self.emit = emit
         self.registry = registry
         self.cfg = cfg
         self.anchor_pane = anchor_pane
+        self._claude_json = claude_json
         self.queue = queue
         self.panes = panes
         self._surfaced_id: str | None = None
@@ -305,6 +311,21 @@ class MasterRuntime:
         self._permission_prompt_pending: set[str] = set()
         self._master_activity: str | None = None
         self._serve_task: asyncio.Task[None] | None = None
+        self._handlers: dict[str, _Handler] = {
+            T_ESCALATION: self._on_escalation,
+            T_PANE_ESCALATION: self._on_pane_escalation,
+            T_COMPLETION: self._on_completion,
+            T_SESSION_ENDED: self._on_session_ended,
+            T_FATAL_ERROR: self._on_fatal_error,
+            T_ESCALATION_RETRACT: self._on_escalation_retract,
+            T_PANE_RETRACT: self._on_pane_retract,
+            T_PROMPT_UNDELIVERED: self._on_prompt_undelivered,
+            T_PROMPT_PROPOSAL: self._on_prompt_proposal,
+            T_BUDGET_UPDATE: self._on_budget_update,
+            T_DECISION_DELIVERED: self._on_decision_delivered,
+            T_DECISION_UNDELIVERED: self._on_decision_undelivered,
+            T_LIVE_STATUS: self._on_live_status,
+        }
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -358,7 +379,7 @@ class MasterRuntime:
                 self._register_proposal(name, status.pending_proposal)
         self._publish_fleet()
 
-    async def handle(self, env: Envelope) -> Response | None:
+    async def handle(self, env: Envelope) -> Response:
         """Handle one inbound envelope, turning any failure into a NACK.
 
         Args:
@@ -370,266 +391,305 @@ class MasterRuntime:
         try:
             return await self._handle(env)
         except Exception as exc:  # fail loud to the developer, never crash serve
+            logger.exception("master handler error on %r", env.type)
             self.emit(
                 Notice(f"master handler error on {env.type!r}: {exc!r}")
             )
-            return self._ack(env, ok=False)
+            return nack_response(env, f"master handler error: {exc!r}", None)
 
-    async def _handle(self, env: Envelope) -> Response | None:
-        """Route an envelope to the handling for its message type.
+    async def _handle(self, env: Envelope) -> Response:
+        """Validate an envelope, check its sender, and run its message's handler.
 
         Args:
             env: Envelope received on the master socket.
 
         Returns:
-            ``Response(ok=True)`` once handled, ``ok=False`` if unknown.
+            The ACK once handled, otherwise the NACK saying why not.
         """
-        name = env.session_id or ""
-        if env.type == T_ESCALATION:
-            return await self._on_escalation(env, name)
-        if env.type == T_PANE_ESCALATION:
-            return await self._on_pane_escalation(env, name)
-        if env.type == T_COMPLETION:
-            p = CompletionPayload.model_validate(env.payload)
-            self._set_state(name, SessionState.COMPLETED)
-            self.emit(CompletionArrived(name, p.headline, p.supporting))
-            await notifier.notify_or_notice(
-                self.emit,
-                notifier.notify_done,
-                f"Session {name} complete",
-                p.headline,
-            )
-            return self._ack(env, ok=True)
-        if env.type == T_SESSION_ENDED:
-            return await self._on_session_ended(env, name)
-        if env.type == T_FATAL_ERROR:
-            p = FatalErrorPayload.model_validate(env.payload)
-            self._set_state(name, SessionState.ERROR)
-            self.emit(
-                Notice(f"session {name} FATAL [{p.error_class}]: {p.detail}")
-            )
-            # An errored session can no longer answer; its escalations would
-            # otherwise wedge the queue, undispatchable to a dead session.
-            await self._retract_stranded_escalation(name)
-            self._retract_stranded_pane_escalations(name)
-            await notifier.notify_or_notice(
-                self.emit,
-                notifier.notify_request,
-                f"Session {name} failed",
-                f"{p.error_class}: {p.detail}",
-            )
-            return self._ack(env, ok=True)
-        if env.type == T_ESCALATION_RETRACT:
-            rp = EscalationRetractPayload.model_validate(env.payload)
-            return await self._on_escalation_retract(env, name, rp)
-        if env.type == T_PANE_RETRACT:
-            pp = PaneRetractPayload.model_validate(env.payload)
-            return self._on_pane_retract(env, name, pp)
-        if env.type == T_PROMPT_UNDELIVERED:
-            up = PromptUndeliveredPayload.model_validate(env.payload)
-            self.emit(
-                Notice(f"prompt for session {name} did NOT reach its pane: {up.detail}")
-            )
-            return self._ack(env, ok=True)
-        if env.type == T_PROMPT_PROPOSAL:
-            p = PromptProposalPayload.model_validate(env.payload)
-            self._set_state(name, SessionState.AWAITING_APPROVAL)
-            self._register_proposal(name, p)
-            self._publish_fleet()
-            return self._ack(env, ok=True)
-        if env.type == T_BUDGET_UPDATE:
-            p = BudgetUpdatePayload.model_validate(env.payload)
-            record = self.registry.get(name)
-            record.budget_count = p.count
-            self.registry.upsert(record)
-            self._publish_fleet()
-            return self._ack(env, ok=True)
-        if env.type == T_DECISION_DELIVERED:
-            dp = DecisionDeliveredPayload.model_validate(env.payload)
-            return await self._on_decision_delivered(env, name, dp)
-        if env.type == T_DECISION_UNDELIVERED:
-            p = DecisionUndeliveredPayload.model_validate(env.payload)
-            return await self._on_decision_undelivered(env, name, p)
-        if env.type == T_LIVE_STATUS:
-            p = LiveStatusPayload.model_validate(env.payload)
-            rec = self.registry.records.get(name)
-            if rec is not None:
-                # Outside the absorbing guard: /clear in a settled session
-                # binds a new Claude session id.
-                self._note_identity(rec, p)
-            # A settled/gone session ignores late pushes: absorbing states are
-            # left only by a master-initiated boundary write, never by a stale
-            # in-flight push arriving after the fact (cross-connection sends
-            # reorder even though each is individually ACKed).
-            if rec is not None and rec.state not in _ABSORBING:
-                if p.activity:
-                    self._activity[name] = p.activity
-                else:
-                    self._activity.pop(name, None)
-                self._note_task_activity(name, p.task_activity)
-                if p.permission_prompt:
-                    self._permission_prompt_pending.add(name)
-                else:
-                    self._permission_prompt_pending.discard(name)
-                state_changed = self._set_state(name, p.state)
-                if not state_changed:
-                    self._publish_fleet()  # activity/perm-only change
-            # ACK every push, absorbing/unknown included, so the sender never
-            # spins re-sending a snapshot the master refuses to apply.
-            return self._ack(env, ok=True)
-        self.emit(Notice(f"unknown message type {env.type!r} from {name!r}"))
-        return self._ack(env, ok=False)
-
-    async def _on_escalation(self, env: Envelope, name: str) -> Response:
-        """Validate one escalation, queue it, and surface it if it is next.
-
-        Args:
-            env: Envelope carrying the escalation payload.
-            name: Session name from the envelope, used for rejection notices.
-
-        Returns:
-            ``Response(ok=True)`` once live, ``ok=False`` with a reason code
-            if rejected.
-        """
+        session_id = env.session_id or ""
+        validate = MASTER_SOCKET_PAYLOADS.get(env.type)
+        if validate is None:
+            msg = f"unknown message type {env.type!r} from session {session_id!r}"
+            self.emit(Notice(msg))
+            return nack_response(env, msg, NackCode.MALFORMED)
         try:
-            p = EscalationPayload.model_validate(env.payload)
+            payload = validate(env.payload)
         except ValidationError as exc:
-            # Never render a thin escalation as if complete.
+            # Never act on a thin message as if it were complete.
             self.emit(
                 Notice(
-                    f"MALFORMED escalation from session {name!r} — NOT "
-                    f"surfaced.\nvalidation: {exc}\nraw payload: {env.payload!r}"
+                    f"MALFORMED {env.type} from session {session_id!r} — NOT "
+                    f"handled.\nvalidation: {exc}\nraw payload: {env.payload!r}"
                 )
             )
-            return self._nack(env, f"malformed escalation: {exc}", NACK_MALFORMED)
-        unknown = self._reject_unknown_session(env, p.session_id, "escalation")
-        if unknown is not None:
-            return unknown
+            return nack_response(
+                env, f"malformed {env.type}: {exc}", NackCode.MALFORMED
+            )
+        if session_id not in self.registry.records:
+            msg = f"{env.type} from unknown session {session_id!r} — refused"
+            self.emit(Notice(msg))
+            return nack_response(env, msg, NackCode.UNKNOWN_SESSION)
+        if (
+            isinstance(
+                payload,
+                EscalationPayload
+                | PermissionEscalationPayload
+                | QuestionEscalationPayload,
+            )
+            and payload.session_id != session_id
+        ):
+            msg = (
+                f"{env.type} sent by session {session_id!r} names session "
+                f"{payload.session_id!r} — refused"
+            )
+            self.emit(Notice(msg))
+            return nack_response(env, msg, NackCode.UNKNOWN_SESSION)
+        refusal = await self._handlers[env.type](session_id, payload)
+        if refusal is not None:
+            return nack_response(env, refusal.error, refusal.reason_code)
+        return Response(id=env.id, ok=True)
+
+    async def _on_escalation(
+        self, session_id: str, p: EscalationPayload
+    ) -> NackPayload | None:
+        """Queue one escalation and surface it if it is next.
+
+        Args:
+            session_id: Session that raised the escalation.
+            p: The escalation.
+
+        Returns:
+            ``None`` once queued, otherwise the refusal.
+        """
         try:
             self.queue.accept(p)
         except EscalationProtocolViolation as exc:
             self.emit(Notice(f"PROTOCOL VIOLATION: {exc}"))
-            return self._nack(env, str(exc), NACK_PROTOCOL_VIOLATION)
-        self._set_state(p.session_id, SessionState.ESCALATED)
+            return NackPayload(
+                error=str(exc), reason_code=NackCode.PROTOCOL_VIOLATION
+            )
+        self._set_state(session_id, SessionState.ESCALATED)
         self._publish_fleet()
         await self._surface_head()
-        return self._ack(env, ok=True)
+        return None
 
-    async def _on_pane_escalation(self, env: Envelope, name: str) -> Response:
-        """Validate one pane escalation, hold it, and announce it at once.
+    async def _on_pane_escalation(
+        self, session_id: str, p: PaneEscalationPayload
+    ) -> NackPayload | None:
+        """Hold one pane escalation and announce it at once.
 
         Args:
-            env: Envelope carrying the pane-escalation payload.
-            name: Session name from the envelope, used for rejection notices.
+            session_id: Session whose pane shows the native prompt.
+            p: The pane escalation.
 
         Returns:
-            ``Response(ok=True)`` once live, ``ok=False`` with a reason code
-            if rejected.
+            ``None`` once held, otherwise the refusal.
         """
-        try:
-            p = PANE_ESCALATION_ADAPTER.validate_python(env.payload)
-        except ValidationError as exc:
-            # A pane escalation missing its session or content is not
-            # something the developer could act on.
-            self.emit(
-                Notice(
-                    f"MALFORMED pane escalation from session {name!r} — "
-                    f"NOT surfaced.\nvalidation: {exc}\n"
-                    f"raw payload: {env.payload!r}"
-                )
-            )
-            return self._nack(
-                env, f"malformed pane escalation: {exc}", NACK_MALFORMED
-            )
-        unknown = self._reject_unknown_session(
-            env, p.session_id, f"{p.kind} escalation"
-        )
-        if unknown is not None:
-            return unknown
         try:
             self.panes.accept(p)
         except PaneProtocolViolation as exc:
             self.emit(Notice(f"PROTOCOL VIOLATION: {exc}"))
-            return self._nack(env, str(exc), NACK_PROTOCOL_VIOLATION)
+            return NackPayload(
+                error=str(exc), reason_code=NackCode.PROTOCOL_VIOLATION
+            )
         self._publish_fleet()
         await self._announce_pane_escalation(p)
-        return self._ack(env, ok=True)
+        return None
+
+    async def _on_completion(
+        self, session_id: str, p: CompletionPayload
+    ) -> NackPayload | None:
+        """Settle a session that finished its task and tell the developer.
+
+        Args:
+            session_id: Session that completed.
+            p: The session's completion report.
+
+        Returns:
+            ``None``; a completion is never refused.
+        """
+        self._set_state(session_id, SessionState.COMPLETED)
+        self.emit(CompletionArrived(session_id, p.headline, p.supporting))
+        await notifier.notify_or_notice(
+            self.emit,
+            notifier.notify_done,
+            f"Session {session_id} complete",
+            p.headline,
+        )
+        return None
+
+    async def _on_fatal_error(
+        self, session_id: str, p: FatalErrorPayload
+    ) -> NackPayload | None:
+        """Mark a session errored and retract the escalations it can no longer answer.
+
+        Args:
+            session_id: Session that failed.
+            p: The failure the broker reported.
+
+        Returns:
+            ``None``; a fatal error is never refused.
+        """
+        self._set_state(session_id, SessionState.ERROR)
+        self.emit(
+            Notice(f"session {session_id} FATAL [{p.error_class}]: {p.detail}")
+        )
+        # An errored session can no longer answer; its escalations would
+        # otherwise wedge the queue, undispatchable to a dead session.
+        await self._retract_stranded_escalation(session_id)
+        self._retract_stranded_pane_escalations(session_id)
+        await notifier.notify_or_notice(
+            self.emit,
+            notifier.notify_request,
+            f"Session {session_id} failed",
+            f"{p.error_class}: {p.detail}",
+        )
+        return None
 
     async def _on_escalation_retract(
-        self, env: Envelope, name: str, p: EscalationRetractPayload
-    ) -> Response:
+        self, session_id: str, p: EscalationRetractPayload
+    ) -> NackPayload | None:
         """Clear a decision escalation its session resolved out of band.
 
         Args:
-            env: The retract envelope.
-            name: Session that withdrew the escalation.
+            session_id: Session that withdrew the escalation.
             p: The escalation withdrawn and why.
 
         Returns:
-            The ACK.
+            ``None``; a retract is never refused.
         """
         self._clear_inflight(p.escalation_id)
         cleared = self.queue.retract(p.escalation_id)
         if cleared is not None:
             # Raising it set ESCALATED here; withdrawing it must undo that
             # or the registry outlives the escalation it describes.
-            self._set_state(name, SessionState.DRIVING)
+            self._set_state(session_id, SessionState.DRIVING)
         if cleared is not None and cleared.escalation_id == self._surfaced_id:
             # It was surfaced, so the developer must learn it is no longer
             # live; a waiting entry they never saw retracts silently.
             self._surfaced_id = None
             self.emit(
                 Notice(
-                    f"escalation {p.escalation_id} from session {name} "
+                    f"escalation {p.escalation_id} from session {session_id} "
                     f"retracted: {p.reason}"
                 )
             )
         self._publish_fleet()
         await self._surface_head()
-        return self._ack(env, ok=True)
+        return None
 
-    def _on_pane_retract(
-        self, env: Envelope, name: str, p: PaneRetractPayload
-    ) -> Response:
+    async def _on_pane_retract(
+        self, session_id: str, p: PaneRetractPayload
+    ) -> NackPayload | None:
         """Clear a pane escalation whose native prompt is no longer open.
 
         Args:
-            env: The retract envelope.
-            name: Session whose prompt closed.
+            session_id: Session whose prompt closed.
             p: The pane escalation withdrawn and why.
 
         Returns:
-            The ACK.
+            ``None``; a retract is never refused.
         """
         cleared = self.panes.retract(p.escalation_id)
         if cleared is not None:
             self.emit(
                 Notice(
                     f"{cleared.kind} escalation {p.escalation_id} from session "
-                    f"{name} retracted: {p.reason}"
+                    f"{session_id} retracted: {p.reason}"
                 )
             )
             self._publish_fleet()
-        return self._ack(env, ok=True)
+        return None
 
-    def _reject_unknown_session(
-        self, env: Envelope, session_id: str, kind: str
-    ) -> Response | None:
-        """Refuse an escalation from a session the registry does not know.
+    async def _on_prompt_undelivered(
+        self, session_id: str, p: PromptUndeliveredPayload
+    ) -> NackPayload | None:
+        """Tell the developer an accepted prompt never reached its pane.
 
         Args:
-            env: Envelope being answered.
-            session_id: Session the payload claims to come from.
-            kind: Word naming the escalation kind, used in the notice.
+            session_id: Session whose pane refused the prompt.
+            p: Why the prompt did not land.
 
         Returns:
-            ``None`` when the session is known, otherwise the NACK.
+            ``None``; the report is never refused.
         """
-        if session_id in self.registry.records:
+        self.emit(
+            Notice(
+                f"prompt for session {session_id} did NOT reach its pane: "
+                f"{p.detail}"
+            )
+        )
+        return None
+
+    async def _on_prompt_proposal(
+        self, session_id: str, p: PromptProposalPayload
+    ) -> NackPayload | None:
+        """Hold a session's prompt proposal for the developer's approval.
+
+        Args:
+            session_id: Session that proposed the prompt.
+            p: The proposal.
+
+        Returns:
+            ``None``; a proposal is never refused.
+        """
+        self._set_state(session_id, SessionState.AWAITING_APPROVAL)
+        self._register_proposal(session_id, p)
+        self._publish_fleet()
+        return None
+
+    async def _on_budget_update(
+        self, session_id: str, p: BudgetUpdatePayload
+    ) -> NackPayload | None:
+        """Persist a session's autonomous-answer count.
+
+        Args:
+            session_id: Session whose count changed.
+            p: The new count.
+
+        Returns:
+            ``None``; the update is never refused.
+        """
+        record = self.registry.get(session_id)
+        record.budget_count = p.count
+        self.registry.upsert(record)
+        self._publish_fleet()
+        return None
+
+    async def _on_live_status(
+        self, session_id: str, p: LiveStatusPayload
+    ) -> NackPayload | None:
+        """Fold a session's pushed live status into the fleet.
+
+        Args:
+            session_id: Session that pushed its status.
+            p: The broker's current live status.
+
+        Returns:
+            ``None``; a settled session's push is ACKed and ignored.
+        """
+        rec = self.registry.records[session_id]
+        # Outside the absorbing guard: /clear in a settled session binds a new
+        # Claude session id.
+        self._note_identity(rec, p)
+        # A settled session ignores late pushes: absorbing states are left
+        # only by a master-initiated boundary write, never by a stale
+        # in-flight push arriving after the fact (cross-connection sends
+        # reorder even though each is individually ACKed).
+        if rec.state in _ABSORBING:
             return None
-        msg = f"{kind} from unknown session {session_id!r} — NOT surfaced"
-        self.emit(Notice(msg))
-        return self._nack(env, msg, NACK_UNKNOWN_SESSION)
+        if p.activity:
+            self._activity[session_id] = p.activity
+        else:
+            self._activity.pop(session_id, None)
+        self._note_task_activity(session_id, p.task_activity)
+        if p.permission_prompt:
+            self._permission_prompt_pending.add(session_id)
+        else:
+            self._permission_prompt_pending.discard(session_id)
+        if not self._set_state(session_id, p.state):
+            self._publish_fleet()  # activity/perm-only change
+        return None
 
     async def _surface_head(self) -> None:
         """Render, announce and notify the queue's head, exactly once."""
@@ -702,7 +762,8 @@ class MasterRuntime:
             anchor_pane=self.anchor_pane,
             intent=intent,
         )
-        seed_trust(cwd_path)  # BEFORE spawn — the dialog eats input
+        # BEFORE spawn — the dialog eats input.
+        seed_trust(cwd_path, self._claude_json)
         proc = await self._spawn_broker(record, adopt=None)
         record.pid = proc.pid
         self._procs[name] = proc
@@ -829,12 +890,9 @@ class MasterRuntime:
             completed and so has a task it is still driving.
         """
         record = self.registry.get(session_id)
-        env = self._env(
-            T_REACTIVATE, ReactivatePayload(intent=intent).model_dump()
-        )
         rejected = await self._deliver(
             record.socket_path,
-            env,
+            ReactivatePayload(intent=intent),
             rejection=f"session {session_id} refused reactivation",
         )
         if rejected is not None:
@@ -868,15 +926,9 @@ class MasterRuntime:
             return msg
         name = pending.session_id
         record = self.registry.get(name)
-        env = self._env(
-            T_APPROVE_PROMPT,
-            ApprovePromptPayload(
-                proposal_id=proposal_id, prompt=prompt
-            ).model_dump(),
-        )
         rejected = await self._deliver(
             record.socket_path,
-            env,
+            ApprovePromptPayload(proposal_id=proposal_id, prompt=prompt),
             rejection=(
                 f"session {name} rejected approval for proposal "
                 f"{proposal_id} (stale)"
@@ -932,15 +984,9 @@ class MasterRuntime:
             self.emit(Notice(msg))
             return msg
         record = self.registry.get(active.session_id)
-        env = self._env(
-            T_DISPATCH_DECISION,
-            DispatchDecisionPayload(
-                escalation_id=escalation_id, response=decision
-            ).model_dump(),
-        )
         rejected = await self._deliver(
             record.socket_path,
-            env,
+            DispatchDecisionPayload(escalation_id=escalation_id, response=decision),
             rejection=(
                 f"session {record.name} rejected the dispatched decision "
                 f"for escalation {escalation_id} (stale)"
@@ -990,17 +1036,16 @@ class MasterRuntime:
             self._inflight = None
 
     async def _on_decision_delivered(
-        self, env: Envelope, name: str, p: DecisionDeliveredPayload
-    ) -> Response:
+        self, session_id: str, p: DecisionDeliveredPayload
+    ) -> NackPayload | None:
         """Resolve an escalation now that its decision reached the pane.
 
         Args:
-            env: The delivered-decision envelope.
-            name: Session that confirmed delivery.
+            session_id: Session that confirmed delivery.
             p: The escalation whose decision landed.
 
         Returns:
-            The ACK.
+            ``None``; a delivery report is never refused.
         """
         self._clear_inflight(p.escalation_id)
         if self.queue.resolve(p.escalation_id) is not None:
@@ -1009,11 +1054,11 @@ class MasterRuntime:
             self._surfaced_id = None
             self._publish_fleet()
             await self._surface_head()
-        return self._ack(env, ok=True)
+        return None
 
     async def _on_decision_undelivered(
-        self, env: Envelope, name: str, p: DecisionUndeliveredPayload
-    ) -> Response:
+        self, session_id: str, p: DecisionUndeliveredPayload
+    ) -> NackPayload | None:
         """Handle a dispatched decision that did not reach the pane.
 
         Resolution waits for confirmed delivery, so the escalation was never
@@ -1022,35 +1067,34 @@ class MasterRuntime:
         now orphaned queue entry.
 
         Args:
-            env: The undelivered-decision envelope.
-            name: Session that reported the miss.
+            session_id: Session that reported the miss.
             p: The escalation the decision answered, why it did not land, and
                 whether the broker still holds it live.
 
         Returns:
-            The ACK.
+            ``None``; a miss report is never refused.
         """
         self._clear_inflight(p.escalation_id)
         if p.still_live:
             self.emit(
                 Notice(
                     f"decision for escalation {p.escalation_id} did NOT reach "
-                    f"session {name}: {p.detail}"
+                    f"session {session_id}: {p.detail}"
                 )
             )
-            return self._ack(env, ok=True)
+            return None
         cleared = self.queue.retract(p.escalation_id)
         if cleared is not None and cleared.escalation_id == self._surfaced_id:
             self._surfaced_id = None
             self.emit(
                 Notice(
-                    f"escalation {p.escalation_id} from session {name} "
+                    f"escalation {p.escalation_id} from session {session_id} "
                     f"cleared: {p.detail}"
                 )
             )
         self._publish_fleet()
         await self._surface_head()
-        return self._ack(env, ok=True)
+        return None
 
     async def clarify_escalation(self, escalation_id: str, question: str) -> str:
         """Relay a read-only question about the live escalation to its broker.
@@ -1076,22 +1120,21 @@ class MasterRuntime:
             self.emit(Notice(msg))
             return msg
         record = self.registry.get(active.session_id)
-        env = self._env(
-            T_CLARIFY_ESCALATION,
+        resp = await client.send(
+            Path(record.socket_path),
             ClarifyEscalationRequestPayload(
                 escalation_id=escalation_id, question=question
-            ).model_dump(),
-        )
-        resp = await client.request(
-            Path(record.socket_path), env, timeout_s=CLARIFY_ESCALATION_TIMEOUT_S
+            ),
+            session_id=None,
+            timeout_s=CLARIFY_ESCALATION_TIMEOUT_S,
         )
         if not resp.ok:
-            reason = resp.payload.get("error")
+            reason = parse_nack(resp).error
             msg = (
                 f"no clarification from session {record.name} for escalation "
                 f"{escalation_id}"
             )
-            if isinstance(reason, str) and reason:
+            if reason:
                 msg = f"{msg}: {reason}"
             self.emit(Notice(msg))
             return msg
@@ -1113,10 +1156,9 @@ class MasterRuntime:
             rejection carrying the session's reason if it NACKed.
         """
         record = self.registry.get(session_id)
-        env = self._env(T_SEND_PROMPT, SendPromptPayload(text=text).model_dump())
         rejected = await self._deliver(
             record.socket_path,
-            env,
+            SendPromptPayload(text=text),
             rejection=f"session {session_id} rejected the prompt",
         )
         if rejected is not None:
@@ -1134,8 +1176,12 @@ class MasterRuntime:
             The status as reported by the session broker.
         """
         socket_path = Path(self.registry.get(session_id).socket_path)
-        env = self._env(T_STATUS, {})
-        resp = await client.request(socket_path, env, timeout_s=REQUEST_TIMEOUT_S)
+        resp = await client.send(
+            socket_path,
+            StatusRequestPayload(),
+            session_id=None,
+            timeout_s=REQUEST_TIMEOUT_S,
+        )
         status = StatusPayload.model_validate(resp.payload)
         self._set_state(session_id, status.state)
         self._note_task_activity(session_id, status.task_activity)
@@ -1177,9 +1223,11 @@ class MasterRuntime:
             ValidationError: The session's reply was not a decision log.
         """
         record = self.registry.get(session_id)
-        env = self._env(T_GET_DECISION_LOG, {})
-        resp = await client.request(
-            Path(record.socket_path), env, timeout_s=REQUEST_TIMEOUT_S
+        resp = await client.send(
+            Path(record.socket_path),
+            DecisionLogRequestPayload(),
+            session_id=None,
+            timeout_s=REQUEST_TIMEOUT_S,
         )
         return DecisionLogPayload.model_validate(resp.payload).text
 
@@ -1196,9 +1244,11 @@ class MasterRuntime:
             ValidationError: The session's reply was not a permission log.
         """
         record = self.registry.get(session_id)
-        env = self._env(T_GET_PERMISSION_LOG, {})
-        resp = await client.request(
-            Path(record.socket_path), env, timeout_s=REQUEST_TIMEOUT_S
+        resp = await client.send(
+            Path(record.socket_path),
+            PermissionLogRequestPayload(),
+            session_id=None,
+            timeout_s=REQUEST_TIMEOUT_S,
         )
         return PermissionLogPayload.model_validate(resp.payload).text
 
@@ -1213,9 +1263,10 @@ class MasterRuntime:
         """
         record = self.registry.get(session_id)
         with contextlib.suppress(ConnectionError, TimeoutError, OSError):
-            await client.request(
+            await client.send(
                 Path(record.socket_path),
-                self._env(T_SHUTDOWN, {}),
+                ShutdownPayload(),
+                session_id=None,
                 timeout_s=REQUEST_TIMEOUT_S,
             )
         proc = self._procs.pop(session_id, None)
@@ -1425,34 +1476,34 @@ class MasterRuntime:
         if cleared:
             self._publish_fleet()
 
-    async def _on_session_ended(self, env: Envelope, name: str) -> Response:
+    async def _on_session_ended(
+        self, session_id: str, p: SessionEndedPayload
+    ) -> NackPayload | None:
         """Retire a session whose broker reported its ``SessionEnd``.
 
         Args:
-            env: Envelope carrying the terminal report.
-            name: Session that ended.
+            session_id: Session that ended.
+            p: The terminal report.
 
         Returns:
-            The ACK, sent even when the session is already gone.
+            ``None``; the report is never refused.
         """
-        if name in self.registry.records:
-            logger.info("session %s: ended (/exit) — removed from the fleet", name)
-            self._activity.pop(name, None)
-            self._task_activity.pop(name, None)
-            self._permission_prompt_pending.discard(name)
-            self._discard_proposals(name)
-            self._procs.pop(name, None)
-            self.registry.remove(name)
-            # The broker exits without withdrawing its live escalations, so
-            # retract them all — a stranded head would wedge the FIFO queue,
-            # undispatchable to a gone session.
-            await self._retract_stranded_escalation(name)
-            self._retract_stranded_pane_escalations(name)
-            self.emit(
-                Notice(f"session {name} ended (/exit) — removed from the fleet")
-            )
-            self._publish_fleet()
-        return self._ack(env, ok=True)
+        self._activity.pop(session_id, None)
+        self._task_activity.pop(session_id, None)
+        self._permission_prompt_pending.discard(session_id)
+        self._discard_proposals(session_id)
+        self._procs.pop(session_id, None)
+        self.registry.remove(session_id)
+        # The broker exits without withdrawing its live escalations, so
+        # retract them all — a stranded head would wedge the FIFO queue,
+        # undispatchable to a gone session.
+        await self._retract_stranded_escalation(session_id)
+        self._retract_stranded_pane_escalations(session_id)
+        self.emit(
+            Notice(f"session {session_id} ended (/exit) — removed from the fleet")
+        )
+        self._publish_fleet()
+        return None
 
     def _set_state(self, name: str, state: SessionState) -> bool:
         """Record a session's new state and tell the TUI, once per change.
@@ -1602,51 +1653,25 @@ class MasterRuntime:
         self._publish_fleet()
 
     async def _deliver(
-        self, socket_path: str, env: Envelope, *, rejection: str
+        self, socket_path: str, payload: WireMessage, *, rejection: str
     ) -> str | None:
-        """Send ``env`` to a session socket, reporting a NACK.
+        """Send ``payload`` to a session socket, reporting a NACK.
 
         Args:
             socket_path: Session socket to write to.
-            env: Envelope to send.
-            rejection: Message logged and returned when the session NACKs.
+            payload: Message to send.
+            rejection: Message returned when the session NACKs.
 
         Returns:
             ``None`` when the session ACKed, otherwise ``rejection``, with the
             broker's own reason appended when it sent one.
         """
-        resp = await client.request(
-            Path(socket_path), env, timeout_s=REQUEST_TIMEOUT_S
+        resp = await client.send(
+            Path(socket_path), payload, session_id=None, timeout_s=REQUEST_TIMEOUT_S
         )
         if resp.ok:
             return None
-        reason = resp.payload.get("error")
-        if isinstance(reason, str) and reason:
+        reason = parse_nack(resp).error
+        if reason:
             rejection = f"{rejection}: {reason}"
-        logger.warning("%s", rejection)
         return rejection
-
-    def _env(self, msg_type: str, payload: dict[str, Any]) -> Envelope:
-        """Wrap a payload in an envelope with a fresh message id."""
-        return Envelope(id=uuid.uuid4().hex, type=msg_type, payload=payload)
-
-    def _ack(self, env: Envelope, *, ok: bool) -> Response:
-        """Build the ACK or NACK answering an envelope."""
-        return Response(id=env.id, ok=ok)
-
-    def _nack(self, env: Envelope, error: str, reason_code: str) -> Response:
-        """Build a refusal a sender can act on without parsing the message.
-
-        Args:
-            env: Envelope being answered.
-            error: Human-readable reason, carried for the developer.
-            reason_code: Machine-readable reason from the closed NACK set.
-
-        Returns:
-            The refusal.
-        """
-        return Response(
-            id=env.id,
-            ok=False,
-            payload={"error": error, "reason_code": reason_code},
-        )

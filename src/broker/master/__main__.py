@@ -13,6 +13,7 @@ escalations.
 
 import argparse
 import asyncio
+import logging
 import os
 import shutil
 import sys
@@ -22,6 +23,7 @@ from typing import NoReturn
 from broker import config as broker_config
 from broker import llm_timing
 from broker import logging_setup
+from broker.claude.paths import claude_json_path, settings_path
 from broker.claude.settings import broker_hook_command, verify_and_repair
 from broker.herdr import driver
 from broker.paths import BrokerPaths
@@ -34,11 +36,19 @@ from broker.master.registry import Registry, RegistryError
 from broker.master.runtime import MasterRuntime, reconcile_registry
 from broker.master.testmode import InjectCommand, test_mode_llm_call
 from broker.master.tui.app import BrokerMasterApp
-from broker.master.viewmodel import ViewEvent, ViewEventRelay
+from broker.master.viewmodel import Notice, ViewEvent, ViewEventRelay
 
 TEST_MODE_ANCHOR = "%test-mode"
 TEST_MODE_WARNING = "TEST MODE — synthetic traffic only; LLM disabled"
 STATUS_TIMEOUT_S = 10.0
+
+logger = logging.getLogger(__name__)
+
+
+def log_notice(event: ViewEvent) -> None:
+    """Write every ``Notice`` view event to the configured log file at WARNING."""
+    if isinstance(event, Notice):
+        logger.warning(event.text)
 
 
 def _fail(reason: str) -> NoReturn:
@@ -94,6 +104,10 @@ def main() -> None:
     paths = BrokerPaths(cfg.broker_home)
     logging_setup.configure(paths.master_log)
     llm_timing.configure(paths.llm_timings, "master")
+    settings = settings_path()
+    claude_json = claude_json_path()
+    relay = ViewEventRelay()
+    relay.connect(log_notice)
     try:
         registry = Registry.load(paths.registry)
     except RegistryError as exc:
@@ -119,7 +133,7 @@ def main() -> None:
             for record in registry.records.values()
         ]
         report = verify_and_repair(
-            list(HookEventName), command, shadow_candidates=candidates
+            list(HookEventName), command, settings, shadow_candidates=candidates
         )
         warnings = list(report.warnings)
 
@@ -129,8 +143,9 @@ def main() -> None:
         llm_call = bind_call_turn(build_client())
 
     # 4. Runtime and app built before run; the runtime starts in on_mount.
-    relay = ViewEventRelay()
-    runtime = MasterRuntime(relay, registry, queue, panes, cfg, anchor_pane=anchor)
+    runtime = MasterRuntime(
+        relay, registry, queue, panes, cfg, anchor_pane=anchor, claude_json=claude_json
+    )
     master_llm = MasterLLM(llm_call, runtime, cfg)
     inject: InjectCommand | None = None
     if args.test_mode:

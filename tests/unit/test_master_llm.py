@@ -54,7 +54,13 @@ class RecordingRuntime(MasterRuntime):
         queue = EscalationQueue.load(paths.escalation_queue)
         panes = PaneEscalations.load(paths.pane_escalations)
         super().__init__(
-            lambda _msg: None, registry, queue, panes, cfg, anchor_pane="%1"
+            lambda _msg: None,
+            registry,
+            queue,
+            panes,
+            cfg,
+            anchor_pane="%1",
+            claude_json=paths.home / "claude.json",
         )
         self.spawned: list[tuple[str, str]] = []
         self.dispatched: list[tuple[str, str]] = []

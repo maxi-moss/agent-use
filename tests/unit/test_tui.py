@@ -95,7 +95,15 @@ def make_runtime(home: Path) -> tuple[MasterRuntime, BrokerConfig, ViewEventRela
     queue = EscalationQueue.load(home / "escalation-queue.json")
     panes = PaneEscalations.load(home / "pane-escalations.json")
     relay = ViewEventRelay()
-    runtime = MasterRuntime(relay, registry, queue, panes, cfg, anchor_pane="%1")
+    runtime = MasterRuntime(
+        relay,
+        registry,
+        queue,
+        panes,
+        cfg,
+        anchor_pane="%1",
+        claude_json=home / "claude.json",
+    )
     return runtime, cfg, relay
 
 

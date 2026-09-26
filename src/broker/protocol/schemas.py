@@ -35,6 +35,7 @@ from broker.protocol.constants import (
     T_SESSION_ENDED,
     T_SHUTDOWN,
     T_STATUS,
+    NackCode,
     PaneKind,
     SessionState,
 )
@@ -56,6 +57,50 @@ class Response(BaseModel):
     type: Literal["response"] = "response"
     ok: bool
     payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class NackPayload(BaseModel):
+    """The refusal a negative ``Response`` carries."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    error: str
+    reason_code: NackCode | None = None
+
+
+def nack_response(env: Envelope, error: str, code: NackCode | None) -> Response:
+    """Build the refusal answering ``env``.
+
+    Args:
+        env: Envelope being answered.
+        error: Human-readable reason, carried for the developer.
+        code: Machine-readable reason, or ``None`` when no code fits.
+
+    Returns:
+        The negative response.
+    """
+    return Response(
+        id=env.id,
+        ok=False,
+        payload=NackPayload(error=error, reason_code=code).model_dump(
+            exclude_none=True
+        ),
+    )
+
+
+def parse_nack(resp: Response) -> NackPayload:
+    """Read the refusal a negative response carries.
+
+    Args:
+        resp: A response with ``ok=False``.
+
+    Returns:
+        The refusal's error string and reason code.
+
+    Raises:
+        ValidationError: The payload is not a refusal.
+    """
+    return NackPayload.model_validate(resp.payload)
 
 
 class WireMessage(BaseModel):

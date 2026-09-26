@@ -1,4 +1,4 @@
-"""Protocol package tests: stdlib-only constants, socket-map coverage, Literal sync."""
+"""Protocol package tests: stdlib-only constants, socket-map coverage, Literal sync, NACKs."""
 
 import subprocess
 import sys
@@ -9,13 +9,18 @@ import pytest
 from pydantic import ValidationError
 
 from broker.protocol import constants
+from broker.protocol.constants import NackCode
 from broker.protocol.schemas import (
     MASTER_SOCKET_PAYLOADS,
     SESSION_SOCKET_PAYLOADS,
     AddDirectoriesSuggestion,
+    Envelope,
     PermissionDecisionPayload,
     PermissionEscalationPayload,
     PermissionRequestPayload,
+    Response,
+    nack_response,
+    parse_nack,
 )
 
 COMPLETE_PERMISSION_ESCALATION: dict[str, Any] = {
@@ -104,3 +109,19 @@ def test_permission_request_needs_no_tool_use_id() -> None:
     )
     assert payload.permission_suggestions == []
     assert "tool_use_id" not in PermissionRequestPayload.model_fields
+
+
+def test_nack_code_survives_the_wire() -> None:
+    """A refusal's code must read back as the same member after serialization."""
+    env = Envelope(id="r1", type=constants.T_SEND_PROMPT)
+    sent = nack_response(env, "session is 'error'", NackCode.WRONG_STATE)
+    received = Response.model_validate_json(sent.model_dump_json())
+    nack = parse_nack(received)
+    assert nack.reason_code is NackCode.WRONG_STATE
+    assert nack.error == "session is 'error'"
+
+
+def test_refusal_without_error_fails_to_parse() -> None:
+    """A NACK that does not say why must fail loud, never read as a refusal."""
+    with pytest.raises(ValidationError):
+        parse_nack(Response(id="r1", ok=False))

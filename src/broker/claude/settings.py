@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any, cast
 
 from broker.atomic_json import atomic_update_json
-from broker.claude.paths import settings_path
 from broker.protocol.constants import ENV_BROKER_SOCKET, HOOK_SETTINGS_TIMEOUT
 
 # Substring of our hook command used to identify OUR entries during repair.
@@ -155,7 +154,7 @@ def write_session_permissions(path: Path, rules: dict[str, Any]) -> None:
 def verify_and_repair(
     events: Sequence[str],
     command: str,
-    path: Path | None = None,
+    path: Path,
     *,
     shadow_candidates: list[Path] | None = None,
 ) -> RepairReport:
@@ -164,13 +163,12 @@ def verify_and_repair(
     Args:
         events: Hook event names that must carry our entry.
         command: Hook command to install; must contain ``BROKER_HOOK_MARKER``.
-        path: Settings file to verify; defaults to user-level ``settings.json``.
+        path: Settings file to verify.
         shadow_candidates: Project-level files to check for shadowing entries.
 
     Returns:
         The events repaired and the warnings raised.
     """
-    target = path if path is not None else settings_path()
     report = RepairReport()
 
     def mutate(data: dict[str, Any]) -> dict[str, Any]:
@@ -178,7 +176,7 @@ def verify_and_repair(
         report.repaired_events = _ensure_registered(data, events, command)
         return data
 
-    atomic_update_json(target, mutate, backup=True)
+    atomic_update_json(path, mutate, backup=True)
     if report.repaired_events:
         report.warnings.append(
             "wrote broker hook entries (first registration, changed command "

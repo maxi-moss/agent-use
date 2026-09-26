@@ -26,8 +26,7 @@ from broker.permission.classifier import PermissionToolCall
 from broker.protocol import client
 from broker.protocol.constants import (
     MAX_LINE_BYTES,
-    NACK_PROTOCOL_VIOLATION,
-    NACK_WRONG_STATE,
+    NackCode,
     T_APPROVE_PROMPT,
     T_CLARIFY_ESCALATION,
     T_ASK_QUESTION,
@@ -315,7 +314,7 @@ class StubMaster:
                 ok=False,
                 payload={
                     "error": "scripted refusal",
-                    "reason_code": NACK_PROTOCOL_VIOLATION,
+                    "reason_code": NackCode.PROTOCOL_VIOLATION,
                 },
             )
         return Response(id=env.id, ok=True)
@@ -1596,7 +1595,7 @@ async def test_clarify_escalation_wrong_id_refused(harness: Harness) -> None:
         harness.sock, clarify_escalation_env("bogus", "anything?"), timeout_s=5.0
     )
     assert resp.ok is False
-    assert resp.payload["reason_code"] == NACK_WRONG_STATE
+    assert resp.payload["reason_code"] == NackCode.WRONG_STATE
     assert len(harness.llm.calls) == calls_before
     assert harness.broker.state == "escalated"
 
@@ -1608,7 +1607,7 @@ async def test_clarify_escalation_not_escalated_refused(harness: Harness) -> Non
         harness.sock, clarify_escalation_env("e1", "anything?"), timeout_s=5.0
     )
     assert resp.ok is False
-    assert resp.payload["reason_code"] == NACK_WRONG_STATE
+    assert resp.payload["reason_code"] == NackCode.WRONG_STATE
     assert len(harness.llm.calls) == calls_before
 
 
@@ -1635,7 +1634,7 @@ async def test_clarify_escalation_cancelled_by_retract(harness: Harness) -> None
     answer = await asking
     assert answer.ok is False
     assert answer.payload["error"] == "escalation resolved in the pane"
-    assert answer.payload["reason_code"] == NACK_WRONG_STATE
+    assert answer.payload["reason_code"] == NackCode.WRONG_STATE
     assert harness.broker._clarify_tasks == set()  # pyright: ignore[reportPrivateUsage]
     await wait_state(harness.broker, "driving")
 
@@ -2099,7 +2098,7 @@ async def test_send_prompt_refused_after_a_fatal_error(harness: Harness) -> None
     harness.run.calls.clear()
     resp = await send_prompt(harness, "hello")
     assert resp.ok is False
-    assert resp.payload["reason_code"] == NACK_WRONG_STATE
+    assert resp.payload["reason_code"] == NackCode.WRONG_STATE
     await asyncio.sleep(0.1)
     assert harness.run.drive_calls() == []
 
@@ -2112,7 +2111,7 @@ async def test_send_prompt_refused_while_a_native_prompt_is_open(
     harness.run.calls.clear()
     resp = await send_prompt(harness, "hello")
     assert resp.ok is False
-    assert resp.payload["reason_code"] == NACK_WRONG_STATE
+    assert resp.payload["reason_code"] == NackCode.WRONG_STATE
     assert "an AskUserQuestion menu" in resp.payload["error"]
     assert "w3:p2" in resp.payload["error"]
     append_menu(harness, "toolu_open", answers={"Pick a color": "Red"})

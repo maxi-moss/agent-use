@@ -3,6 +3,7 @@ runtime server; driver.subprocess.run monkeypatched; emit = recording list."""
 
 import asyncio
 import json
+import logging
 import subprocess
 import tempfile
 import uuid
@@ -14,9 +15,11 @@ import pytest
 from pydantic import ValidationError
 
 from broker import decision_log
+from broker import logging_setup
 from broker.decision_log import DecisionKind
 from broker.config import BrokerConfig
 from broker.herdr import driver
+from broker.master.__main__ import log_notice
 from broker.master.pane_escalations import PaneEscalations
 from broker.master.payload_render import (
     PANE_UNKNOWN,
@@ -39,9 +42,7 @@ from broker.master.viewmodel import (
 )
 from broker.protocol import client
 from broker.protocol.constants import (
-    NACK_MALFORMED,
-    NACK_PROTOCOL_VIOLATION,
-    NACK_UNKNOWN_SESSION,
+    NackCode,
     PaneKind,
     SessionState,
     T_APPROVE_PROMPT,
@@ -65,6 +66,7 @@ from broker.protocol.constants import (
     T_STATUS,
 )
 from broker.protocol.schemas import (
+    MASTER_SOCKET_PAYLOADS,
     Envelope,
     EscalationPayload,
     PermissionEscalationPayload,
@@ -107,7 +109,7 @@ class NackingSession:
     """Session-socket handler that always rejects."""
 
     async def handler(self, env: Envelope) -> Response:
-        return Response(id=env.id, ok=False)
+        return Response(id=env.id, ok=False, payload={"error": "refused"})
 
 
 class ReasoningNackSession:
@@ -201,7 +203,9 @@ class StatusSession:
 
     async def handler(self, env: Envelope) -> Response:
         if env.type != T_STATUS:
-            return Response(id=env.id, ok=False)
+            return Response(
+                id=env.id, ok=False, payload={"error": f"unexpected {env.type}"}
+            )
         return Response(
             id=env.id,
             ok=True,
@@ -221,7 +225,9 @@ class ProposalStatusSession:
 
     async def handler(self, env: Envelope) -> Response:
         if env.type != T_STATUS:
-            return Response(id=env.id, ok=False)
+            return Response(
+                id=env.id, ok=False, payload={"error": f"unexpected {env.type}"}
+            )
         return Response(
             id=env.id,
             ok=True,
@@ -292,6 +298,33 @@ def question_escalation_dict(
     }
 
 
+def broker_messages(session: str) -> list[tuple[str, dict[str, Any]]]:
+    """One valid message of every master-socket type, in an order a live
+    broker could send them."""
+    return [
+        (T_ESCALATION, escalation_dict("e1", session)),
+        (T_ESCALATION_RETRACT, {"escalation_id": "e1", "reason": "r"}),
+        (T_PANE_ESCALATION, permission_pane_dict("p1", session)),
+        (T_PANE_RETRACT, {"escalation_id": "p1", "reason": "r"}),
+        (T_PROMPT_UNDELIVERED, {"detail": "d"}),
+        (
+            T_PROMPT_PROPOSAL,
+            {
+                "proposal_id": "p1",
+                "proposed_prompt": "do the task",
+                "grounding_summary": "repo facts",
+            },
+        ),
+        (T_BUDGET_UPDATE, {"count": 1}),
+        (T_DECISION_DELIVERED, {"escalation_id": "e1"}),
+        (T_DECISION_UNDELIVERED, {"escalation_id": "e1", "still_live": False}),
+        (T_LIVE_STATUS, {"state": "driving"}),
+        (T_COMPLETION, {"headline": "h", "supporting": "s"}),
+        (T_FATAL_ERROR, {"error_class": "X", "detail": "d"}),
+        (T_SESSION_ENDED, {}),
+    ]
+
+
 @pytest.fixture
 def recording_run(monkeypatch: pytest.MonkeyPatch) -> RecordingRun:
     rec = RecordingRun()
@@ -332,7 +365,13 @@ async def rt(
     queue = EscalationQueue.load(home / "escalation-queue.json")
     panes = PaneEscalations.load(home / "pane-escalations.json")
     runtime = MasterRuntime(
-        posts.append, registry, queue, panes, cfg, anchor_pane="%1"
+        posts.append,
+        registry,
+        queue,
+        panes,
+        cfg,
+        anchor_pane="%1",
+        claude_json=home / "claude.json",
     )
     runtime.start()
     for _ in range(200):
@@ -390,7 +429,7 @@ async def test_second_escalation_while_active_is_protocol_violation(
     resp = await send(runtime, T_ESCALATION, escalation_dict("e2"))
     assert not resp.ok
     # Same session: the broker was told to hold one at a time and did not.
-    assert resp.payload["reason_code"] == NACK_PROTOCOL_VIOLATION
+    assert resp.payload["reason_code"] == NackCode.PROTOCOL_VIOLATION
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("PROTOCOL VIOLATION" in t for t in notices)
     # The first escalation stays active; the second is never surfaced.
@@ -413,7 +452,7 @@ async def test_second_permission_pane_from_a_session_is_protocol_violation(
     )
     # The permission module retracts the old prompt before raising the next.
     assert not resp.ok
-    assert resp.payload["reason_code"] == NACK_PROTOCOL_VIOLATION
+    assert resp.payload["reason_code"] == NackCode.PROTOCOL_VIOLATION
     assert [p.escalation_id for p in runtime.panes.entries] == ["p1"]
     assert (
         len([m for m in posts if isinstance(m, PaneEscalationArrived)]) == 1
@@ -555,7 +594,7 @@ async def test_malformed_permission_pane_nacked_never_surfaced(
     del thin["reason"]
     resp = await send(runtime, T_PANE_ESCALATION, thin)
     assert not resp.ok
-    assert resp.payload["reason_code"] == NACK_MALFORMED
+    assert resp.payload["reason_code"] == NackCode.MALFORMED
     # A prompt the developer cannot act on is worse than none at all.
     assert [m for m in posts if isinstance(m, PaneEscalationArrived)] == []
     notices = [m.text for m in posts if isinstance(m, Notice)]
@@ -573,7 +612,7 @@ async def test_escalation_from_an_unknown_session_never_enters_the_queue(
         runtime, T_ESCALATION, escalation_dict("e1", "ghost"), session="ghost"
     )
     assert not resp.ok
-    assert resp.payload["reason_code"] == NACK_UNKNOWN_SESSION
+    assert resp.payload["reason_code"] == NackCode.UNKNOWN_SESSION
     resp = await send(
         runtime,
         T_PANE_ESCALATION,
@@ -581,7 +620,7 @@ async def test_escalation_from_an_unknown_session_never_enters_the_queue(
         session="ghost",
     )
     assert not resp.ok
-    assert resp.payload["reason_code"] == NACK_UNKNOWN_SESSION
+    assert resp.payload["reason_code"] == NackCode.UNKNOWN_SESSION
     assert runtime.queue.active is None
     assert runtime.panes.entries == ()
     assert [m for m in posts if isinstance(m, EscalationArrived)] == []
@@ -918,6 +957,7 @@ async def test_startup_resurfaces_the_persisted_head_and_open_prompts(
         PaneEscalations.load(panes_path),
         cfg,
         anchor_pane="%1",
+        claude_json=home / "claude.json",
     )
     runtime.start()
     for _ in range(200):
@@ -970,6 +1010,7 @@ async def test_probe_of_a_settled_session_keeps_it_settled(home: Path) -> None:
         PaneEscalations.load(home / "pane-escalations.json"),
         cfg,
         anchor_pane="%1",
+        claude_json=home / "claude.json",
     )
     try:
         await runtime.probe_status("s1")
@@ -1009,6 +1050,7 @@ async def test_repopulate_from_brokers_fills_task_activity_at_startup(
         PaneEscalations.load(home / "pane-escalations.json"),
         cfg,
         anchor_pane="%1",
+        claude_json=home / "claude.json",
     )
     try:
         runtime.start()
@@ -1066,6 +1108,7 @@ async def test_repopulate_from_brokers_recovers_pending_proposal(
         PaneEscalations.load(home / "pane-escalations.json"),
         cfg,
         anchor_pane="%1",
+        claude_json=home / "claude.json",
     )
     try:
         runtime.start()
@@ -1112,6 +1155,7 @@ async def test_repopulate_from_brokers_registers_nothing_when_no_proposal(
         PaneEscalations.load(home / "pane-escalations.json"),
         cfg,
         anchor_pane="%1",
+        claude_json=home / "claude.json",
     )
     try:
         runtime.start()
@@ -1550,20 +1594,9 @@ async def test_session_ended_removes_from_fleet(
     assert not any(row.session_id == "s1" for row in last_view.rows)
     # The removal is durable, and a late live-status push cannot resurrect it.
     assert "s1" not in Registry.load(home / "registry.json").records
-    assert (await send(runtime, T_LIVE_STATUS, {"state": "driving"})).ok
+    resp = await send(runtime, T_LIVE_STATUS, {"state": "driving"})
+    assert resp.payload["reason_code"] == NackCode.UNKNOWN_SESSION
     assert "s1" not in runtime.registry.records
-
-
-async def test_session_ended_for_unknown_session_is_acked(
-    rt: tuple[MasterRuntime, list[Any]]
-) -> None:
-    runtime, posts = rt
-    before = len(posts)
-    resp = await send(runtime, T_SESSION_ENDED, {}, session="ghost")
-    # A report for a session already gone (or never known) is ACKed and posts
-    # nothing — the sender never spins re-reporting.
-    assert resp.ok
-    assert len(posts) == before
 
 
 async def test_session_ended_retracts_its_stranded_escalation(
@@ -1619,43 +1652,10 @@ async def test_every_broker_message_type_is_acked(
     # Brokers deliver via client.request and fail loud without a reply —
     # every upward type must get an ok=True ack.
     runtime, _ = rt
-    assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-    assert (
-        await send(
-            runtime, T_ESCALATION_RETRACT, {"escalation_id": "e1", "reason": "r"}
-        )
-    ).ok
-    assert (
-        await send(
-            runtime, T_PANE_ESCALATION, permission_pane_dict("p1")
-        )
-    ).ok
-    assert (
-        await send(
-            runtime, T_PANE_RETRACT, {"escalation_id": "p1", "reason": "r"}
-        )
-    ).ok
-    assert (await send(runtime, T_PROMPT_UNDELIVERED, {"detail": "d"})).ok
-    assert (
-        await send(
-            runtime,
-            T_PROMPT_PROPOSAL,
-            {
-                "proposal_id": "p1",
-                "proposed_prompt": "do the task",
-                "grounding_summary": "repo facts",
-            },
-        )
-    ).ok
-    assert (await send(runtime, T_BUDGET_UPDATE, {"count": 1})).ok
-    assert (
-        await send(runtime, T_COMPLETION, {"headline": "h", "supporting": "s"})
-    ).ok
-    assert (
-        await send(
-            runtime, T_FATAL_ERROR, {"error_class": "X", "detail": "d"}
-        )
-    ).ok
+    messages = broker_messages("s1")
+    assert {t for t, _ in messages} == MASTER_SOCKET_PAYLOADS.keys()
+    for msg_type, payload in messages:
+        assert (await send(runtime, msg_type, payload)).ok, msg_type
 
 
 async def test_proposal_awaits_approval_and_badges_on_arrival(
@@ -1822,6 +1822,34 @@ async def test_get_decision_log_raises_on_malformed_reply(
     finally:
         server.close()
         await server.wait_closed()
+
+
+async def test_spawn_session_seeds_trust_and_registers(
+    home: Path, spawn: RecordingSpawn
+) -> None:
+    cfg = BrokerConfig(model_id="test-model", broker_home=home)
+    registry = Registry.load(home / "registry.json")
+    queue = EscalationQueue.load(home / "escalation-queue.json")
+    panes = PaneEscalations.load(home / "pane-escalations.json")
+    runtime = MasterRuntime(
+        lambda _event: None,
+        registry,
+        queue,
+        panes,
+        cfg,
+        anchor_pane="%1",
+        claude_json=home / "claude.json",
+    )
+    result = await runtime.spawn_session("do the thing", str(home))
+    assert "spawned session" in result
+    assert len(spawn.argvs) == 1
+    assert registry.get("s1").cwd == str(home)
+    assert registry.get("s1").intent == "do the thing"
+    trusted = cast(
+        dict[str, Any],
+        json.loads((home / "claude.json").read_text(encoding="utf-8")),
+    )
+    assert trusted["projects"][str(home)]["hasTrustDialogAccepted"] is True
 
 
 def _bind_session(runtime: MasterRuntime) -> SessionRecord:
@@ -2164,7 +2192,13 @@ async def test_build_fleet_view_idle_master_and_no_sessions(home: Path) -> None:
     queue = EscalationQueue.load(home / "escalation-queue.json")
     panes = PaneEscalations.load(home / "pane-escalations.json")
     runtime = MasterRuntime(
-        lambda _event: None, registry, queue, panes, cfg, anchor_pane="%1"
+        lambda _event: None,
+        registry,
+        queue,
+        panes,
+        cfg,
+        anchor_pane="%1",
+        claude_json=home / "claude.json",
     )
     view = runtime.build_fleet_view()
     assert view.master_activity is None
@@ -2305,11 +2339,6 @@ async def test_live_status_updates_state_activity_and_perm(
     assert row.task_activity == ""
     assert Attention.PERMISSION not in row.badges
     assert row.broker_activity == ""
-    # A push from an unknown session is still ACKed.
-    resp = await send(
-        runtime, T_LIVE_STATUS, {"state": "driving"}, session="ghost"
-    )
-    assert resp.ok
 
 
 async def test_live_status_persists_the_session_identity(
@@ -2523,3 +2552,75 @@ async def test_reactivate_rejection_surfaces_the_reason_and_changes_nothing(
     finally:
         server.close()
         await server.wait_closed()
+
+
+async def test_every_message_from_an_unknown_session_is_refused(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    """A message from a session the master cannot route to changes nothing:
+    a completion, proposal or budget it applied would describe no session."""
+    runtime, posts = rt
+    before = len(posts)
+    for msg_type, payload in broker_messages("ghost"):
+        resp = await send(runtime, msg_type, payload, session="ghost")
+        assert resp.payload["reason_code"] == NackCode.UNKNOWN_SESSION, msg_type
+    assert list(runtime.registry.records) == ["s1"]
+    assert runtime.queue.active is None
+    assert runtime.panes.entries == ()
+    assert runtime.proposals == {}
+    assert all(isinstance(m, Notice) for m in posts[before:])
+
+
+async def test_escalation_naming_another_session_is_refused(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    runtime, _ = rt
+    _add_session(runtime, "s2")
+    resp = await send(runtime, T_ESCALATION, escalation_dict("e1", "s2"))
+    assert resp.payload["reason_code"] == NackCode.UNKNOWN_SESSION
+    resp = await send(
+        runtime, T_PANE_ESCALATION, permission_pane_dict("p1", "s2")
+    )
+    assert resp.payload["reason_code"] == NackCode.UNKNOWN_SESSION
+    assert runtime.queue.active is None
+    assert runtime.panes.entries == ()
+    assert runtime.registry.get("s2").state == SessionState.DRIVING
+
+
+async def test_unknown_or_malformed_message_is_refused_as_malformed(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    runtime, posts = rt
+    resp = await send(runtime, "no_such_type", {})
+    assert resp.payload["reason_code"] == NackCode.MALFORMED
+    resp = await send(runtime, T_BUDGET_UPDATE, {"count": "many"})
+    assert resp.payload["reason_code"] == NackCode.MALFORMED
+    assert runtime.registry.get("s1").budget_count == 0
+    notices = [m.text for m in posts if isinstance(m, Notice)]
+    assert any("no_such_type" in t for t in notices)
+    assert any("MALFORMED" in t and T_BUDGET_UPDATE in t for t in notices)
+
+
+def test_log_notice_writes_every_notice_to_the_configured_log_file(
+    tmp_path: Path,
+) -> None:
+    root = logging.getLogger()
+    saved = list(root.handlers)
+    saved_level = root.level
+    for handler in saved:
+        root.removeHandler(handler)
+    try:
+        log_path = tmp_path / "master.log"
+        logging_setup.configure(log_path)
+        log_notice(Notice("a stranded escalation"))
+        log_notice(SessionStateChanged("s1", SessionState.DRIVING))
+        text = log_path.read_text(encoding="utf-8")
+        assert "a stranded escalation" in text
+        assert text.count("\n") == 1
+    finally:
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+            handler.close()
+        for handler in saved:
+            root.addHandler(handler)
+        root.setLevel(saved_level)

@@ -36,7 +36,13 @@ async def rt(home: Path) -> AsyncIterator[tuple[MasterRuntime, list[Any]]]:
     panes = PaneEscalations.load(home / "pane-escalations.json")
     posts: list[Any] = []
     runtime = MasterRuntime(
-        posts.append, registry, queue, panes, cfg, anchor_pane="%1"
+        posts.append,
+        registry,
+        queue,
+        panes,
+        cfg,
+        anchor_pane="%1",
+        claude_json=home / "claude.json",
     )
     runtime.start()
     for _ in range(200):

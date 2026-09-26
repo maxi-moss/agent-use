@@ -28,7 +28,7 @@ from broker.protocol.constants import (
     ASK_USER_QUESTION,
     DECISION_ALLOW,
     DECISION_ESCALATED,
-    NACK_SLOT_OCCUPIED,
+    NackCode,
     T_PANE_ESCALATION,
     T_PANE_RETRACT,
 )
@@ -38,6 +38,7 @@ from broker.protocol.schemas import (
     PermissionEscalationPayload,
     PermissionSuggestion,
     Response,
+    parse_nack,
 )
 
 logger = logging.getLogger(__name__)
@@ -348,23 +349,25 @@ class PermissionModule:
         )
         if response is not None and response.ok:
             return
-        if response is not None:
-            reason_code = response.payload.get("reason_code")
-            if reason_code == NACK_SLOT_OCCUPIED:
-                logger.info(
-                    "permission escalation %s refused for capacity",
-                    payload.escalation_id,
-                )
-            else:
-                logger.error(
-                    "permission escalation %s refused: %s (%s)",
-                    payload.escalation_id,
-                    response.payload.get("error", ""),
-                    reason_code,
-                )
-        # Nothing is waiting with the developer, so the slot must not stay
-        # claimed — a later call has to be free to raise.
-        self._release(payload.escalation_id)
+        try:
+            if response is not None:
+                nack = parse_nack(response)
+                if nack.reason_code == NackCode.SLOT_OCCUPIED:
+                    logger.info(
+                        "permission escalation %s refused for capacity",
+                        payload.escalation_id,
+                    )
+                else:
+                    logger.error(
+                        "permission escalation %s refused: %s (%s)",
+                        payload.escalation_id,
+                        nack.error,
+                        nack.reason_code,
+                    )
+        finally:
+            # Nothing is waiting with the developer, so the slot must not stay
+            # claimed — a later call has to be free to raise.
+            self._release(payload.escalation_id)
 
     async def _send_retract(self, payload: PaneRetractPayload) -> None:
         """Send one retraction; a failed send leaves nothing to undo.

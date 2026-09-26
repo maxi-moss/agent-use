@@ -27,8 +27,7 @@ from broker.permission.classifier import PermissionCallError, PermissionToolCall
 from broker.protocol.constants import (
     DECISION_ALLOW,
     DECISION_ESCALATED,
-    NACK_MALFORMED,
-    NACK_SLOT_OCCUPIED,
+    NackCode,
     T_PANE_ESCALATION,
     T_PANE_RETRACT,
 )
@@ -299,7 +298,7 @@ async def test_slot_occupied_nack_is_routine(home: Path) -> None:
     master = StubMaster(
         nack={
             "error": "an escalation is already live",
-            "reason_code": NACK_SLOT_OCCUPIED,
+            "reason_code": NackCode.SLOT_OCCUPIED,
         }
     )
     llm = FakeLLM(ESCALATE, ESCALATE_2)
@@ -340,7 +339,7 @@ async def test_set_intent_changes_what_calls_are_judged_against(
 
 async def test_non_capacity_nack_still_frees_the_slot(home: Path) -> None:
     master = StubMaster(
-        nack={"error": "payload rejected", "reason_code": NACK_MALFORMED}
+        nack={"error": "payload rejected", "reason_code": NackCode.MALFORMED}
     )
     llm = FakeLLM(ESCALATE)
     async with _module(home, llm, master=master) as (module, _, _log):
@@ -348,6 +347,20 @@ async def test_non_capacity_nack_still_frees_the_slot(home: Path) -> None:
         await master.wait_for(T_PANE_ESCALATION)
         await asyncio.sleep(SETTLE_S)
         # Nothing reached the developer, so there is nothing to retract.
+        module.note_session_ended()
+        await asyncio.sleep(SETTLE_S)
+        assert master.of_type(T_PANE_RETRACT) == []
+
+
+async def test_unreadable_nack_still_frees_the_slot(home: Path) -> None:
+    master = StubMaster(
+        nack={"error": "refused", "reason_code": "code_from_a_newer_master"}
+    )
+    llm = FakeLLM(ESCALATE)
+    async with _module(home, llm, master=master) as (module, _, _log):
+        assert await module.decide("Bash", PUSH_INPUT, []) == DECISION_ESCALATED
+        await master.wait_for(T_PANE_ESCALATION)
+        await asyncio.sleep(SETTLE_S)
         module.note_session_ended()
         await asyncio.sleep(SETTLE_S)
         assert master.of_type(T_PANE_RETRACT) == []
