@@ -1619,7 +1619,9 @@ async def test_clarify_escalation_not_escalated_refused(harness: Harness) -> Non
 async def test_clarify_escalation_cancelled_by_retract(harness: Harness) -> None:
     await launch(harness)
     escalation_id = await escalate_via_stop(harness)
-    calls_before = len(harness.llm.calls)
+    broker = harness.broker
+    escalation = broker._decision_escalation  # pyright: ignore[reportPrivateUsage]
+    assert escalation is not None
     harness.llm.never_resolve = True
     asking = asyncio.create_task(
         client.request(
@@ -1629,8 +1631,9 @@ async def test_clarify_escalation_cancelled_by_retract(harness: Harness) -> None
         )
     )
     async with asyncio.timeout(5.0):
-        while len(harness.llm.calls) == calls_before:
+        while not escalation.clarify_tasks:
             await asyncio.sleep(0.01)
+    llm_task = next(iter(escalation.clarify_tasks))
     # The developer answers in the pane: this hook retracts.
     append_user_prompt(harness, "try B")
     await _notify(harness.sock, hook_env("UserPromptSubmit", {}))
@@ -1640,7 +1643,8 @@ async def test_clarify_escalation_cancelled_by_retract(harness: Harness) -> None
     assert answer.ok is False
     assert answer.payload["error"] == "escalation resolved in the pane"
     assert answer.payload["reason_code"] == NackCode.WRONG_STATE
-    assert harness.broker._clarify_tasks == set()  # pyright: ignore[reportPrivateUsage]
+    assert llm_task.cancelled()
+    assert escalation.clarify_tasks == set()
     await wait_state(harness.broker, "driving")
 
 
@@ -1658,7 +1662,10 @@ async def test_clarify_escalation_timeout_fails_loud_and_cancels_the_call(
             timeout_s=5.0,
         )
     )
-    in_flight = harness.broker._clarify_tasks  # pyright: ignore[reportPrivateUsage]
+    broker = harness.broker
+    escalation = broker._decision_escalation  # pyright: ignore[reportPrivateUsage]
+    assert escalation is not None
+    in_flight = escalation.clarify_tasks
     async with asyncio.timeout(5.0):
         while not in_flight:
             await asyncio.sleep(0.01)
@@ -1696,6 +1703,34 @@ async def test_stale_dispatch_decision_is_reported_not_submitted(
     assert undelivered.payload["escalation_id"] == "stale-id"
     assert undelivered.payload["still_live"] is False
     assert harness.run.drive_calls() == []
+
+
+async def test_a_fatal_error_ends_the_live_escalation(harness: Harness) -> None:
+    await launch(harness)
+    escalation_id = await escalate_via_stop(harness)
+    await _notify(
+        harness.sock,
+        hook_env("StopFailure", {"matcher": "rate_limit", "message": "429"}),
+    )
+    await harness.master.wait_for(T_FATAL_ERROR)
+    await wait_state(harness.broker, "error")
+    harness.run.calls.clear()
+    await client.request(
+        harness.sock,
+        Envelope(
+            id=uuid.uuid4().hex,
+            type=T_DISPATCH_DECISION,
+            session_id="s1",
+            payload={"escalation_id": escalation_id, "response": "go with a"},
+        ),
+        timeout_s=5.0,
+    )
+    # A dispatch must not revive a session that already failed.
+    undelivered = await harness.master.wait_for(T_DECISION_UNDELIVERED)
+    assert undelivered.payload["escalation_id"] == escalation_id
+    assert undelivered.payload["still_live"] is False
+    assert harness.run.drive_calls() == []
+    assert harness.broker.state == "error"
 
 
 async def test_dispatch_decision_submit_failure_reports_undelivered(
@@ -2045,7 +2080,7 @@ async def test_permission_prompt_notification_is_pushed(
 async def test_failed_push_is_retried(
     harness: Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("broker.session.broker.STATUS_RETRY_S", 0.05)
+    monkeypatch.setattr("broker.session.master_link.STATUS_RETRY_S", 0.05)
     h = harness
     await launch(h)
     await wait_live(h.master, lambda p: p["state"] == "driving")
@@ -2285,7 +2320,7 @@ async def test_permission_prompt_not_reported_while_a_menu_is_open(
     )
 
 
-async def test_a_newer_menu_retracts_the_one_it_replaced_first(
+async def test_a_newer_menu_supersedes_the_one_it_replaced(
     harness: Harness,
 ) -> None:
     await launch(harness)
@@ -2295,16 +2330,13 @@ async def test_a_newer_menu_retracts_the_one_it_replaced_first(
         harness.sock, ask_question_env("toolu_second", COLOR_TOOL_INPUT), timeout_s=5.0
     )
     second = await harness.master.wait_for(T_PANE_ESCALATION, count=2)
-    retract = harness.master.of_type(T_PANE_RETRACT)
-    assert [r.payload["escalation_id"] for r in retract] == [
-        first.payload["escalation_id"]
-    ]
+    await asyncio.sleep(0.1)
+    assert second.payload["escalation_id"] != first.payload["escalation_id"]
+    # The master supersedes the first on the second raise; nothing retracts it.
+    assert harness.master.of_type(T_PANE_RETRACT) == []
     assert logged_retractions(harness) == [
         (first.payload["escalation_id"], "Replaced by a newer question")
     ]
-    # Retract before raise: the master holds one question per session.
-    order = [e.id for e in harness.master.received]
-    assert order.index(retract[0].id) < order.index(second.id)
 
 
 async def test_every_session_socket_type_reaches_its_handler(

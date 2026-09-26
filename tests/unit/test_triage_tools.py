@@ -9,11 +9,9 @@ import pytest
 from broker.protocol.schemas import EscalationDisclosure
 from broker.session.ask import ASK_TOOLS
 from broker.session.clarify import CLARIFY_TOOLS
-from broker.session.triage import (
-    GROUNDING_TOOLS,
-    TRIAGE_TOOLS,
-    EscalateCall,
-)
+from broker.session.grounding import GROUNDING_TOOLS
+from broker.session.llm_stack import EscalateCall
+from broker.session.triage import TRIAGE_TOOLS
 
 ALL_TOOLS = TRIAGE_TOOLS + GROUNDING_TOOLS + ASK_TOOLS
 

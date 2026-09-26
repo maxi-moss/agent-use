@@ -14,7 +14,7 @@ from broker.config import SessionModelConfig
 from broker.llm import LLMCallError, ToolCall
 from broker.protocol.schemas import EscalationPayload
 from broker.session.clarify import ClarifyCall, clarify, render_disclosure
-from broker.session.triage import FORCED_ONE
+from broker.session.llm_stack import FORCED_ONE
 from broker.transcript.schemas import AssistantText, UserPrompt
 
 MODEL_CFG = SessionModelConfig(model_id="test-model", max_tokens=8192)

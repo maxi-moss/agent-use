@@ -32,13 +32,13 @@ def _modules_using_capability(name: str) -> list[Path]:
     return hits
 
 
-def _assert_capability_confined_to(name: str, package: str) -> None:
-    """Every use of ``name`` lives under ``package`` or in herdr/driver.py."""
+def _assert_capability_confined_to(name: str, allowed: Path) -> None:
+    """Every use of ``name`` lives under ``allowed`` or in herdr/driver.py."""
     for path in _modules_using_capability(name):
         if path == _DRIVER_PATH:
             continue
-        assert path.parts[0] == package, (
-            f"{name} used outside broker.{package} and {_DRIVER_PATH}: {path}"
+        assert path.is_relative_to(allowed), (
+            f"{name} used outside {allowed} and {_DRIVER_PATH}: {path}"
         )
 
 
@@ -54,12 +54,12 @@ def test_classifier_model_id_pinned_in_exactly_one_module() -> None:
     assert hits == [Path("config.py")], f"classifier model id leaked into {hits}"
 
 
-def test_send_to_claude_capability_is_session_only() -> None:
-    """agent_prompt/agent_start/pane_split/agent_get are session-only capabilities."""
+def test_send_to_claude_capability_is_session_pane_only() -> None:
+    """agent_prompt/agent_start/pane_split/agent_get live only in session/pane.py."""
     for name in ("agent_prompt", "agent_start", "pane_split", "agent_get"):
-        _assert_capability_confined_to(name, "session")
+        _assert_capability_confined_to(name, Path("session/pane.py"))
 
 
 def test_notify_capability_is_master_only() -> None:
     """notification_show is a master-only capability."""
-    _assert_capability_confined_to("notification_show", "master")
+    _assert_capability_confined_to("notification_show", Path("master"))

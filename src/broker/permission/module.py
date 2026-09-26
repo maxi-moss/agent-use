@@ -9,11 +9,11 @@ unasked approval.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
 import uuid
-from collections.abc import Coroutine
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -53,9 +53,6 @@ _ASK_REASON = (
 _RETRACT_COMPLETED = "the tool call completed, so the prompt is gone"
 _RETRACT_DEVELOPER_INPUT = "the developer typed into the session"
 _RETRACT_SESSION_ENDED = "the session ended"
-# Reaching a new prompt means the session was unblocked, so the earlier one was
-# answered in the pane whether or not any other signal observed it.
-_RETRACT_SUPERSEDED = "the session moved on to a different permission request"
 
 
 @dataclass
@@ -97,9 +94,12 @@ class PermissionModule:
         self.intent = intent
         self._llm_call = llm_call
         self._live: _LiveEscalation | None = None
-        self._tasks: set[asyncio.Task[None]] = set()
+        self._outbox: asyncio.Queue[
+            PermissionEscalationPayload | PaneRetractPayload
+        ] = asyncio.Queue()
+        self._sender: asyncio.Task[None] | None = None
 
-    # ── the five calls the session broker makes ───────────────────────────
+    # ── the calls the session broker makes ────────────────────────────────
 
     async def decide(
         self,
@@ -219,6 +219,15 @@ class PermissionModule:
         """
         self.intent = intent
 
+    async def aclose(self) -> None:
+        """Stop sending to the master; messages still queued are dropped."""
+        sender = self._sender
+        if sender is None:
+            return
+        sender.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sender
+
     # ── internals ─────────────────────────────────────────────────────────
 
     def _caller(self) -> PermissionCaller:
@@ -257,10 +266,10 @@ class PermissionModule:
         reason: str,
         suggestions: list[PermissionSuggestion],
     ) -> None:
-        """Claim the escalation slot and send the raise off the decision path.
+        """Claim the escalation slot and queue the raise off the decision path.
 
-        Any escalation still held is retracted first: the session could not
-        have reached a new prompt while blocked on the old one.
+        Any escalation still held is replaced without a retraction: the master
+        supersedes a session's live permission escalation on the newer raise.
 
         Args:
             key: Key this escalation's tool call is identified by.
@@ -278,50 +287,46 @@ class PermissionModule:
             reason=reason,
             permission_suggestions=suggestions,
         )
-        superseded = self._live
         self._live = _LiveEscalation(
             escalation_id=payload.escalation_id, key=key
         )
-        self._spawn(self._supersede_then_send(superseded, payload))
-
-    async def _supersede_then_send(
-        self,
-        superseded: _LiveEscalation | None,
-        payload: PermissionEscalationPayload,
-    ) -> None:
-        """Retract the escalation this one replaces, then raise this one.
-
-        Args:
-            superseded: Escalation being replaced, or ``None`` on a first raise.
-            payload: The escalation to raise.
-        """
-        if superseded is not None:
-            await self._send_retract(
-                PaneRetractPayload(
-                    escalation_id=superseded.escalation_id,
-                    reason=_RETRACT_SUPERSEDED,
-                )
-            )
-        await self._send_escalation(payload)
+        self._enqueue(payload)
 
     def _retract(self, live: _LiveEscalation, reason: str) -> None:
-        """Release the escalation slot and send the retraction off the path.
+        """Release the escalation slot and queue the retraction off the path.
 
         Args:
             live: The escalation being resolved out of band.
             reason: Why it no longer needs the developer.
         """
         self._live = None
-        payload = PaneRetractPayload(
-            escalation_id=live.escalation_id, reason=reason
+        self._enqueue(
+            PaneRetractPayload(escalation_id=live.escalation_id, reason=reason)
         )
-        self._spawn(self._send_retract(payload))
 
-    def _spawn(self, coro: Coroutine[Any, Any, None]) -> None:
-        """Run ``coro`` off the caller's path, keeping a reference to it."""
-        task = asyncio.create_task(coro)
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+    def _enqueue(
+        self, payload: PermissionEscalationPayload | PaneRetractPayload
+    ) -> None:
+        """Queue ``payload`` for the master, starting the sender on first use."""
+        if self._sender is None:
+            self._sender = asyncio.create_task(self._drain_outbox())
+        self._outbox.put_nowait(payload)
+
+    async def _drain_outbox(self) -> None:
+        """Send queued messages to the master one at a time, in decision order."""
+        while True:
+            payload = await self._outbox.get()
+            try:
+                if isinstance(payload, PermissionEscalationPayload):
+                    await self._send_escalation(payload)
+                else:
+                    await self._send(payload, payload.escalation_id)
+            except Exception:
+                logger.exception(
+                    "sender failed on %s for escalation %s",
+                    payload.MESSAGE_TYPE,
+                    payload.escalation_id,
+                )
 
     async def _send_escalation(
         self, payload: PermissionEscalationPayload
@@ -347,14 +352,6 @@ class PermissionModule:
             # Nothing is waiting with the developer, so the slot must not stay
             # claimed — a later call has to be free to raise.
             self._release(payload.escalation_id)
-
-    async def _send_retract(self, payload: PaneRetractPayload) -> None:
-        """Send one retraction; a failed send leaves nothing to undo.
-
-        Args:
-            payload: The retraction to send.
-        """
-        await self._send(payload, payload.escalation_id)
 
     async def _send(
         self, payload: WireMessage, escalation_id: str

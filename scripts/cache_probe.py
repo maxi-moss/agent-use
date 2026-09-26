@@ -31,25 +31,18 @@ from broker.permission.classifier import (
     build_classifier_client,
     render_suggestions,
 )
-from broker.session.triage import (
-    FORCED_ONE,
-    TRIAGE_TOOLS,
-    assemble_context as assemble_triage_context,
-)
+from broker.session.llm_stack import FORCED_ONE, assemble_context
+from broker.session.triage import TRIAGE_TOOLS, triage_working_text
 
 _INTENT = "Add OAuth login to the app."
-_WORKING = (
-    "# What just happened\nhook event: Stop\n\n"
-    "# The coding agent's last message (triage THIS)\n"
-    "Where should the token store live?"
-)
+_WORKING = triage_working_text("Where should the token store live?")
 
 
 async def probe_triage() -> None:
     """Issue two identical triage calls and report each call's cache usage."""
     cfg = BrokerConfig()
     client = build_client()
-    system, messages = assemble_triage_context(
+    system, messages = assemble_context(
         prompts.load("triage"), _INTENT, [], _WORKING
     )
     print(f"triage ({cfg.model_id}): two identical calls")

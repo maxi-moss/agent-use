@@ -1,8 +1,8 @@
 """Clarify: answer one read-only question about a live escalation.
 
-Reuses the session broker's own LLM seam and triage's context assembly — one
-forced-tool call, exactly like triage. Never resolves the escalation and never
-writes to the pane.
+Reuses the session broker's own LLM seam and the session stack's context
+assembly — one forced-tool call, exactly like triage. Never resolves the
+escalation and never writes to the pane.
 
 Class names, field names, `Field` descriptions and docstrings of these models
 are sent to the model.
@@ -10,14 +10,14 @@ are sent to the model.
 
 import logging
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict
 
 from broker import llm_timing
 from broker import prompts
 from broker.config import SessionModelConfig
-from broker.llm import LLMCaller, LLMCallError, ToolCall, strict_tool
+from broker.llm import LLMCaller, ToolCall, strict_tool
 from broker.protocol.schemas import EscalationDisclosure, EscalationPayload
-from broker.session.triage import FORCED_ONE, assemble_context
+from broker.session.llm_stack import assemble_context, forced_call
 from broker.transcript.schemas import TranscriptEvent
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,8 @@ CLARIFY_TOOLS = [
         ClarifyCall,
     )
 ]
+
+_TOOL_MODELS: dict[str, type[ClarifyCall]] = {"answer_clarification": ClarifyCall}
 
 _CLARIFY_PROMPT = prompts.load("clarify")
 
@@ -105,7 +107,8 @@ async def clarify(
 
     Raises:
         LLMCallError: The model called the wrong tool, or its input failed
-            validation.
+            validation. Uncaught here; the caller NACKs the developer's
+            clarify request rather than resolving it.
     """
     working = (
         "# The escalation the developer is asking about\n"
@@ -114,17 +117,12 @@ async def clarify(
         + question
     )
     system, messages = assemble_context(_CLARIFY_PROMPT, intent, events, working)
-    call: ToolCall = await llm_call(
-        model=model_cfg.model_id,
-        max_tokens=model_cfg.max_tokens,
+    return await forced_call(
+        llm_call,
+        model_cfg,
         system=system,
         messages=messages,
         tools=CLARIFY_TOOLS,
-        tool_choice=FORCED_ONE,
+        models=_TOOL_MODELS,
+        label="clarify",
     )
-    if call.name != "answer_clarification":
-        raise LLMCallError(f"unknown clarify tool {call.name!r}")
-    try:
-        return ClarifyCall.model_validate(call.input)
-    except ValidationError as exc:
-        raise LLMCallError(f"invalid answer_clarification input: {exc}") from exc

@@ -10,7 +10,7 @@ Structure:
   never the transcript tail. The watchdog reconciliation is the
   one sanctioned pure-transcript read.
 - Every pane write is a single `agent prompt`, which submits on its own,
-  via driver.agent_prompt with an explicit timeout.
+  via `SessionPane.submit` with an explicit timeout.
 """
 
 import asyncio
@@ -18,39 +18,27 @@ import contextlib
 import json
 import logging
 import uuid
-from collections.abc import Awaitable, Callable, Generator
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, assert_never, cast
 
-from anthropic import AsyncAnthropic
-from anthropic.types import (
-    MessageParam,
-    TextBlockParam,
-    ToolChoiceParam,
-    ToolParam,
-)
 from pydantic import ValidationError
 
 from broker import decision_log
 from broker.decision_log import DecisionLogKind, DecisionLogRow
 from broker import llm as llm_module
-from broker.index.embedding import EmbeddingError, OpenAIEmbedder
-from broker.index.retrieval import RetrievalError, retrieve as retrieve_code
-from broker.index.schemas import GroundingContext
+from broker.index.embedding import EmbeddingError
+from broker.index.retrieval import RetrievalError
 from broker.llm import LLMCallError, LLMCaller, ToolCall
 from broker.config import (
     AdoptedSession,
-    EmbeddingConfig,
     ResumedTask,
     SessionBrokerConfig,
 )
 from broker.paths import BrokerPaths
-from broker.herdr import driver
-from broker.herdr.schemas import AgentStatus
 from broker.claude.paths import transcript_dir_for_cwd
 from broker.permission import PermissionModule, render_permission_log
-from broker.protocol import client
 from broker.protocol.constants import (
     ACTIVE_STATES,
     ASK_DECISION_ANSWER,
@@ -97,6 +85,7 @@ from broker.protocol.schemas import (
     FatalErrorPayload,
     HookEventPayload,
     LiveStatusPayload,
+    NackPayload,
     PaneRetractPayload,
     PermissionDecisionPayload,
     PermissionLogPayload,
@@ -116,22 +105,25 @@ from broker.protocol.schemas import (
     StatusRequestPayload,
     WireMessage,
     nack_response,
-    parse_nack,
 )
 from broker.session import ask, clarify
-from broker.session.triage import (
-    AnswerCall,
-    CompleteCall,
-    EscalateCall,
-    NoActionCall,
+from broker.session.grounding import (
     Retriever,
-    disclosure_of,
+    bind_index_retriever,
     ground_intent,
-    triage,
 )
+from broker.session.llm_stack import EscalateCall, bind_call_tool, disclosure_of
+from broker.session.master_link import (
+    LiveStatusPusher,
+    describe_refusal,
+    send_to_master,
+)
+from broker.session.pane import OpenMenu, PaneOccupiedError, SessionPane
+from broker.session.triage import AnswerCall, CompleteCall, NoActionCall, triage
 from broker.session.watchdog import Watchdog
 from broker.transcript.adapter import ReadReport, read_cleaned
 from broker.transcript.schemas import (
+    AnswerValue,
     AskUserAnswer,
     AssistantText,
     TranscriptEvent,
@@ -140,8 +132,6 @@ from broker.transcript.schemas import (
 
 logger = logging.getLogger(__name__)
 
-SUBMIT_TIMEOUT_S = 15.0
-MASTER_TIMEOUT_S = 10.0
 SESSION_BIND_TIMEOUT_S = 60.0
 
 # Both waits are named and bounded (global rule). The decision deadline sits
@@ -156,19 +146,12 @@ ASK_VERIFY_TIMEOUT_S = 30.0
 # expires first and it fails loud on its own terms.
 CLARIFY_TIMEOUT_S = 45.0
 
-# Forwarded to the claude binary at spawn. "auto" classifies each tool call and
-# still prompts on the risky ones, so the hook's escalation path survives;
-# "bypassPermissions" would silently approve every escalation.
-CLAUDE_AGENT_ARGS = ["--model", "opus", "--permission-mode", "auto"]
-
 # Dashboard activity phrases, one per LLM call site.
 PHRASE_GROUNDING = "constructing the prompt…"
 PHRASE_TRIAGE = "reviewing the latest turn…"
 PHRASE_PERMISSION = "reviewing a permission request…"
 PHRASE_ASK = "deciding a question…"
 PHRASE_CLARIFY = "answering a question about the escalation…"
-
-STATUS_RETRY_S = 1.0
 
 Job = Callable[[], Awaitable[None]]
 _Handler = Callable[[Envelope, Any], Awaitable[Response | None]]
@@ -196,12 +179,12 @@ class _PendingApproval:
 
 
 @dataclass(slots=True)
-class _OpenMenu:
-    """An AskUserQuestion picker the broker left open in the pane."""
+class DecisionEscalation:
+    """The one live decision escalation, from its raise until it ends."""
 
-    tool_use_id: str
-    escalation_id: str | None  # None: nothing escalated for it
-    injected: dict[str, ask.AnswerValue] | None  # unverified injected answers
+    payload: EscalationPayload
+    user_prompt_baseline: int | None  # None: only a dispatched decision resolves it
+    clarify_tasks: set[asyncio.Task[clarify.ClarifyCall]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,32 +192,7 @@ class _InjectedAnswers:
     """Answers the broker injected into a menu, awaiting verification."""
 
     tool_input: dict[str, Any]
-    answers: dict[str, ask.AnswerValue]
-
-
-class PaneOccupiedError(Exception):
-    def __init__(self, what: str, pane_id: str | None) -> None:
-        """Record which native prompt holds the pane."""
-        super().__init__(
-            f"{what} is open in pane {pane_id or '?'}; nothing is typed into "
-            "the pane while it is"
-        )
-        self.what = what
-        self.pane_id = pane_id
-
-
-class MasterRefusedError(Exception):
-    def __init__(
-        self, msg_type: str, error: str, reason_code: NackCode | None
-    ) -> None:
-        """Record the refused message type and the master's stated reason."""
-        super().__init__(
-            f"master refused {msg_type}: {error or '(no reason given)'}"
-            + (f" [{reason_code}]" if reason_code else "")
-        )
-        self.msg_type = msg_type
-        self.error = error
-        self.reason_code = reason_code
+    answers: dict[str, AnswerValue]
 
 
 class FatalSessionError(Exception):
@@ -243,65 +201,6 @@ class FatalSessionError(Exception):
         super().__init__(f"{error_class}: {detail}")
         self.error_class = error_class
         self.detail = detail
-
-
-def _bind_llm(client: AsyncAnthropic) -> LLMCaller[ToolCall]:
-    """Adapt an Anthropic client into the keyword-only ``LLMCaller`` shape.
-
-    Args:
-        client: Anthropic client passed through to ``llm.call_tool``.
-
-    Returns:
-        A callable that forwards every triage call to that one client.
-    """
-
-    async def call(
-        *,
-        model: str,
-        max_tokens: int,
-        system: list[TextBlockParam],
-        messages: list[MessageParam],
-        tools: list[ToolParam],
-        tool_choice: ToolChoiceParam,
-    ) -> ToolCall:
-        """Invoke the bound client and return its single tool call."""
-        return await llm_module.call_tool(
-            client,
-            model=model,
-            max_tokens=max_tokens,
-            system=system,
-            messages=messages,
-            tools=tools,
-            tool_choice=tool_choice,
-        )
-
-    return call
-
-
-def _bind_retrieve(paths: BrokerPaths, embedding: EmbeddingConfig) -> Retriever:
-    """Bind index retrieval to this broker home and the pinned embedding model.
-
-    The embedder is built per call so a missing ``OPENAI_API_KEY`` fails at
-    grounding time, loudly, rather than at broker start.
-
-    Args:
-        paths: Resolves the repository's index file.
-        embedding: The model pinned in ``broker.config``, as sent by the master.
-
-    Returns:
-        A callable matching ``Retriever``.
-    """
-
-    async def call(intent: str, cwd: Path) -> GroundingContext:
-        repo = cwd.resolve()
-        return await retrieve_code(
-            intent,
-            repo,
-            index_path=paths.index_db(repo),
-            embedder=OpenAIEmbedder.from_env(embedding),
-        )
-
-    return call
 
 
 class SessionBroker:
@@ -328,7 +227,6 @@ class SessionBroker:
         self._llm_call = llm_call
         self._retrieve = retrieve
         self.state: SessionState = SessionState.SPAWNING
-        self.pane_id: str | None = None
         self.claude_session_id: str | None = None
         self.transcript_path: str | None = None
         self._logged_drift_warnings: set[str] = set()
@@ -342,19 +240,16 @@ class SessionBroker:
         self.jobs: asyncio.Queue[Job] = asyncio.Queue()
         self._run_task: asyncio.Task[None] | None = None
 
-        self._active_escalation: EscalationPayload | None = None
-        self._clarify_tasks: set[asyncio.Task[clarify.ClarifyCall]] = set()
-        self._open_menu: _OpenMenu | None = None
+        self._decision_escalation: DecisionEscalation | None = None
         self._ask_decisions: dict[str, AskQuestionDecisionPayload] = {}
         self._ask_expected: dict[str, _InjectedAnswers] = {}
         self._ask_verify_tasks: dict[str, asyncio.Task[None]] = {}
-        self._permission_prompt_pending = False
-        self._user_prompt_baseline = 0
         self._last_event_count = -1
 
-        self._status_dirty = asyncio.Event()
-        self._activity_phrases: set[str] = set()
-        self._status_task: asyncio.Task[None] | None = None
+        self._status = LiveStatusPusher(
+            snapshot=self._live_status, send=self._to_master
+        )
+        self.pane = SessionPane(cfg.name, on_change=self._status.mark_dirty)
 
         self._paths = BrokerPaths(cfg.broker_home)
         self.decision_log_path = self._paths.session_decisions(cfg.name)
@@ -367,7 +262,7 @@ class SessionBroker:
             intent=self._task.authoritative,
         )
         self.watchdog = Watchdog(
-            cfg.watchdog_seconds, self._herdr_state, self._reconcile
+            cfg.watchdog_seconds, self.pane.herdr_state, self._reconcile
         )
         self._handlers: dict[str, _Handler] = {
             T_PERMISSION_REQUEST: self._on_permission_request,
@@ -391,11 +286,11 @@ class SessionBroker:
         # Bind FIRST — hooks may fire before the pane exists.
         server = await serve_unix(Path(self.cfg.socket_path), self.handle)
         if self._llm_call is None:
-            self._llm_call = _bind_llm(llm_module.build_client())
+            self._llm_call = bind_call_tool(llm_module.build_client())
         if self._retrieve is None:
-            self._retrieve = _bind_retrieve(self._paths, self.cfg.embedding)
+            self._retrieve = bind_index_retriever(self._paths, self.cfg.embedding)
         self.watchdog.start()
-        self._status_task = asyncio.create_task(self._status_sender())
+        self._status.start()
         drive = self._run_task = asyncio.create_task(self._drive())
         try:
             await drive
@@ -406,15 +301,12 @@ class SessionBroker:
             if current is not None and current.cancelling():
                 raise
         finally:
-            # Cancellation, not a shutdown flag: a sender parked in
-            # _status_dirty.wait() would never observe one.
-            self._status_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._status_task
+            await self._status.aclose()
             for task in list(self._ask_verify_tasks.values()):
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+            await self.permission.aclose()
             await self.watchdog.stop()
             server.close()
             await server.wait_closed()
@@ -461,7 +353,7 @@ class SessionBroker:
         Args:
             adopt: Pane, Claude session id and transcript path to take over.
         """
-        self.pane_id = adopt.pane_id
+        self.pane.adopt(adopt.pane_id)
         self.claude_session_id = adopt.claude_session_id
         self.transcript_path = adopt.transcript_path
         self.session_bound.set()
@@ -500,41 +392,20 @@ class SessionBroker:
         """
         cfg = self.cfg
         # Trust was seeded by the MASTER before spawn.
-        pane = await asyncio.to_thread(
-            driver.pane_split,
+        guess = await self.pane.start(
             cfg.anchor_pane,
-            direction="right",
             cwd=Path(cfg.cwd),
             env={
                 ENV_BROKER_SOCKET: cfg.socket_path,
                 ENV_BROKER_HOOK_LOG: str(self._paths.session_hook_log(cfg.name)),
             },
-            focus=False,
-            timeout_s=15.0,
+            claude_settings_path=cfg.claude_settings_path,
         )
-        self.pane_id = pane.pane_id  # the DURABLE handle
-        start = await asyncio.to_thread(
-            driver.agent_start,
-            cfg.name,
-            kind="claude",
-            pane_id=self.pane_id,
-            timeout_ms=30000,
-            agent_args=[
-                *CLAUDE_AGENT_ARGS,
-                "--settings",
-                cfg.claude_settings_path,
-            ],
-        )
-        session = start.agent_session
         # Optimistic fill-in only: the SessionStart hook may already have
         # bound the authoritative id by the time this returns, and must
-        # never be clobbered by agent_start's guess.
-        if (
-            session is not None
-            and session.kind == "id"
-            and self.claude_session_id is None
-        ):
-            self.claude_session_id = session.value
+        # never be clobbered by the start-time guess.
+        if guess is not None and self.claude_session_id is None:
+            self.claude_session_id = guess
         try:
             async with asyncio.timeout(SESSION_BIND_TIMEOUT_S):
                 # Primary binding is the SessionStart hook event.
@@ -564,7 +435,7 @@ class SessionBroker:
         self._set_state(SessionState.GROUNDING)
         assert self._llm_call is not None
         assert self._retrieve is not None
-        with self._activity(PHRASE_GROUNDING):
+        with self._status.activity(PHRASE_GROUNDING):
             try:
                 grounding = await ground_intent(
                     self._llm_call,
@@ -592,46 +463,21 @@ class SessionBroker:
         # Approval is synchronous and blocking — no timeout.
         approved = await approval
         self._set_task(intent, approved.prompt)
-        await self._submit(approved.prompt)
+        await self.pane.submit(approved.prompt)
         self._pending = None
         self._set_state(SessionState.DRIVING)
 
-    async def _status_sender(self) -> None:
-        """Coalesce live-status changes into full-snapshot pushes to the master."""
-        while True:  # exits by cancellation at teardown
-            await self._status_dirty.wait()
-            self._status_dirty.clear()
-            payload = LiveStatusPayload(
-                state=self.state,
-                activity=" · ".join(sorted(self._activity_phrases)),
-                permission_prompt=self._reports_permission_prompt(),
-                task_activity=self.task_activity,
-                pane_id=self.pane_id,
-                claude_session_id=self.claude_session_id,
-                transcript_path=self.transcript_path,
-            )
-            try:
-                await self._to_master(payload)
-            except Exception as exc:
-                # Master unreachable: re-send the current snapshot next loop;
-                # the backoff keeps a dead master from spinning the broker hot.
-                logger.warning("live-status push failed, retrying: %r", exc)
-                self._status_dirty.set()
-                await asyncio.sleep(STATUS_RETRY_S)
-
-    @contextlib.contextmanager
-    def _activity(self, phrase: str) -> Generator[None]:
-        """Show ``phrase`` on the dashboard for the duration of the block."""
-        # A set, not a string: a permission decision on a socket-handler task
-        # and a triage on the event loop run concurrently, so each must show
-        # and clear exactly its own phrase.
-        self._activity_phrases.add(phrase)
-        self._status_dirty.set()
-        try:
-            yield
-        finally:
-            self._activity_phrases.discard(phrase)
-            self._status_dirty.set()
+    def _live_status(self) -> LiveStatusPayload:
+        """Return the session's current live status."""
+        return LiveStatusPayload(
+            state=self.state,
+            activity=self._status.current_activity,
+            permission_prompt=self.pane.reports_permission_prompt(),
+            task_activity=self.task_activity,
+            pane_id=self.pane.pane_id,
+            claude_session_id=self.claude_session_id,
+            transcript_path=self.transcript_path,
+        )
 
     async def _event_loop(self) -> None:
         """Run queued jobs one at a time until the drive task is cancelled."""
@@ -688,7 +534,7 @@ class SessionBroker:
         Returns:
             The decision reply for the hook.
         """
-        with self._activity(PHRASE_PERMISSION):
+        with self._status.activity(PHRASE_PERMISSION):
             decision = await self.permission.decide(
                 payload.tool_name,
                 payload.tool_input,
@@ -718,7 +564,7 @@ class SessionBroker:
         # LLM call.
         cached = self._ask_decisions.get(payload.tool_use_id)
         if cached is None:
-            with self._activity(PHRASE_ASK):
+            with self._status.activity(PHRASE_ASK):
                 cached = await self._decide_ask(payload)
             self._ask_decisions[payload.tool_use_id] = cached
         return Response(id=env.id, ok=True, payload=cached.model_dump())
@@ -750,7 +596,7 @@ class SessionBroker:
                 "the developer",
                 tool_use_id=tool_use_id,
             )
-            self._claim_menu(_OpenMenu(tool_use_id, None, None))
+            self._claim_menu(OpenMenu(tool_use_id, None, None))
             return escalated
         try:
             questions = ask.parse_questions(payload.tool_input)
@@ -786,7 +632,7 @@ class SessionBroker:
                 tool_use_id, payload.tool_input, f"{type(exc).__name__}: {exc}"
             )
             return escalated
-        if isinstance(result, ask.EscalateCall):
+        if isinstance(result, EscalateCall):
             self._escalate_menu(
                 tool_use_id,
                 payload.tool_input,
@@ -835,11 +681,11 @@ class SessionBroker:
             The answer reply, or an ``ok=False`` reply naming why no answer is
             given (escalation not live, resolved under the call, or LLM error).
         """
-        active = self._active_escalation
+        escalation = self._decision_escalation
         if (
             self.state != SessionState.ESCALATED
-            or active is None
-            or active.escalation_id != req.escalation_id
+            or escalation is None
+            or escalation.payload.escalation_id != req.escalation_id
         ):
             return nack_response(
                 env, "escalation no longer live", NackCode.WRONG_STATE
@@ -862,14 +708,14 @@ class SessionBroker:
                 self._llm_call,
                 self.cfg.session_model,
                 intent=self._intent(),
-                escalation=active,
+                escalation=escalation.payload,
                 question=req.question,
                 events=events,
             )
         )
-        self._clarify_tasks.add(task)
+        escalation.clarify_tasks.add(task)
         try:
-            with self._activity(PHRASE_CLARIFY):
+            with self._status.activity(PHRASE_CLARIFY):
                 async with asyncio.timeout(CLARIFY_TIMEOUT_S):
                     result = await task
         except asyncio.CancelledError:
@@ -890,14 +736,12 @@ class SessionBroker:
             # Discard only: awaiting `task` forwards this connection task's
             # cancellation — the timeout's included — into it, so it is
             # always finished by the time control reaches here.
-            self._clarify_tasks.discard(task)
-        # Backstop: a fatal error leaves ESCALATED without clearing
-        # _active_escalation, so it would not have cancelled the task.
-        live = self._active_escalation
+            escalation.clarify_tasks.discard(task)
+        # Cancelling a task that already finished is a no-op, so an escalation
+        # ending between the answer and this line still has to drop it.
         if (
             self.state != SessionState.ESCALATED
-            or live is None
-            or live.escalation_id != req.escalation_id
+            or self._decision_escalation is not escalation
         ):
             return resolved
         self._log(DecisionLogKind.CLARIFIED, result.reasoning, result.answer)
@@ -926,7 +770,7 @@ class SessionBroker:
             task_summary: The escalation's one-line Reason in the outcome history.
         """
         escalation_id = uuid.uuid4().hex
-        self._claim_menu(_OpenMenu(tool_use_id, escalation_id, None))
+        self._claim_menu(OpenMenu(tool_use_id, escalation_id, None))
         # Queued: the hook blocks on this reply and must never wait on master
         # traffic.
         self.jobs.put_nowait(
@@ -939,15 +783,15 @@ class SessionBroker:
             )
         )
 
-    def _claim_menu(self, menu: _OpenMenu) -> None:
+    def _claim_menu(self, menu: OpenMenu) -> None:
         """Record ``menu`` as the picker open in the pane."""
-        previous = self._open_menu
-        self._open_menu = menu
-        self._status_dirty.set()
-        # A picker opening means the earlier one closed. Its escalation is
-        # retracted ahead of the new raise: the master holds one per session.
+        previous = self.pane.claim_menu(menu)
+        # A picker opening means the earlier one closed. The master supersedes
+        # its escalation on the new raise, so only the log row is written,
+        # queued behind the earlier raise so it follows that raise's row.
         if previous is not None and previous.escalation_id is not None:
-            self.jobs.put_nowait(lambda: self._retract_superseded_menu(previous))
+            replaced = previous.escalation_id
+            self.jobs.put_nowait(lambda: self._log_replaced_question(replaced))
 
     async def _on_hook_event(
         self, env: Envelope, hook: HookEventPayload
@@ -1045,11 +889,11 @@ class SessionBroker:
                 "its pane",
                 NackCode.WRONG_STATE,
             )
-        what = self._native_prompt()
+        what = self.pane.native_prompt()
         if what is not None:
             return nack_response(
                 env,
-                f"{what} is open in pane {self.pane_id or '?'} — the "
+                f"{what} is open in pane {self.pane.pane_id or '?'} — the "
                 "developer answers it there before a prompt can be typed",
                 NackCode.WRONG_STATE,
             )
@@ -1066,13 +910,14 @@ class SessionBroker:
         Returns:
             The status reply.
         """
+        live = self._live_status()
         return Response(
             id=env.id,
             ok=True,
             payload=StatusPayload(
-                state=self.state,
-                permission_prompt=self._reports_permission_prompt(),
-                task_activity=self.task_activity,
+                state=live.state,
+                permission_prompt=live.permission_prompt,
+                task_activity=live.task_activity,
                 pending_proposal=(
                     self._pending.payload if self._pending is not None else None
                 ),
@@ -1152,7 +997,7 @@ class SessionBroker:
             case HookEventName.SESSION_START:
                 self._bind_session(raw)
             case HookEventName.STOP:
-                self._set_perm_pending(False)
+                self.pane.set_permission_prompt(False)
                 message = str(raw.get("last_assistant_message", "") or "")
                 self.jobs.put_nowait(lambda: self._on_turn_end(message))
             case HookEventName.STOP_FAILURE:
@@ -1164,21 +1009,21 @@ class SessionBroker:
                 self.jobs.put_nowait(lambda: self._fatal(error_class, detail))
             case HookEventName.USER_PROMPT_SUBMIT | HookEventName.POST_TOOL_USE:
                 if event == HookEventName.POST_TOOL_USE:
-                    self._set_perm_pending(False)
+                    self.pane.set_permission_prompt(False)
                     tool_name, tool_input = _raw_tool(raw)
                     self.permission.note_tool_completed(tool_name, tool_input)
                     if tool_name == ASK_USER_QUESTION:
                         self._verify_ask(raw)
                 else:
                     self.permission.note_developer_input()
-                if self._open_menu is not None:
+                if self.pane.open_menu is not None:
                     self.jobs.put_nowait(self._check_menu_answered)
                 if self.state == SessionState.ESCALATED:
                     self.jobs.put_nowait(self._check_out_of_band_resolution)
             case HookEventName.NOTIFICATION:
                 self._log(DecisionLogKind.NOTIFICATION, "", str(raw.get("message", "")))
                 if raw.get("notification_type") == "permission_prompt":
-                    self._set_perm_pending(True)
+                    self.pane.set_permission_prompt(True)
             case HookEventName.SESSION_END:
                 self.permission.note_session_ended()
                 self._set_state(SessionState.STOPPED)
@@ -1217,7 +1062,7 @@ class SessionBroker:
                 / f"{self.claude_session_id}.jsonl"
             )
         self.session_bound.set()
-        self._status_dirty.set()
+        self._status.mark_dirty()
 
     # ── queued jobs ───────────────────────────────────────────────────────
 
@@ -1245,18 +1090,17 @@ class SessionBroker:
         events = self._read_transcript()  # context ONLY; input is the message
         self._last_event_count = len(events)
         assert self._llm_call is not None
-        with self._activity(PHRASE_TRIAGE):
+        with self._status.activity(PHRASE_TRIAGE):
             result = await triage(
                 self._llm_call,
                 self.cfg.session_model,
                 intent=self._intent(),
                 events=events,
-                event_name=HookEventName.STOP,
                 last_assistant_message=last_assistant_message,
             )
         if not isinstance(result, EscalateCall):
             self.task_activity = result.task_activity
-            self._status_dirty.set()
+            self._status.mark_dirty()
         if isinstance(result, AnswerCall):
             if self.budget_count >= self.cfg.budget_max:
                 await self._escalate_handover(result, last_assistant_message, events)
@@ -1267,7 +1111,7 @@ class SessionBroker:
                     result.answer,
                     task_summary=result.task_summary,
                 )
-                await self._submit(result.answer)
+                await self.pane.submit(result.answer)
                 self.budget_count += 1
                 await self._report_budget(self.budget_count)
         elif isinstance(result, EscalateCall):
@@ -1396,7 +1240,7 @@ class SessionBroker:
         self._log(
             DecisionLogKind.ESCALATION_RAISED,
             reason,
-            f"AskUserQuestion menu open in pane {self.pane_id or '?'}",
+            f"AskUserQuestion menu open in pane {self.pane.pane_id or '?'}",
             task_summary=task_summary,
             escalation_id=escalation_id,
         )
@@ -1409,27 +1253,28 @@ class SessionBroker:
             reason=reason,
             analysis=analysis,
         )
-        try:
-            await self._to_master(payload)
-        except MasterRefusedError as exc:
-            # The picker is still in the pane, so the claim stays; only the
-            # escalation the master refused is dropped.
-            self._log(
-                DecisionLogKind.QUESTION_REFUSED,
-                "question escalation refused",
-                str(exc),
-            )
-            menu = self._open_menu
-            if menu is not None and menu.escalation_id == escalation_id:
-                menu.escalation_id = None
+        nack = await self._to_master(payload, tolerated=frozenset(NackCode))
+        if nack is None:
+            return
+        # The picker is still in the pane, so the claim stays; only the
+        # escalation the master refused is dropped.
+        self._log(
+            DecisionLogKind.QUESTION_REFUSED,
+            "question escalation refused",
+            describe_refusal(payload.MESSAGE_TYPE, nack),
+        )
+        menu = self.pane.open_menu
+        if menu is not None and menu.escalation_id == escalation_id:
+            menu.escalation_id = None
 
-    async def _retract_superseded_menu(self, menu: _OpenMenu) -> None:
-        """Withdraw the question escalation of a picker a newer one replaced."""
-        assert menu.escalation_id is not None
-        await self._retract_question(
-            menu.escalation_id,
+    async def _log_replaced_question(self, escalation_id: str) -> None:
+        """Close the question escalation of a picker a newer one replaced."""
+        self._log(
+            DecisionLogKind.RETRACTED,
             "a newer AskUserQuestion menu replaced it",
-            "Replaced by a newer question",
+            "",
+            task_summary="Replaced by a newer question",
+            escalation_id=escalation_id,
         )
 
     async def _retract_question(
@@ -1457,7 +1302,7 @@ class SessionBroker:
         """Release the open picker once the transcript records its answer."""
         # Every way the picker closes writes an answer for its tool use, so
         # the transcript is the complete clearing signal.
-        menu = self._open_menu
+        menu = self.pane.open_menu
         if menu is None:
             return
         answer = next(
@@ -1470,8 +1315,7 @@ class SessionBroker:
         )
         if answer is None:
             return
-        self._open_menu = None
-        self._status_dirty.set()
+        self.pane.release_menu()
         if menu.escalation_id is None:
             return
         answered_by_developer = (
@@ -1622,7 +1466,7 @@ class SessionBroker:
         # something, and only a decision in the master chat resolves it.
         if not answer_recorded:
             escalation_id = uuid.uuid4().hex
-            self._claim_menu(_OpenMenu(tool_use_id, escalation_id, injected.answers))
+            self._claim_menu(OpenMenu(tool_use_id, escalation_id, injected.answers))
             await self._raise_question(
                 escalation_id,
                 injected.tool_input,
@@ -1635,7 +1479,7 @@ class SessionBroker:
             escalation_title="AskUserQuestion answer verification failed",
             situation=(
                 "AskUserQuestion answer verification failed — " + reason
-                + f" Check pane {self.pane_id or '?'} and the session's "
+                + f" Check pane {self.pane.pane_id or '?'} and the session's "
                 "recent turns."
             ),
             what_was_asked=(
@@ -1693,9 +1537,11 @@ class SessionBroker:
             task_summary=task_summary,
             escalation_id=payload.escalation_id,
         )
-        self._active_escalation = payload
-        self._user_prompt_baseline = (
-            _count_user_prompts(events) if events is not None else -1
+        self._end_decision_escalation()
+        self._decision_escalation = DecisionEscalation(
+            payload,
+            _count_user_prompts(events) if events is not None else None,
+            set(),
         )
         self._set_state(SessionState.ESCALATED)  # QUIESCENT until dispatch or retract
         await self._to_master(payload)
@@ -1712,7 +1558,7 @@ class SessionBroker:
             last_assistant_message: ``last_assistant_message`` from the Stop
                 payload.
         """
-        if self._open_menu is not None:
+        if self.pane.open_menu is not None:
             await self._check_menu_answered()
         if self.state == SessionState.ESCALATED:
             await self._check_out_of_band_resolution()
@@ -1726,13 +1572,15 @@ class SessionBroker:
         A user prompt beyond the recorded baseline counts as resolution.
         Resolving returns the session to driving.
         """
+        escalation = self._decision_escalation
         if (
             self.state != SessionState.ESCALATED
-            or self._active_escalation is None
-            or self._user_prompt_baseline < 0
+            or escalation is None
+            or escalation.user_prompt_baseline is None
         ):
             return
-        if _count_user_prompts(self._read_transcript()) <= self._user_prompt_baseline:
+        baseline = escalation.user_prompt_baseline
+        if _count_user_prompts(self._read_transcript()) <= baseline:
             return
         await self._retract_decision("resolved in pane", "User answered in the pane")
         await self._note_developer_contact()
@@ -1744,8 +1592,8 @@ class SessionBroker:
             reason: Why it ended; shown to the developer.
             summary: The escalation's Solution line in the outcome history.
         """
-        assert self._active_escalation is not None
-        escalation_id = self._active_escalation.escalation_id
+        assert self._decision_escalation is not None
+        escalation_id = self._decision_escalation.payload.escalation_id
         self._log(
             DecisionLogKind.RETRACTED,
             reason,
@@ -1753,7 +1601,7 @@ class SessionBroker:
             task_summary=summary,
             escalation_id=escalation_id,
         )
-        self._end_active_escalation()
+        self._end_decision_escalation()
         self._set_state(SessionState.DRIVING)
         await self._to_master(
             EscalationRetractPayload(escalation_id=escalation_id, reason=reason)
@@ -1773,8 +1621,8 @@ class SessionBroker:
             decision: The dispatched decision, carrying the escalation id it
                 answers and the response text to submit.
         """
-        active = self._active_escalation
-        if active is None or decision.escalation_id != active.escalation_id:
+        active = self._decision_escalation
+        if active is None or decision.escalation_id != active.payload.escalation_id:
             # The broker has moved past this escalation, so the master should
             # drop its queue entry (still_live=False). Reachable when a master
             # restart re-surfaces an escalation this broker already answered.
@@ -1792,7 +1640,7 @@ class SessionBroker:
             )
             return
         try:
-            await self._submit(decision.response)
+            await self.pane.submit(decision.response)
         except Exception as exc:
             # The master resolves only on confirmed delivery, so a failed pane
             # write — an occupied pane included — leaves the escalation live
@@ -1813,7 +1661,7 @@ class SessionBroker:
                 )
             )
             return
-        self._end_active_escalation()
+        self._end_decision_escalation()
         await self._note_developer_contact()
         self._set_state(SessionState.DRIVING)
         self._log(
@@ -1840,7 +1688,7 @@ class SessionBroker:
         self._log(
             DecisionLogKind.REACTIVATED, "new task in the same session", payload.intent
         )
-        self._end_active_escalation()
+        self._end_decision_escalation()
         await self._note_developer_contact()
         await self._ground_and_submit(payload.intent)
 
@@ -1851,14 +1699,14 @@ class SessionBroker:
             prompt: The text the master relayed, submitted unmodified.
         """
         try:
-            await self._submit(prompt.text)
+            await self.pane.submit(prompt.text)
         except PaneOccupiedError as exc:
             self._log(
                 DecisionLogKind.DISPATCH_FAILED, "developer prompt not typed", str(exc)
             )
             await self._to_master(PromptUndeliveredPayload(detail=str(exc)))
             return
-        if self._active_escalation is not None:
+        if self._decision_escalation is not None:
             await self._retract_decision(
                 "superseded by a developer prompt", "Superseded by a developer prompt"
             )
@@ -1875,16 +1723,19 @@ class SessionBroker:
         """Tell the master the autonomous answer budget stands at ``count``."""
         await self._to_master(BudgetUpdatePayload(count=count))
 
-    def _end_active_escalation(self) -> None:
-        """Clear the active escalation and cancel any clarification bound to it.
+    def _end_decision_escalation(self) -> None:
+        """Clear the live decision escalation and cancel any clarification bound to it.
 
         Every path that ends an escalation (dispatch, out-of-band retract,
-        developer prompt, reactivation) routes here, so an in-flight clarify
-        LLM call can never outlive the escalation it is about.
+        developer prompt, reactivation, a newer raise, a fatal error) routes
+        here, so an in-flight clarify LLM call can never outlive the
+        escalation it is about.
         """
-        self._active_escalation = None
-        for task in self._clarify_tasks:
-            task.cancel()
+        escalation = self._decision_escalation
+        self._decision_escalation = None
+        if escalation is not None:
+            for task in escalation.clarify_tasks:
+                task.cancel()
 
     async def _reconcile(self) -> None:
         """Enqueue reconciliation work on watchdog expiry."""
@@ -1898,12 +1749,12 @@ class SessionBroker:
         classified as if a Stop hook had delivered it, so a dropped hook
         cannot silently strand the session.
         """
-        if self._open_menu is not None:
+        if self.pane.open_menu is not None:
             await self._check_menu_answered()
         if self.state == SessionState.ESCALATED:
             await self._check_out_of_band_resolution()
         # A native prompt open means the turn is blocked on it, not over.
-        if self._native_prompt() is not None or self.state not in ACTIVE_STATES:
+        if self.pane.native_prompt() is not None or self.state not in ACTIVE_STATES:
             return
         events = self._read_transcript()
         if len(events) == self._last_event_count:
@@ -1974,60 +1825,31 @@ class SessionBroker:
             dict(report.unknown_types),
         )
 
-    def _native_prompt(self) -> str | None:
-        """Name the native prompt open in the pane, or ``None`` when there is none."""
-        if self._open_menu is not None:
-            return "an AskUserQuestion menu"
-        if self._permission_prompt_pending:
-            return "a permission prompt"
-        return None
-
-    def _reports_permission_prompt(self) -> bool:
-        """Whether to report a permission prompt upstream."""
-        # An open picker's own permission check can raise a permission-prompt
-        # notification; the picker is the prompt the developer sees.
-        return self._permission_prompt_pending and self._open_menu is None
-
-    async def _submit(self, text: str) -> None:
-        """Type ``text`` into the session and submit it, with an explicit timeout.
-
-        Args:
-            text: Prompt text, submitted exactly as given.
-
-        Raises:
-            PaneOccupiedError: A native prompt is open in the pane; typing
-                would land in it.
-        """
-        what = self._native_prompt()
-        if what is not None:
-            raise PaneOccupiedError(what, self.pane_id)
-        await asyncio.to_thread(
-            driver.agent_prompt,
-            self.cfg.name,
-            text,
-            timeout_s=SUBMIT_TIMEOUT_S,
-        )
-
-    async def _to_master(self, payload: WireMessage) -> None:
+    async def _to_master(
+        self,
+        payload: WireMessage,
+        *,
+        tolerated: frozenset[NackCode] = frozenset(),
+    ) -> NackPayload | None:
         """Send one message to the master and wait for its reply.
 
         Args:
             payload: The message; its ``MESSAGE_TYPE`` is the envelope type.
+            tolerated: Refusal codes the caller handles itself.
+
+        Returns:
+            ``None`` once accepted, otherwise the tolerated refusal.
 
         Raises:
-            MasterRefusedError: The master answered ``ok=False``.
+            MasterRefusedError: The master refused it with a code outside
+                ``tolerated``, or with no code.
         """
-        resp = await client.send(
+        return await send_to_master(
             Path(self.cfg.master_socket_path),
+            self.cfg.name,
             payload,
-            session_id=self.cfg.name,
-            timeout_s=MASTER_TIMEOUT_S,
+            tolerated=tolerated,
         )
-        if not resp.ok:
-            nack = parse_nack(resp)
-            raise MasterRefusedError(
-                payload.MESSAGE_TYPE, nack.error, nack.reason_code
-            )
 
     async def _fatal(self, error_class: str, detail: str) -> None:
         """Log the failure, enter the error state, and tell the master.
@@ -2041,6 +1863,7 @@ class SessionBroker:
         """
         logger.error("fatal: %s: %s", error_class, detail)
         self._log(DecisionLogKind.ERROR, error_class, detail)
+        self._end_decision_escalation()
         self._set_state(SessionState.ERROR)
         try:
             await self._to_master(
@@ -2089,23 +1912,7 @@ class SessionBroker:
         """Assign a new state and log the transition."""
         logger.info("session %s: %s -> %s", self.cfg.name, self.state, state)
         self.state = state
-        self._status_dirty.set()
-
-    def _set_perm_pending(self, pending: bool) -> None:
-        """Record whether the session sits on a native permission prompt."""
-        self._permission_prompt_pending = pending
-        self._status_dirty.set()
-
-    def _herdr_state(self) -> AgentStatus:
-        """Report the agent's state as Herdr sees it, for the watchdog gate.
-
-        Returns:
-            Herdr's status, or ``"unknown"`` if the query fails.
-        """
-        try:
-            return driver.agent_get(self.cfg.name, timeout_s=10.0).agent_status
-        except Exception:
-            return "unknown"  # gates the watchdog read out; never classifies
+        self._status.mark_dirty()
 
 
 def _raw_tool(raw: dict[str, Any]) -> tuple[str, dict[str, Any]]:
