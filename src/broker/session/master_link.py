@@ -11,6 +11,7 @@ import contextlib
 import logging
 from collections.abc import Awaitable, Callable, Generator
 from pathlib import Path
+from typing import Protocol
 
 from broker.protocol import client
 from broker.protocol.constants import NackCode
@@ -40,6 +41,19 @@ class MasterRefusedError(Exception):
         super().__init__(describe_refusal(msg_type, nack))
         self.msg_type = msg_type
         self.nack = nack
+
+
+class MasterSender(Protocol):
+    """The session's bound sender to the master, shaped like `send_to_master`."""
+
+    async def __call__(
+        self,
+        payload: WireMessage,
+        *,
+        tolerated: frozenset[NackCode] = ...,
+    ) -> NackPayload | None:
+        """Send one message and return the tolerated refusal, if any."""
+        ...
 
 
 async def send_to_master(
