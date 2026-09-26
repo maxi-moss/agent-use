@@ -103,7 +103,6 @@ class PaneEscalationArrived:
 class ProposalArrived:
     session_id: str
     proposal_id: str
-    rendered: str
 
 
 @dataclass(frozen=True, slots=True)

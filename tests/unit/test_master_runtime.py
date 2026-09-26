@@ -979,7 +979,7 @@ async def test_repopulate_from_brokers_recovers_pending_proposal(
     assert runtime.board.proposals["pr1"].session_id == "s1"
     arrived = [m for m in posts if isinstance(m, ProposalArrived)]
     assert [(m.session_id, m.proposal_id) for m in arrived] == [("s1", "pr1")]
-    assert "add a health endpoint" in arrived[0].rendered
+    assert "add a health endpoint" in runtime.board.rendered_proposals()["s1"]
 
 
 async def test_repopulate_from_brokers_registers_nothing_when_no_proposal(

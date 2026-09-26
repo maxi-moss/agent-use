@@ -164,11 +164,7 @@ class FleetBoard:
         """Hold a session's proposal in place of any earlier one and announce it."""
         self.discard_proposals(session_id)
         self.proposals[payload.proposal_id] = PendingProposal(session_id, payload)
-        self.emit(
-            ProposalArrived(
-                session_id, payload.proposal_id, render_proposal(payload)
-            )
-        )
+        self.emit(ProposalArrived(session_id, payload.proposal_id))
 
     def discard_proposals(self, session_id: str) -> None:
         """Drop every pending proposal a session holds."""
