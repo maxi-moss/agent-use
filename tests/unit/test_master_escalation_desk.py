@@ -208,10 +208,11 @@ async def test_dispatch_and_clarify_refuse_a_question_naming_the_pane(
     dispatched = await h.desk.dispatch("q1", "label-a")
     clarified = await h.desk.clarify("q1", "why?")
     for result in (dispatched, clarified):
-        assert "an AskUserQuestion menu" in result
-        assert "pane w3:p2" in result
-    assert dispatched.startswith("decision NOT dispatched")
-    assert clarified.startswith("question NOT sent")
+        assert not result.ok
+        assert "an AskUserQuestion menu" in result.text
+        assert "pane w3:p2" in result.text
+    assert dispatched.text.startswith("decision NOT dispatched")
+    assert clarified.text.startswith("question NOT sent")
     assert h.link.sent == []
     assert h.desk.panes.find("q1") is not None
 
@@ -222,11 +223,11 @@ async def test_dispatch_refuses_permission_pane(h: Harness) -> None:
     result = await h.desk.dispatch("p1", "yes, go ahead")
     # Refused as a permission prompt, not as a stale decision: the developer
     # is told where the answer belongs.
-    assert "NOT dispatched" in result
-    assert "permission prompt" in result
+    assert not result.ok
+    assert "permission prompt" in result.text
     # The registry has no pane for s1 here; the refusal still has to say where
     # the answer belongs rather than go silent.
-    assert PANE_UNKNOWN in result
+    assert PANE_UNKNOWN in result.text
     assert h.link.sent == []
     assert h.desk.panes.find("p1") is not None
     active = h.desk.queue.active
@@ -238,7 +239,7 @@ async def test_queued_escalation_surfaces_after_resolve(h: Harness) -> None:
     await accept(h, "e1")
     await accept(h, "e2", "s2")
     assert h.surfaced() == ["e1"]
-    assert "dispatched" in await h.desk.dispatch("e1", "use option B")
+    assert (await h.desk.dispatch("e1", "use option B")).ok
     # Resolution waits for confirmed delivery: e1 is still the head and
     # nothing new surfaces until the broker confirms it reached the pane.
     assert h.surfaced() == ["e1"]
@@ -273,10 +274,10 @@ async def test_retracted_queued_escalation_is_never_surfaced(h: Harness) -> None
 
 async def test_dispatch_aborts_on_stale_escalation(h: Harness) -> None:
     # No active escalation at all.
-    assert "NOT dispatched" in await h.desk.dispatch("ghost", "option B")
+    assert not (await h.desk.dispatch("ghost", "option B")).ok
     # Mismatched id while another escalation is active.
     await accept(h)
-    assert "NOT dispatched" in await h.desk.dispatch("e2", "option B")
+    assert not (await h.desk.dispatch("e2", "option B")).ok
     assert h.link.sent == []
     assert any("NOT dispatched" in t for t in h.notices())
 
@@ -285,7 +286,7 @@ async def test_undelivered_still_live_keeps_escalation_for_redecide(
     h: Harness,
 ) -> None:
     await accept(h)
-    assert "dispatched" in await h.desk.dispatch("e1", "use option B")
+    assert (await h.desk.dispatch("e1", "use option B")).ok
     await h.desk.undelivered("s1", undelivered("e1", still_live=True))
     # A failed pane write never resolved e1: it is reported loudly and stays
     # the live head so the developer can dispatch again.
@@ -294,12 +295,12 @@ async def test_undelivered_still_live_keeps_escalation_for_redecide(
     assert active is not None and active.escalation_id == "e1"
     # The in-flight lock cleared, so a re-decide dispatches rather than
     # bouncing off a decision that is supposedly still being delivered.
-    assert "dispatched" in await h.desk.dispatch("e1", "retry")
+    assert (await h.desk.dispatch("e1", "retry")).ok
 
 
 async def test_undelivered_stale_retracts_orphaned_entry(h: Harness) -> None:
     await accept(h)
-    assert "dispatched" in await h.desk.dispatch("e1", "use option B")
+    assert (await h.desk.dispatch("e1", "use option B")).ok
     await h.desk.undelivered("s1", undelivered("e1", still_live=False))
     # The broker no longer holds e1 (e.g. answered before a master restart):
     # the orphaned entry is dropped so the queue cannot wedge.
@@ -307,15 +308,17 @@ async def test_undelivered_stale_retracts_orphaned_entry(h: Harness) -> None:
     assert any("cleared" in t and "e1" in t for t in h.notices())
     # The in-flight lock cleared with it: a fresh escalation dispatches.
     await accept(h, "e2")
-    assert "dispatched" in await h.desk.dispatch("e2", "go")
+    assert (await h.desk.dispatch("e2", "go")).ok
 
 
 async def test_second_dispatch_refused_while_inflight(h: Harness) -> None:
     await accept(h)
-    assert "dispatched" in await h.desk.dispatch("e1", "first")
+    assert (await h.desk.dispatch("e1", "first")).ok
     # A decision is already on its way to the pane; a second would
     # double-submit the same escalation.
-    assert "already being delivered" in await h.desk.dispatch("e1", "second")
+    second = await h.desk.dispatch("e1", "second")
+    assert not second.ok
+    assert "already being delivered" in second.text
     assert len(h.link.sent) == 1
 
 
@@ -332,13 +335,13 @@ async def test_delivery_reply_before_dispatch_ack_leaves_no_inflight_marker(
     h.link.answer = deliver_then_ack
     await accept(h)
     first = await h.desk.dispatch("e1", "go")
-    assert first.startswith("decision dispatched"), first
+    assert first.ok, first
     assert h.desk.queue.active is None
     # A marker set after the ACK would name the resolved e1 and refuse every
     # later dispatch as already being delivered.
     await accept(h, "e2")
     second = await h.desk.dispatch("e2", "go")
-    assert second.startswith("decision dispatched"), second
+    assert second.ok, second
 
 
 async def test_dispatch_rejected_by_the_session_clears_inflight(
@@ -350,10 +353,29 @@ async def test_dispatch_rejected_by_the_session_clears_inflight(
     h.link.answer = nack
     await accept(h)
     result = await h.desk.dispatch("e1", "go")
-    assert result.startswith("session s1 rejected the dispatched decision")
-    assert result in h.notices()
+    assert not result.ok
+    assert result.text.startswith("session s1 rejected the dispatched decision")
+    assert result.text in h.notices()
     h.link.answer = _ack
-    assert "dispatched" in await h.desk.dispatch("e1", "retry")
+    assert (await h.desk.dispatch("e1", "retry")).ok
+
+
+async def test_dispatch_to_a_silent_broker_is_refused_and_clears_inflight(
+    h: Harness,
+) -> None:
+    async def silent(_payload: WireMessage) -> Response:
+        raise ConnectionError("no reply from s1.sock")
+
+    h.link.answer = silent
+    await accept(h)
+    result = await h.desk.dispatch("e1", "go")
+    # The master LLM reads the refusal instead of losing its whole turn.
+    assert not result.ok
+    assert "did not reply" in result.text
+    assert "may have received it" in result.text
+    assert result.text in h.notices()
+    h.link.answer = _ack
+    assert (await h.desk.dispatch("e1", "retry")).ok
 
 
 async def test_clarify_relays_answer(h: Harness) -> None:
@@ -372,16 +394,16 @@ async def test_clarify_relays_answer(h: Harness) -> None:
     # The answer reaches the developer verbatim; the tool loop gets only an
     # acknowledgement it cannot paraphrase from.
     assert any("it tried A" in t and "e1" in t for t in h.notices())
-    assert "it tried A" not in result
-    assert "shown to the developer" in result
+    assert result.ok
+    assert "it tried A" not in result.text
     active = h.desk.queue.active
     assert active is not None and active.escalation_id == "e1"
 
 
 async def test_clarify_wrong_id(h: Harness) -> None:
-    assert "NOT sent" in await h.desk.clarify("ghost", "q")
+    assert not (await h.desk.clarify("ghost", "q")).ok
     await accept(h)
-    assert "NOT sent" in await h.desk.clarify("e2", "q")
+    assert not (await h.desk.clarify("e2", "q")).ok
     assert h.link.sent == []
     assert any("NOT sent" in t for t in h.notices())
 
@@ -390,9 +412,9 @@ async def test_clarify_permission_refused(h: Harness) -> None:
     await accept(h)
     await accept_permission(h)
     result = await h.desk.clarify("p1", "q")
-    assert "NOT sent" in result
-    assert "permission prompt" in result
-    assert PANE_UNKNOWN in result
+    assert not result.ok
+    assert "permission prompt" in result.text
+    assert PANE_UNKNOWN in result.text
     assert h.link.sent == []
     assert h.desk.panes.find("p1") is not None
     assert any("NOT sent" in t for t in h.notices())
@@ -407,8 +429,9 @@ async def test_clarify_broker_nack(h: Harness) -> None:
     h.link.answer = nack
     await accept(h)
     result = await h.desk.clarify("e1", "q")
-    assert result.startswith("no clarification from session s1")
-    assert result.endswith(": escalation resolved in the pane")
-    assert result in h.notices()
+    assert not result.ok
+    assert result.text.startswith("no clarification from session s1")
+    assert result.text.endswith(": escalation resolved in the pane")
+    assert result.text in h.notices()
     # The master never resolves on the broker's behalf.
     assert h.desk.queue.active is not None

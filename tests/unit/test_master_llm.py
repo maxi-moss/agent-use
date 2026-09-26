@@ -30,6 +30,7 @@ from broker.master.llm import (
     MasterLLM,
     bind_call_turn,
 )
+from broker.master.control_result import ControlResult
 from broker.master.escalation_desk import EscalationDesk
 from broker.master.pane_escalations import PaneEscalations
 from broker.master.payload_render import (
@@ -67,9 +68,9 @@ class RecordingDesk(EscalationDesk):
         )
         self.dispatched = dispatched
 
-    async def dispatch(self, escalation_id: str, decision: str) -> str:
+    async def dispatch(self, escalation_id: str, decision: str) -> ControlResult:
         self.dispatched.append((escalation_id, decision))
-        return "dispatched"
+        return ControlResult(True, "dispatched")
 
 
 class RecordingRuntime(MasterRuntime):
@@ -93,13 +94,13 @@ class RecordingRuntime(MasterRuntime):
         self.desk = RecordingDesk(self, self.dispatched)
         self.sent: list[tuple[str, str]] = []
 
-    async def spawn_session(self, intent: str, cwd: str) -> str:
+    async def spawn_session(self, intent: str, cwd: str) -> ControlResult:
         self.spawned.append((intent, cwd))
-        return "spawned"
+        return ControlResult(True, "spawned")
 
-    async def send_prompt(self, session_id: str, text: str) -> str:
+    async def send_prompt(self, session_id: str, text: str) -> ControlResult:
         self.sent.append((session_id, text))
-        return "sent"
+        return ControlResult(True, "sent")
 
 
 class FakeLLM:
@@ -357,6 +358,28 @@ async def test_pending_proposal_reaches_llm_context(
     texts = _block_texts(fake.calls[0])
     assert any("p1" in t for t in texts)  # the id the tool needs
     assert render_proposal(PROPOSAL) in texts  # verbatim, its own block
+
+
+async def test_refused_tool_is_an_error_result_and_the_turn_goes_on(
+    runtime: RecordingRuntime,
+) -> None:
+    fake = FakeLLM(
+        [
+            TurnResult(
+                tool_calls=[
+                    ToolCall(name="stop_session", input={"session_id": "ghost"})
+                ]
+            ),
+            TurnResult(text="there is no session ghost"),
+        ]
+    )
+    master = make_master(runtime, fake)
+    reply = await master.handle_developer_message("stop ghost")
+    assert reply == "there is no session ghost"
+    messages = cast(list[dict[str, Any]], fake.calls[1]["messages"])
+    tool_result = cast(list[dict[str, Any]], messages[-1]["content"])[0]
+    assert tool_result["is_error"] is True
+    assert "ghost" in tool_result["content"]
 
 
 async def test_tool_loop_terminates_at_cap(

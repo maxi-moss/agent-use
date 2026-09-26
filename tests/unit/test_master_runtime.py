@@ -670,7 +670,7 @@ async def test_get_permission_log_round_trip(
     stub = PermissionLogSession()
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
-        assert await runtime.get_permission_log("s1") == stub.text
+        assert (await runtime.get_permission_log("s1")).text == stub.text
         assert [e.type for e in stub.envelopes] == [T_GET_PERMISSION_LOG]
     finally:
         server.close()
@@ -687,7 +687,7 @@ async def test_list_sessions_reports_permission_prompt_flag(
     stub = StatusSession(permission_prompt=True)
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
-        listing = await runtime.list_sessions()
+        listing = (await runtime.list_sessions()).text
         assert "s1" in listing
         assert "sitting on a permission prompt" in listing
         assert "w3:p2" in listing
@@ -704,7 +704,7 @@ async def test_list_sessions_degrades_when_a_session_is_unreachable(
 ) -> None:
     """One dead session costs a line of the listing, never the whole listing."""
     runtime, _ = rt
-    listing = await runtime.list_sessions()
+    listing = (await runtime.list_sessions()).text
     assert "s1" in listing
     assert "unreachable" in listing
 
@@ -1080,7 +1080,7 @@ async def test_dispatch_delivers_decision_when_live(
         assert (await send(runtime, T_LIVE_STATUS, {"state": "escalated"})).ok
         assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
         result = await runtime.desk.dispatch("e1", "use option B")
-        assert "dispatched" in result
+        assert result.ok
         assert len(stub.envelopes) == 1
         env = stub.envelopes[0]
         assert env.type == T_DISPATCH_DECISION
@@ -1112,14 +1112,11 @@ async def test_stop_session_clears_inflight_for_its_own_head(
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
         assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-        assert "dispatched" in await runtime.desk.dispatch("e1", "go")
+        assert (await runtime.desk.dispatch("e1", "go")).ok
         # Stopped mid-delivery: no delivered/undelivered reply ever clears the
         # marker, so the stop must, or a re-dispatch is wrongly refused.
         await runtime.stop_session("s1")
-        assert (
-            "already being delivered"
-            not in await runtime.desk.dispatch("e1", "retry")
-        )
+        assert (await runtime.desk.dispatch("e1", "retry")).ok
     finally:
         server.close()
         await server.wait_closed()
@@ -1402,7 +1399,7 @@ async def test_approve_prompt_stores_the_title_and_it_reaches_the_fleet_row(
         result = await runtime.approve_prompt(
             "p1", "the approved prompt", "fix the login bug"
         )
-        assert "approved" in result
+        assert result.ok
         assert len(stub.envelopes) == 1
         assert stub.envelopes[0].type == T_APPROVE_PROMPT
         assert stub.envelopes[0].payload == {
@@ -1427,7 +1424,8 @@ async def test_dispatch_reports_rejection_when_session_nacks(
         assert (await send(runtime, T_LIVE_STATUS, {"state": "escalated"})).ok
         assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
         result = await runtime.desk.dispatch("e1", "use option B")
-        assert "rejected" in result
+        assert not result.ok
+        assert "rejected" in result.text
         # A NACKed dispatch must not be treated as delivered.
         assert runtime.desk.queue.active is not None
         assert runtime.registry.get("s1").state != "driving"
@@ -1449,7 +1447,7 @@ async def test_send_prompt_leaves_the_budget_to_the_broker(
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
         result = await runtime.send_prompt("s1", "hello")
-        assert result == "prompt accepted by session s1"
+        assert result.ok
         # Acceptance is not delivery: only the broker's budget update resets it.
         assert runtime.registry.get("s1").budget_count == 5
     finally:
@@ -1468,12 +1466,24 @@ async def test_send_prompt_reports_rejection_when_session_nacks(
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
         result = await runtime.send_prompt("s1", "hello")
-        assert "rejected" in result
+        assert not result.ok
+        assert "rejected" in result.text
         # A NACKed send must not reset the budget as if it were delivered.
         assert runtime.registry.get("s1").budget_count == 5
     finally:
         server.close()
         await server.wait_closed()
+
+
+async def test_send_prompt_to_a_silent_session_is_refused(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    """No broker answers s1's socket: the refusal is returned, never raised."""
+    runtime, posts = rt
+    result = await runtime.send_prompt("s1", "hello")
+    assert not result.ok
+    assert "nothing was sent" in result.text
+    assert result.text in [m.text for m in posts if isinstance(m, Notice)]
 
 
 async def test_get_decision_log_raises_on_malformed_reply(
@@ -1509,7 +1519,7 @@ async def test_spawn_session_seeds_trust_and_registers(
         claude_json=home / "claude.json",
     )
     result = await runtime.spawn_session("do the thing", str(home))
-    assert "spawned session" in result
+    assert result.ok
     assert len(spawn.argvs) == 1
     assert registry.get("s1").cwd == str(home)
     assert registry.get("s1").intent == "do the thing"
@@ -1542,7 +1552,7 @@ async def test_reassign_spawns_a_broker_that_adopts_the_live_session(
     runtime, _ = rt
     record = _bind_session(runtime)
     result = await runtime.reassign_session("s1", "take it from here")
-    assert "reassigned" in result
+    assert result.ok
     # -I isolates the subprocess from the developer's PYTHONPATH and cwd.
     assert spawn.argvs[-1][1:4] == ("-I", "-m", "broker.session")
     config = spawn.config()
@@ -1592,8 +1602,7 @@ async def test_reassign_does_not_resurrect_a_session_ended_during_its_stop_wait(
         assert (await send(runtime, T_SESSION_ENDED, {})).ok
         assert "s1" not in runtime.registry.records
         release.set()
-        with pytest.raises(KeyError):
-            await reassign
+        assert not (await reassign).ok
     finally:
         server.close()
         await server.wait_closed()
@@ -1641,10 +1650,10 @@ async def test_reassign_refuses_a_session_it_only_partly_knows(
     record = runtime.registry.get("s1")
     record.pane_id = "w3:p2"  # no claude session id, no transcript path
     runtime.registry.upsert(record)
-    with pytest.raises(ValueError) as exc:
-        await runtime.reassign_session("s1", "take it from here")
-    assert "claude_session_id" in str(exc.value)
-    assert "transcript_path" in str(exc.value)
+    result = await runtime.reassign_session("s1", "take it from here")
+    assert not result.ok
+    assert "claude_session_id" in result.text
+    assert "transcript_path" in result.text
     # Refusing AFTER the teardown would leave the session with no broker at
     # all — the check has to come first.
     assert spawn.argvs == []
@@ -1663,9 +1672,9 @@ async def test_reassign_refuses_while_a_broker_still_answers(
     stub = StubSession()
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
-        with pytest.raises(RuntimeError) as exc:
-            await runtime.reassign_session("s1", "take it from here")
-        assert "refusing to reassign" in str(exc.value)
+        result = await runtime.reassign_session("s1", "take it from here")
+        assert not result.ok
+        assert "refusing to reassign" in result.text
         # A unix rebind over a live listener succeeds silently; two brokers
         # would then split this pane's hook traffic between them.
         assert spawn.argvs == []
@@ -1699,9 +1708,9 @@ async def test_stop_fails_loud_when_the_broker_outlives_terminate(
     runtime, _ = rt
     _bind_session(runtime)
     await runtime.attach_session("s1")
-    with pytest.raises(RuntimeError) as exc:
-        await runtime.stop_session("s1")
-    assert "still running" in str(exc.value)
+    result = await runtime.stop_session("s1")
+    assert not result.ok
+    assert "still running" in result.text
     assert cast(UnkillableProcess, spawn.procs[-1]).terminated
     # A broker still driving the pane is not reported stopped.
     assert runtime.registry.get("s1").state != SessionState.STOPPED
@@ -1718,7 +1727,7 @@ async def test_attach_spawns_a_resuming_broker(
     record = _bind_session(runtime)
     intent_before = record.intent
     result = await runtime.attach_session("s1")
-    assert "reattached" in result
+    assert result.ok
     config = spawn.config()
     assert config["name"] == "s1"
     # The SAME socket path: BROKER_SOCKET was baked into the pane's
@@ -1796,9 +1805,9 @@ async def test_attach_refuses_while_a_broker_still_answers(
     stub = StubSession()
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
-        with pytest.raises(RuntimeError) as exc:
-            await runtime.attach_session("s1")
-        assert "refusing to attach" in str(exc.value)
+        result = await runtime.attach_session("s1")
+        assert not result.ok
+        assert "refusing to attach" in result.text
         assert spawn.argvs == []
     finally:
         server.close()
@@ -1812,10 +1821,10 @@ async def test_attach_refuses_a_session_it_only_partly_knows(
     record = runtime.registry.get("s1")
     record.pane_id = "w3:p2"  # no claude session id, no transcript path
     runtime.registry.upsert(record)
-    with pytest.raises(ValueError) as exc:
-        await runtime.attach_session("s1")
-    assert "claude_session_id" in str(exc.value)
-    assert "transcript_path" in str(exc.value)
+    result = await runtime.attach_session("s1")
+    assert not result.ok
+    assert "claude_session_id" in result.text
+    assert "transcript_path" in result.text
     assert spawn.argvs == []
     assert runtime.registry.get("s1").state == "driving"
 
@@ -1827,11 +1836,11 @@ async def test_attach_refuses_without_an_approved_prompt(
     record = _bind_session(runtime)
     record.approved_prompt = None
     runtime.registry.upsert(record)
-    with pytest.raises(ValueError) as exc:
-        await runtime.attach_session("s1")
+    result = await runtime.attach_session("s1")
+    assert not result.ok
     # A broker that died before approval left nothing to resume; the refusal
     # names the route that takes a new task.
-    assert "reassign_session" in str(exc.value)
+    assert "reassign_session" in result.text
     assert spawn.argvs == []
 
 
@@ -1843,8 +1852,7 @@ async def test_attach_refuses_a_gone_session(
     # A session whose pane was found gone is removed, not marked: it is no
     # longer a routing candidate, so attach cannot even resolve it.
     runtime.registry.remove("s1")
-    with pytest.raises(KeyError):
-        await runtime.attach_session("s1")
+    assert not (await runtime.attach_session("s1")).ok
     assert spawn.argvs == []
 
 
@@ -2107,7 +2115,7 @@ async def test_list_sessions_folds_the_probed_permission_flag(
     stub = StatusSession(permission_prompt=True)
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
-        listing = await runtime.list_sessions()
+        listing = (await runtime.list_sessions()).text
         # The probe refreshes the flag the listing and the sidebar badge
         # both read, so the two never disagree.
         assert "sitting on a permission prompt" in listing
@@ -2132,7 +2140,7 @@ async def test_reactivate_relays_the_intent_and_supersedes_the_old_one(
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
         result = await runtime.reactivate_session("s1", "now write the docs")
-        assert "reactivated" in result
+        assert result.ok
         assert len(stub.envelopes) == 1
         assert stub.envelopes[0].type == T_REACTIVATE
         assert stub.envelopes[0].payload == {"intent": "now write the docs"}
@@ -2161,7 +2169,8 @@ async def test_reactivate_rejection_surfaces_the_reason_and_changes_nothing(
         result = await runtime.reactivate_session("s1", "displace it")
         # The broker's own reason reaches the developer; "refused" alone would
         # not say which task is still running.
-        assert stub.reason in result
+        assert not result.ok
+        assert stub.reason in result.text
         assert any(stub.reason in m.text for m in posts if isinstance(m, Notice))
         # A refused reactivation must not read as if the new task took.
         reloaded = runtime.registry.get("s1")

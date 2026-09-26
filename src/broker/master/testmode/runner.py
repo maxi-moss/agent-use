@@ -21,6 +21,7 @@ from broker.master.viewmodel import (
     FleetView,
     PaneEscalationArrived,
 )
+from broker.master.escalation_desk import NOT_DISPATCHED
 from broker.master.registry import SessionRecord
 from broker.master.runtime import MasterRuntime
 from broker.master.testmode.fake_broker import FakeBrokerClient, FakeSessionSocket
@@ -418,13 +419,13 @@ async def _run_pane_retract(
 
 
 async def _run_dispatch(index: int, step: DispatchStep, ctx: _Context) -> StepResult:
-    """Dispatch a decision and check whether it was expected to land."""
+    """Dispatch a decision and check it landed, or was refused before any send."""
     outcome = await ctx.runtime.desk.dispatch(step.escalation_id, step.decision)
     if step.expect == "dispatched":
-        passed = outcome.startswith("decision dispatched")
+        passed = outcome.ok
     else:
-        passed = outcome.startswith("decision NOT dispatched")
-    return StepResult(index=index, op=step.op, passed=passed, detail=outcome)
+        passed = outcome.text.startswith(NOT_DISPATCHED)
+    return StepResult(index=index, op=step.op, passed=passed, detail=outcome.text)
 
 
 async def _run_deliver(
@@ -441,17 +442,12 @@ async def _run_deliver(
 async def _run_attach(index: int, step: AttachStep, ctx: _Context) -> StepResult:
     """Attempt to attach to a session and check whether it was refused."""
     ctx.require_seeded(index, step.session)
-    try:
-        detail = await ctx.runtime.attach_session(step.session)
-        outcome = "attached"
-    except (ValueError, RuntimeError) as exc:
-        detail = f"refused: {exc}"
-        outcome = "refused"
+    outcome = await ctx.runtime.attach_session(step.session)
     return StepResult(
         index=index,
         op=step.op,
-        passed=outcome == step.expect,
-        detail=detail,
+        passed=outcome.ok == (step.expect == "attached"),
+        detail=outcome.text,
     )
 
 
@@ -598,16 +594,13 @@ async def _run_assert_unreachable(
 ) -> StepResult:
     """Assert a session reads unreachable and no other seeded session does."""
     ctx.require_seeded(index, step.session)
-    rendered = await ctx.runtime.list_sessions()
-    passed = f"- {step.session}: unreachable" in rendered
-    others = [
+    failures = await ctx.runtime.probe_sessions()
+    others = sorted(
         other
         for other in ctx.seeded
-        if other != step.session
-        and f"- {other}: unreachable" in rendered
-    ]
-    if others:
-        passed = False
+        if other != step.session and failures.get(other) is not None
+    )
+    passed = failures.get(step.session) is not None and not others
     detail = (
         f"{step.session} reads unreachable, others reachable"
         if passed

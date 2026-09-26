@@ -5,7 +5,8 @@ runtime tool call. Every escalation waiting on the developer belongs to
 
 Every broker → master message is ACKED with Response(ok=True/False): session
 brokers deliver upward messages via client.request and fail loud when nothing
-answers.
+answers. Every session-control tool returns a ``ControlResult``: an expected
+refusal, an unknown session included, is ``ok=False``, never an exception.
 """
 
 import asyncio
@@ -19,15 +20,17 @@ from typing import Any, Concatenate
 from pydantic import ValidationError
 
 from broker import decision_log
-from broker.config import BrokerConfig, ResumedTask
+from broker.config import AdoptedSession, BrokerConfig, ResumedTask
 from broker.paths import BrokerPaths
 from broker.master import notifier
 from broker.master.broker_link import (
+    LINK_FAILURES,
     REQUEST_TIMEOUT_S,
     BrokerLink,
     adoption_fields,
     broker_is_listening,
 )
+from broker.master.control_result import ControlResult, refusal
 from broker.master.escalation_desk import EscalationDesk
 from broker.master.fleet_board import FleetBoard
 from broker.master.outcome import SessionOutcome, build_outcome
@@ -94,7 +97,7 @@ _Handler = Callable[[str, Any], Awaitable[NackPayload | None]]
 
 # Failures the on-demand status probe absorbs into a warning line: a session
 # that cannot be reached must not fail the whole listing.
-PROBE_FAILURES = (OSError, ConnectionError, TimeoutError, ValidationError)
+PROBE_FAILURES = (*LINK_FAILURES, ValidationError)
 
 
 def _publishes[**P, R](
@@ -433,7 +436,7 @@ class MasterRuntime:
     # ── session control (LLM-layer tool implementations) ─────────────────────
 
     @_publishes
-    async def spawn_session(self, intent: str, cwd: str) -> str:
+    async def spawn_session(self, intent: str, cwd: str) -> ControlResult:
         """Spawn a session broker for ``cwd`` and register it.
 
         Args:
@@ -442,14 +445,12 @@ class MasterRuntime:
             cwd: Working directory for the session; must already exist.
 
         Returns:
-            A confirmation line naming the session, its pid and its cwd.
-
-        Raises:
-            ValueError: ``cwd`` is not an existing directory.
+            A confirmation naming the session, its pid and its cwd, or the
+            refusal when ``cwd`` is not an existing directory.
         """
         cwd_path = Path(cwd).resolve()
         if not cwd_path.is_dir():
-            raise ValueError(f"cwd does not exist: {cwd}")
+            return refusal(self.emit, f"cwd does not exist: {cwd}")
         name = self.registry.allocate_name()
         record = SessionRecord(
             name=name,
@@ -461,10 +462,12 @@ class MasterRuntime:
         pid = await self.link.spawn(record, adopt=None, resume=None)
         self.registry.upsert(record)
         self.emit(SessionStateChanged(name, record.state))
-        return f"spawned session {name} (pid {pid}) in {cwd_path}"
+        return ControlResult(True, f"spawned session {name} (pid {pid}) in {cwd_path}")
 
     @_publishes
-    async def reassign_session(self, session_id: str, intent: str) -> str:
+    async def reassign_session(
+        self, session_id: str, intent: str
+    ) -> ControlResult:
         """Hand a live session to a freshly spawned broker with a new task.
 
         The Claude session, its pane and its transcript survive; only the
@@ -477,34 +480,47 @@ class MasterRuntime:
             intent: Raw developer intent for the new task.
 
         Returns:
-            A confirmation line naming the session and the new broker's pid.
-
-        Raises:
-            KeyError: The session ended while this call was in flight.
-            ValueError: The registry does not know the session's pane, Claude
-                session id or transcript path.
-            RuntimeError: A broker is still answering on the session socket.
+            A confirmation naming the session and the new broker's pid, or the
+            refusal: the session is unknown or ended while this call was in
+            flight, the registry does not know its pane, Claude session id or
+            transcript path, or a broker still answers on its socket.
         """
-        record = self.registry.get(session_id)
+        record = self._lookup(session_id)
+        if isinstance(record, ControlResult):
+            return record
         # BEFORE anything is torn down: an unreassignable session must not be
         # left with its old broker killed and no replacement.
-        adopt = adoption_fields(record)
-        await self._stop(record)
-        record = self.registry.get(session_id)  # KeyError if ended meanwhile
-        await self.link.require_socket_free(record)
-        record = self.registry.get(session_id)  # KeyError if ended meanwhile
+        adopt = self._adoption(record)
+        if isinstance(adopt, ControlResult):
+            return adopt
+        stopped = await self._stop(record)
+        if not stopped.ok:
+            return stopped
+        record = self._lookup(session_id)
+        if isinstance(record, ControlResult):
+            return record
+        busy = await self.link.require_socket_free(record)
+        if busy is not None:
+            return refusal(self.emit, busy)
+        record = self._lookup(session_id)
+        if isinstance(record, ControlResult):
+            return record
         record.intent = intent
         record.approved_prompt = None  # superseded; set again on approval
         record.title = ""
         record.budget_count = 0
         pid = await self.link.spawn(record, adopt=adopt, resume=None)
-        record = self.registry.get(session_id)  # KeyError if ended meanwhile
+        record = self._lookup(session_id)
+        if isinstance(record, ControlResult):
+            return record
         self.registry.upsert(record)
         self._set_state(session_id, SessionState.SPAWNING)
-        return f"session {session_id} reassigned to a new broker (pid {pid})"
+        return ControlResult(
+            True, f"session {session_id} reassigned to a new broker (pid {pid})"
+        )
 
     @_publishes
-    async def attach_session(self, session_id: str) -> str:
+    async def attach_session(self, session_id: str) -> ControlResult:
         """Bind a fresh broker to a session whose own broker is gone.
 
         A pure resume: the persisted approved prompt and budget count carry
@@ -517,54 +533,64 @@ class MasterRuntime:
             session_id: Registry name of the session to reattach.
 
         Returns:
-            A confirmation line naming the session and the new broker's pid.
-
-        Raises:
-            KeyError: No such session — a session whose pane was found gone is
-                removed from the registry, so there is nothing left to attach.
-            ValueError: The registry only partly knows the session, or no
-                approved prompt was ever persisted for it.
-            RuntimeError: A broker is still answering on the session socket.
+            A confirmation naming the session and the new broker's pid, or the
+            refusal: no such session (a session whose pane was found gone is
+            removed from the registry, so there is nothing left to attach), the
+            registry only partly knows it, no approved prompt was ever
+            persisted for it, or a broker still answers on its socket.
         """
-        record = self.registry.get(session_id)  # KeyError if gone or unknown
+        record = self._lookup(session_id)
+        if isinstance(record, ControlResult):
+            return record
         # Every refusal fires before any side effect.
-        adopt = adoption_fields(record)
+        adopt = self._adoption(record)
+        if isinstance(adopt, ControlResult):
+            return adopt
         if record.approved_prompt is None:
-            raise ValueError(
+            return refusal(
+                self.emit,
                 f"session {session_id} has no persisted approved prompt to "
                 "resume — its broker died before a prompt was approved. Use "
-                "reassign_session with a new task instead."
+                "reassign_session with a new task instead.",
             )
         # One probe, never a poll: nothing was stopped, so waiting cannot
         # free the socket. Anything alive or ambiguous refuses.
         if await broker_is_listening(Path(record.socket_path)):
-            raise RuntimeError(
+            return refusal(
+                self.emit,
                 f"session {session_id}: a broker is still answering on "
-                f"{record.socket_path} — refusing to attach"
+                f"{record.socket_path} — refusing to attach",
             )
         # ``record`` stays bound to the same registry object throughout (a
-        # concurrent upsert mutates it in place); each re-`get` below is only
+        # concurrent upsert mutates it in place); each lookup below is only
         # a liveness check, so the ``approved_prompt`` narrowing above holds.
-        self.registry.get(session_id)  # KeyError if ended meanwhile
+        if isinstance(gone := self._lookup(session_id), ControlResult):
+            return gone
         # The dead broker's stranded escalations, of both kinds: a decision
         # dispatched to one would be discarded, and a live entry would refuse
         # the resumed broker's first raise. It re-raises if the situation
         # still holds.
         await self.desk.retract_stranded(session_id)
-        self.registry.get(session_id)  # KeyError if ended meanwhile
+        if isinstance(gone := self._lookup(session_id), ControlResult):
+            return gone
         self.desk.retract_stranded_panes(session_id)
         resume = ResumedTask(
             approved_prompt=record.approved_prompt,
             completed=record.state == SessionState.COMPLETED,
         )
         pid = await self.link.spawn(record, adopt=adopt, resume=resume)
-        self.registry.get(session_id)  # KeyError if ended meanwhile
+        if isinstance(gone := self._lookup(session_id), ControlResult):
+            return gone
         self.registry.upsert(record)
         self._set_state(session_id, SessionState.SPAWNING)
-        return f"session {session_id} reattached to a new broker (pid {pid})"
+        return ControlResult(
+            True, f"session {session_id} reattached to a new broker (pid {pid})"
+        )
 
     @_publishes
-    async def reactivate_session(self, session_id: str, intent: str) -> str:
+    async def reactivate_session(
+        self, session_id: str, intent: str
+    ) -> ControlResult:
         """Give a completed session a new task without replacing its broker.
 
         Args:
@@ -572,28 +598,31 @@ class MasterRuntime:
             intent: Raw developer intent for the new task.
 
         Returns:
-            A confirmation line, or a rejection when the session is not
-            completed and so has a task it is still driving.
+            A confirmation, or the refusal: the session is unknown, never
+            replied, or is not completed and so has a task it is still driving.
         """
-        record = self.registry.get(session_id)
+        record = self._lookup(session_id)
+        if isinstance(record, ControlResult):
+            return record
         rejected = await self.link.deliver(
             record,
             ReactivatePayload(intent=intent),
             rejection=f"session {session_id} refused reactivation",
         )
         if rejected is not None:
-            self.emit(Notice(rejected))
-            return rejected
+            return refusal(self.emit, rejected)
         record.intent = intent
         record.approved_prompt = None  # superseded; set again on approval
         record.title = ""
         self.registry.upsert(record)
-        return f"session {session_id} reactivated — grounding the new task"
+        return ControlResult(
+            True, f"session {session_id} reactivated — grounding the new task"
+        )
 
     @_publishes
     async def approve_prompt(
         self, proposal_id: str, prompt: str, title: str
-    ) -> str:
+    ) -> ControlResult:
         """Approve a pending prompt proposal and send it to its session.
 
         Args:
@@ -603,15 +632,18 @@ class MasterRuntime:
             title: Short task label shown next to the session in the fleet.
 
         Returns:
-            An outcome line: approved, unknown proposal, or rejected as stale.
+            Approved, or the refusal: an unknown proposal or session, no reply,
+            or rejected as stale.
         """
         pending = self.board.proposals.get(proposal_id)
         if pending is None:
-            msg = f"unknown proposal {proposal_id!r} — nothing approved"
-            self.emit(Notice(msg))
-            return msg
+            return refusal(
+                self.emit, f"unknown proposal {proposal_id!r} — nothing approved"
+            )
         name = pending.session_id
-        record = self.registry.get(name)
+        record = self._lookup(name)
+        if isinstance(record, ControlResult):
+            return record
         rejected = await self.link.deliver(
             record,
             ApprovePromptPayload(proposal_id=proposal_id, prompt=prompt),
@@ -621,16 +653,15 @@ class MasterRuntime:
             ),
         )
         if rejected is not None:
-            self.emit(Notice(rejected))
-            return rejected
+            return refusal(self.emit, rejected)
         del self.board.proposals[proposal_id]
         record.approved_prompt = prompt  # the AUTHORITATIVE intent
         record.title = title
         self.registry.upsert(record)
-        return f"prompt approved for session {name}"
+        return ControlResult(True, f"prompt approved for session {name}")
 
     @_publishes
-    async def send_prompt(self, session_id: str, text: str) -> str:
+    async def send_prompt(self, session_id: str, text: str) -> ControlResult:
         """Send a developer prompt straight to a session.
 
         Args:
@@ -638,19 +669,21 @@ class MasterRuntime:
             text: Prompt text, sent verbatim.
 
         Returns:
-            A confirmation that the session accepted the prompt, or a
-            rejection carrying the session's reason if it NACKed.
+            A confirmation that the session accepted the prompt, or the
+            refusal: an unknown session, no reply, or the session's reason if
+            it NACKed.
         """
-        record = self.registry.get(session_id)
+        record = self._lookup(session_id)
+        if isinstance(record, ControlResult):
+            return record
         rejected = await self.link.deliver(
             record,
             SendPromptPayload(text=text),
             rejection=f"session {session_id} rejected the prompt",
         )
         if rejected is not None:
-            self.emit(Notice(rejected))
-            return rejected
-        return f"prompt accepted by session {session_id}"
+            return refusal(self.emit, rejected)
+        return ControlResult(True, f"prompt accepted by session {session_id}")
 
     async def probe_status(self, session_id: str) -> StatusPayload:
         """Ask a session for its status and record the state it reports.
@@ -699,57 +732,78 @@ class MasterRuntime:
         )
 
     @_publishes
-    async def get_decision_log(self, session_id: str) -> str:
+    async def get_decision_log(self, session_id: str) -> ControlResult:
         """Fetch a session's decision log as text.
 
         Args:
             session_id: Registry name of the session to query.
 
         Returns:
-            The log text verbatim.
+            The log text verbatim, or the refusal: an unknown session, no
+            reply, or a NACK.
 
         Raises:
             ValidationError: The session's reply was not a decision log.
         """
-        record = self.registry.get(session_id)
-        resp = await self.link.request(
-            record, DecisionLogRequestPayload(), timeout_s=REQUEST_TIMEOUT_S
+        record = self._lookup(session_id)
+        if isinstance(record, ControlResult):
+            return record
+        reply = await self.link.query(
+            record,
+            DecisionLogRequestPayload(),
+            timeout_s=REQUEST_TIMEOUT_S,
+            rejection=f"session {session_id} refused its decision log",
         )
-        return DecisionLogPayload.model_validate(resp.payload).text
+        if isinstance(reply, str):
+            return refusal(self.emit, reply)
+        return ControlResult(
+            True, DecisionLogPayload.model_validate(reply.payload).text
+        )
 
     @_publishes
-    async def get_permission_log(self, session_id: str) -> str:
+    async def get_permission_log(self, session_id: str) -> ControlResult:
         """Fetch a session's permission log as text.
 
         Args:
             session_id: Registry name of the session to query.
 
         Returns:
-            The log text verbatim.
+            The log text verbatim, or the refusal: an unknown session, no
+            reply, or a NACK.
 
         Raises:
             ValidationError: The session's reply was not a permission log.
         """
-        record = self.registry.get(session_id)
-        resp = await self.link.request(
-            record, PermissionLogRequestPayload(), timeout_s=REQUEST_TIMEOUT_S
+        record = self._lookup(session_id)
+        if isinstance(record, ControlResult):
+            return record
+        reply = await self.link.query(
+            record,
+            PermissionLogRequestPayload(),
+            timeout_s=REQUEST_TIMEOUT_S,
+            rejection=f"session {session_id} refused its permission log",
         )
-        return PermissionLogPayload.model_validate(resp.payload).text
+        if isinstance(reply, str):
+            return refusal(self.emit, reply)
+        return ControlResult(
+            True, PermissionLogPayload.model_validate(reply.payload).text
+        )
 
     @_publishes
-    async def stop_session(self, session_id: str) -> str:
+    async def stop_session(self, session_id: str) -> ControlResult:
         """Shut a session broker down and mark it stopped.
 
         Args:
             session_id: Registry name of the session to stop.
 
         Returns:
-            A confirmation line naming the session.
-
-        Raises:
-            RuntimeError: The broker process outlived its terminate.
+            A confirmation naming the session, or the refusal: an unknown
+            session, or a broker process that outlived its terminate.
         """
-        return await self._stop(self.registry.get(session_id))
+        record = self._lookup(session_id)
+        if isinstance(record, ControlResult):
+            return record
+        return await self._stop(record)
 
     def registry_summary(self) -> str:
         """Render the registry summary for the LLM context and ``list_sessions``.
@@ -771,7 +825,24 @@ class MasterRuntime:
         return "\n".join(lines)
 
     @_publishes
-    async def list_sessions(self) -> str:
+    async def probe_sessions(self) -> dict[str, Exception | None]:
+        """Probe every session for its live status.
+
+        Returns:
+            Each session's probe failure, or ``None`` for a session that
+            answered, in registry order.
+        """
+        failures: dict[str, Exception | None] = {}
+        for name in self.registry.names_in_order():
+            try:
+                await self.probe_status(name)
+            except PROBE_FAILURES as exc:
+                failures[name] = exc
+            else:
+                failures[name] = None
+        return failures
+
+    async def list_sessions(self) -> ControlResult:
         """Render the registry summary, probing each session for a live prompt.
 
         The prompt flag is refreshed by the probe and never enters the
@@ -783,14 +854,12 @@ class MasterRuntime:
             could not be reached.
         """
         lines = [self.registry_summary()]
-        for name in self.registry.names_in_order():
-            try:
-                await self.probe_status(name)
-            except PROBE_FAILURES as exc:
+        for name, failure in (await self.probe_sessions()).items():
+            if failure is not None:
                 # An unreachable session costs one line of the listing, never
                 # the whole listing.
                 lines.append(
-                    f"- {name}: unreachable ({exc!r}) — could not read "
+                    f"- {name}: unreachable ({failure!r}) — could not read "
                     "whether it is sitting on a permission prompt"
                 )
                 continue
@@ -799,26 +868,42 @@ class MasterRuntime:
                     f"- {name}: sitting on a permission prompt, answered in "
                     f"pane {self.desk.pane_of(name)}"
                 )
-        return "\n".join(lines)
+        return ControlResult(True, "\n".join(lines))
 
     # ── internals ────────────────────────────────────────────────────────────
 
-    async def _stop(self, record: SessionRecord) -> str:
+    def _lookup(self, session_id: str) -> SessionRecord | ControlResult:
+        """Return a session's record, or the refusal naming it unknown."""
+        record = self.registry.records.get(session_id)
+        if record is None:
+            return refusal(
+                self.emit, f"session {session_id!r} is not in the registry"
+            )
+        return record
+
+    def _adoption(self, record: SessionRecord) -> AdoptedSession | ControlResult:
+        """Return what a replacement broker adopts, or the refusal naming the gaps."""
+        try:
+            return adoption_fields(record)
+        except ValueError as exc:
+            return refusal(self.emit, str(exc))
+
+    async def _stop(self, record: SessionRecord) -> ControlResult:
         """Shut a session's broker down and mark the session stopped.
 
         Args:
             record: Registry record of the session to stop.
 
         Returns:
-            A confirmation line naming the session.
-
-        Raises:
-            RuntimeError: The broker process outlived its terminate.
+            A confirmation naming the session, or the refusal: a broker process
+            that outlived its terminate.
         """
-        await self.link.stop(record)
+        still_running = await self.link.stop(record)
+        if still_running is not None:
+            return refusal(self.emit, still_running)
         self.desk.session_stopped(record.name)
         self._set_state(record.name, SessionState.STOPPED)
-        return f"session {record.name} stopped"
+        return ControlResult(True, f"session {record.name} stopped")
 
     async def _on_session_ended(
         self, session_id: str, p: SessionEndedPayload

@@ -6,10 +6,13 @@ announces, dispatches, clarifies, resolves and retracts both, and renders
 what is waiting. It never publishes the fleet view: the runtime does that
 once per routed message or runtime tool call. The desk's own dispatch and
 clarify tools change nothing the fleet view shows, so they publish nothing.
+Its developer-requested actions return a ``ControlResult``, an expected
+refusal included.
 """
 
 from broker.master import notifier
 from broker.master.broker_link import BrokerLink
+from broker.master.control_result import ControlResult, refusal
 from broker.master.pane_escalations import PaneEscalations
 from broker.master.payload_render import (
     PANE_UNKNOWN,
@@ -37,12 +40,14 @@ from broker.protocol.schemas import (
     NackPayload,
     PaneEscalationPayload,
     PaneRetractPayload,
-    parse_nack,
 )
 
 # The broker runs an LLM call before it can reply, so this is far longer than
 # REQUEST_TIMEOUT_S and must exceed the broker's own CLARIFY_TIMEOUT_S.
 CLARIFY_ESCALATION_TIMEOUT_S = 60.0
+
+# Opens every dispatch refusal decided before anything was sent to the session.
+NOT_DISPATCHED = "decision NOT dispatched"
 
 
 class EscalationDesk:
@@ -261,7 +266,7 @@ class EscalationDesk:
 
     # ── answering ────────────────────────────────────────────────────────────
 
-    async def dispatch(self, escalation_id: str, decision: str) -> str:
+    async def dispatch(self, escalation_id: str, decision: str) -> ControlResult:
         """Dispatch a decision to the session whose escalation it answers.
 
         Args:
@@ -269,13 +274,12 @@ class EscalationDesk:
             decision: The developer's decision, sent verbatim.
 
         Returns:
-            An outcome line: dispatched to the named session, a refusal
-            naming the escalation that is no longer live, a refusal naming the
-            pane when the escalation is a pane escalation, a refusal when a
-            decision is already in flight for it, or a rejection if the session
-            NACKed delivery.
+            Dispatched to the named session, or refused: the escalation is no
+            longer live, it is a pane escalation (naming the pane), a decision
+            is already in flight for it, or the session NACKed or never
+            replied.
         """
-        refused = self._refuse_if_pane(escalation_id, "decision NOT dispatched")
+        refused = self._refuse_if_pane(escalation_id, NOT_DISPATCHED)
         if refused is not None:
             return refused
         # Liveness is checked THE INSTANT before the write, not at
@@ -283,22 +287,20 @@ class EscalationDesk:
         # can produce.
         active = self.queue.active
         if active is None or active.escalation_id != escalation_id:
-            msg = (
-                f"decision NOT dispatched — escalation {escalation_id} is "
-                "no longer live"
+            return refusal(
+                self.emit,
+                f"{NOT_DISPATCHED} — escalation {escalation_id} is "
+                "no longer live",
             )
-            self.emit(Notice(msg))
-            return msg
         inflight = self.queue.inflight
         if inflight is not None:
             # A decision is already on its way to the pane; a second would
             # double-submit the same escalation.
-            msg = (
-                f"decision NOT dispatched — a decision for escalation "
-                f"{inflight} is already being delivered"
+            return refusal(
+                self.emit,
+                f"{NOT_DISPATCHED} — a decision for escalation "
+                f"{inflight} is already being delivered",
             )
-            self.emit(Notice(msg))
-            return msg
         record = self.registry.get(active.session_id)
         # The ACK only confirms the broker accepted the decision; resolution
         # waits for T_DECISION_DELIVERED, and until then no second decision
@@ -321,9 +323,8 @@ class EscalationDesk:
             raise
         if rejected is not None:
             self.queue.clear_inflight(escalation_id)
-            self.emit(Notice(rejected))
-            return rejected
-        return f"decision dispatched to session {record.name}"
+            return refusal(self.emit, rejected)
+        return ControlResult(True, f"decision dispatched to session {record.name}")
 
     async def delivered(
         self, session_id: str, p: DecisionDeliveredPayload
@@ -381,7 +382,7 @@ class EscalationDesk:
         await self.surface_head()
         return None
 
-    async def clarify(self, escalation_id: str, question: str) -> str:
+    async def clarify(self, escalation_id: str, question: str) -> ControlResult:
         """Relay a read-only question about the live escalation to its broker.
 
         The escalation stays pending. The broker's answer is shown to the
@@ -393,42 +394,44 @@ class EscalationDesk:
             question: The developer's question, sent verbatim.
 
         Returns:
-            An acknowledgement line, or a refusal naming why no answer was
-            obtained (not the head, a pane escalation, or the broker declined).
+            An acknowledgement, or the refusal naming why no answer was
+            obtained: not the head, a pane escalation, or the broker declined
+            or never replied.
         """
         refused = self._refuse_if_pane(escalation_id, "question NOT sent")
         if refused is not None:
             return refused
         active = self.queue.active
         if active is None or active.escalation_id != escalation_id:
-            msg = f"question NOT sent — escalation {escalation_id} is no longer live"
-            self.emit(Notice(msg))
-            return msg
+            return refusal(
+                self.emit,
+                f"question NOT sent — escalation {escalation_id} is no longer live",
+            )
         record = self.registry.get(active.session_id)
-        resp = await self.link.request(
+        reply = await self.link.query(
             record,
             ClarifyEscalationRequestPayload(
                 escalation_id=escalation_id, question=question
             ),
             timeout_s=CLARIFY_ESCALATION_TIMEOUT_S,
-        )
-        if not resp.ok:
-            reason = parse_nack(resp).error
-            msg = (
+            rejection=(
                 f"no clarification from session {record.name} for escalation "
                 f"{escalation_id}"
-            )
-            if reason:
-                msg = f"{msg}: {reason}"
-            self.emit(Notice(msg))
-            return msg
-        answer = ClarifyEscalationReplyPayload.model_validate(resp.payload).answer
+            ),
+        )
+        if isinstance(reply, str):
+            return refusal(self.emit, reply)
+        answer = ClarifyEscalationReplyPayload.model_validate(reply.payload).answer
         self.emit(
             Notice(f"Session {record.name} on escalation {escalation_id}:\n\n{answer}")
         )
-        return f"clarification from session {record.name} shown to the developer"
+        return ControlResult(
+            True, f"clarification from session {record.name} shown to the developer"
+        )
 
-    def _refuse_if_pane(self, escalation_id: str, lead: str) -> str | None:
+    def _refuse_if_pane(
+        self, escalation_id: str, lead: str
+    ) -> ControlResult | None:
         """Refuse a master action aimed at a pane escalation, naming the pane.
 
         Args:
@@ -447,13 +450,12 @@ class EscalationDesk:
             if prompt.kind == PaneKind.PERMISSION
             else "an AskUserQuestion menu"
         )
-        msg = (
+        return refusal(
+            self.emit,
             f"{lead} — escalation {escalation_id} is {what} in session "
             f"{prompt.session_id}. The developer answers it in pane "
-            f"{self.pane_of(prompt.session_id)}."
+            f"{self.pane_of(prompt.session_id)}.",
         )
-        self.emit(Notice(msg))
-        return msg
 
     # ── read model ───────────────────────────────────────────────────────────
 

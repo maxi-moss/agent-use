@@ -1,5 +1,8 @@
 """The master's link to each session broker: the processes it spawned and
 every socket call it makes to them.
+
+A refused call returns its refusal as text: a NACK, no reply, or a broker that
+will not go. ``request`` returns the raw reply and raises on no reply.
 """
 
 import asyncio
@@ -27,6 +30,9 @@ REQUEST_TIMEOUT_S = 10.0
 STOP_WAIT_S = 10.0
 SOCKET_POLL_S = 0.1
 SOCKET_PROBE_TIMEOUT_S = 2.0
+
+# Every way a socket call ends without a reply line.
+LINK_FAILURES = (OSError, ConnectionError, TimeoutError)
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +211,7 @@ class BrokerLink:
         except Exception:
             logger.exception("session %s: broker exit handler failed", name)
 
-    async def stop(self, record: SessionRecord) -> None:
+    async def stop(self, record: SessionRecord) -> str | None:
         """Ask a session's broker to shut down and wait for the process to exit.
 
         Only a process this master spawned is waited on or terminated.
@@ -213,17 +219,17 @@ class BrokerLink:
         Args:
             record: Registry record of the session to stop.
 
-        Raises:
-            RuntimeError: The spawned process was still running
-                ``STOP_WAIT_S`` after it was terminated.
+        Returns:
+            ``None`` once stopped, otherwise the refusal: the spawned process
+            was still running ``STOP_WAIT_S`` after it was terminated.
         """
         proc = self._procs.get(record.name)
         if proc is not None:
             self._stopping.add(proc)
-        with contextlib.suppress(ConnectionError, TimeoutError, OSError):
+        with contextlib.suppress(*LINK_FAILURES):
             await self.request(record, ShutdownPayload(), timeout_s=REQUEST_TIMEOUT_S)
         if proc is None:
-            return
+            return None
         try:
             async with asyncio.timeout(STOP_WAIT_S):
                 await proc.wait()
@@ -233,12 +239,13 @@ class BrokerLink:
                 async with asyncio.timeout(STOP_WAIT_S):
                     await proc.wait()
             except TimeoutError:
-                raise RuntimeError(
+                return (
                     f"session {record.name}: broker pid {proc.pid} still "
                     f"running {STOP_WAIT_S:.0f} s after terminate"
-                ) from None
+                )
         if self._procs.get(record.name) is proc:
             del self._procs[record.name]
+        return None
 
     def forget(self, name: str) -> None:
         """Stop tracking a session's broker process without waiting on it."""
@@ -253,8 +260,8 @@ class BrokerLink:
             watcher.cancel()
         await asyncio.wait(watchers)
 
-    async def require_socket_free(self, record: SessionRecord) -> None:
-        """Block until nothing answers on a session's socket.
+    async def require_socket_free(self, record: SessionRecord) -> str | None:
+        """Wait until nothing answers on a session's socket.
 
         The replacement broker binds the same path, and a unix socket rebind
         over a live listener succeeds silently — two brokers would then split
@@ -263,24 +270,25 @@ class BrokerLink:
         Args:
             record: Registry record of the session being reassigned.
 
-        Raises:
-            RuntimeError: A broker was still accepting connections after
-                ``STOP_WAIT_S``.
+        Returns:
+            ``None`` once the socket is free, otherwise the refusal: a broker
+            was still accepting connections after ``STOP_WAIT_S``.
         """
         path = Path(record.socket_path)
         deadline = asyncio.get_running_loop().time() + STOP_WAIT_S
         while await broker_is_listening(path):
             if asyncio.get_running_loop().time() >= deadline:
-                raise RuntimeError(
+                return (
                     f"session {record.name}: a broker is still serving "
                     f"{path} after {STOP_WAIT_S:.0f} s — refusing to reassign"
                 )
             await asyncio.sleep(SOCKET_POLL_S)
+        return None
 
     async def deliver(
         self, record: SessionRecord, payload: WireMessage, *, rejection: str
     ) -> str | None:
-        """Send ``payload`` to a session's broker, reporting a NACK.
+        """Send ``payload`` to a session's broker, reporting a refusal.
 
         Args:
             record: Registry record of the target session.
@@ -288,12 +296,50 @@ class BrokerLink:
             rejection: Message returned when the session NACKs.
 
         Returns:
-            ``None`` when the session ACKed, otherwise ``rejection``, with the
-            broker's own reason appended when it sent one.
+            ``None`` when the session ACKed, otherwise the refusal ``query``
+            returns.
         """
-        resp = await self.request(record, payload, timeout_s=REQUEST_TIMEOUT_S)
+        reply = await self.query(
+            record, payload, timeout_s=REQUEST_TIMEOUT_S, rejection=rejection
+        )
+        return reply if isinstance(reply, str) else None
+
+    async def query(
+        self,
+        record: SessionRecord,
+        payload: WireMessage,
+        *,
+        timeout_s: float,
+        rejection: str,
+    ) -> Response | str:
+        """Send ``payload`` to a session's broker and return its ACK or the refusal.
+
+        Args:
+            record: Registry record of the target session.
+            payload: Message to send.
+            timeout_s: Hard deadline for the whole exchange.
+            rejection: Message returned when the session NACKs.
+
+        Returns:
+            The ACK; on a NACK, ``rejection`` with the broker's own reason
+            appended when it sent one; on no reply, a line naming the failure
+            and whether the message may have reached the session.
+        """
+        try:
+            resp = await self.request(record, payload, timeout_s=timeout_s)
+        except (FileNotFoundError, ConnectionRefusedError) as exc:
+            return (
+                f"session {record.name} did not reply to "
+                f"{payload.MESSAGE_TYPE}: {exc!r} — nothing was sent"
+            )
+        except LINK_FAILURES as exc:
+            return (
+                f"session {record.name} did not reply to "
+                f"{payload.MESSAGE_TYPE}: {exc!r} — it may have received it; "
+                "do not resend without the developer"
+            )
         if resp.ok:
-            return None
+            return resp
         reason = parse_nack(resp).error
         if reason:
             rejection = f"{rejection}: {reason}"

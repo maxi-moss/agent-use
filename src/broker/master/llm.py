@@ -3,7 +3,8 @@
 Structural thin-master rule: the escalation block enters the context as the
 runtime-rendered string, byte-identical — this layer never sees a payload it
 could re-summarise. tool_choice is auto (never forced): the loop exits on a
-text-only response, and forced choice would suppress that text.
+text-only response, and forced choice would suppress that text. A refused
+tool call reaches the model as an ``is_error`` tool result and the turn goes on.
 
 Class names, field names, `Field` descriptions and docstrings of these models
 are sent to the model.
@@ -37,6 +38,7 @@ from broker.llm import (
     call_turn,
     strict_tool,
 )
+from broker.master.control_result import ControlResult
 from broker.master.payload_render import render_proposal
 from broker.master.runtime import MasterRuntime
 from broker.protocol.constants import PaneKind
@@ -133,7 +135,7 @@ class MasterTool[M: BaseModel]:
     name: str
     description: str
     model: type[M]
-    handler: Callable[[MasterRuntime, M], Awaitable[str]]
+    handler: Callable[[MasterRuntime, M], Awaitable[ControlResult]]
     activity: str  # dashboard phrase shown while the tool runs
 
 
@@ -355,15 +357,17 @@ class MasterLLM:
                     on_activity(tool.activity)
                 outcome = await self._execute(call)
                 self.log.append(
-                    "tool", f"{call.name}({json.dumps(call.input)}) -> {outcome}"
+                    "tool",
+                    f"{call.name}({json.dumps(call.input)}) -> {outcome.text}",
                 )
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": ids[i],
-                        "content": outcome,
-                    }
-                )
+                tool_result: dict[str, Any] = {
+                    "type": "tool_result",
+                    "tool_use_id": ids[i],
+                    "content": outcome.text,
+                }
+                if not outcome.ok:
+                    tool_result["is_error"] = True
+                tool_results.append(tool_result)
             messages.append(
                 cast(MessageParam, {"role": "user", "content": tool_results})
             )
@@ -438,7 +442,7 @@ class MasterLLM:
         )
         return [cast(MessageParam, {"role": "user", "content": blocks})]
 
-    async def _execute(self, call: ToolCall) -> str:
+    async def _execute(self, call: ToolCall) -> ControlResult:
         tool = _BY_NAME.get(call.name)
         if tool is None:
             raise LLMCallError(f"unknown master tool {call.name!r}")
