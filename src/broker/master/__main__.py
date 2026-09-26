@@ -33,7 +33,8 @@ from broker.master.llm import MasterLLM, bind_call_turn
 from broker.master.pane_escalations import PaneEscalations, PaneStoreError
 from broker.master.queue import EscalationQueue, QueueError
 from broker.master.registry import Registry, RegistryError
-from broker.master.runtime import MasterRuntime, reconcile_registry
+from broker.master.registry_reconcile import reconcile_registry
+from broker.master.runtime import MasterRuntime
 from broker.master.testmode import InjectCommand, test_mode_llm_call
 from broker.master.tui.app import BrokerMasterApp
 from broker.master.viewmodel import Notice, ViewEvent, ViewEventRelay
