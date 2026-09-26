@@ -29,15 +29,13 @@ from broker.protocol.constants import (
     DECISION_ALLOW,
     DECISION_ESCALATED,
     NackCode,
-    T_PANE_ESCALATION,
-    T_PANE_RETRACT,
 )
 from broker.protocol.schemas import (
-    Envelope,
     PaneRetractPayload,
     PermissionEscalationPayload,
     PermissionSuggestion,
     Response,
+    WireMessage,
     parse_nack,
 )
 
@@ -344,9 +342,7 @@ class PermissionModule:
         Args:
             payload: The escalation to raise.
         """
-        response = await self._send(
-            T_PANE_ESCALATION, payload.model_dump(), payload.escalation_id
-        )
+        response = await self._send(payload, payload.escalation_id)
         if response is not None and response.ok:
             return
         try:
@@ -375,36 +371,33 @@ class PermissionModule:
         Args:
             payload: The retraction to send.
         """
-        await self._send(
-            T_PANE_RETRACT, payload.model_dump(), payload.escalation_id
-        )
+        await self._send(payload, payload.escalation_id)
 
     async def _send(
-        self, msg_type: str, payload: dict[str, Any], escalation_id: str
+        self, payload: WireMessage, escalation_id: str
     ) -> Response | None:
-        """Send one envelope to the master and wait for its reply.
+        """Send one message to the master and wait for its reply.
 
         Args:
-            msg_type: Protocol message type constant.
-            payload: Already-serialized payload for that type.
+            payload: Message to send; its ``MESSAGE_TYPE`` becomes the
+                envelope type.
             escalation_id: Escalation the send concerns, for the diagnostic log.
 
         Returns:
             The master's reply, or ``None`` when the master was unreachable.
         """
-        env = Envelope(
-            id=uuid.uuid4().hex,
-            type=msg_type,
-            session_id=self.session_id,
-            payload=payload,
-        )
         try:
-            return await client.request(
-                self.master_socket_path, env, timeout_s=MASTER_TIMEOUT_S
+            return await client.send(
+                self.master_socket_path,
+                payload,
+                session_id=self.session_id,
+                timeout_s=MASTER_TIMEOUT_S,
             )
         except Exception:
             logger.exception(
-                "could not send %s for escalation %s", msg_type, escalation_id
+                "could not send %s for escalation %s",
+                payload.MESSAGE_TYPE,
+                escalation_id,
             )
             return None
 
