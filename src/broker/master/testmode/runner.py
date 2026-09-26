@@ -147,7 +147,6 @@ def _permission_payload(step: PermissionEscalate) -> PermissionEscalationPayload
         tool_input=step.tool_input,
         task_intent=f"task intent for {eid}",
         reason=f"reason for {eid}",
-        raised_at=step.raised_at,
     )
 
 

@@ -29,7 +29,6 @@ def permission_pane(
             "tool_input": {"command": "git push"},
             "task_intent": "intent",
             "reason": "reason",
-            "raised_at": "2026-07-29T12:00:00+00:00",
             "permission_suggestions": [],
         }
     )

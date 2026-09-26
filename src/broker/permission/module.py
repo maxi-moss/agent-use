@@ -15,7 +15,6 @@ import time
 import uuid
 from collections.abc import Coroutine
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -278,7 +277,6 @@ class PermissionModule:
             tool_input=tool_input,
             task_intent=self.intent,
             reason=reason,
-            raised_at=datetime.now(UTC).isoformat(timespec="seconds"),
             permission_suggestions=suggestions,
         )
         superseded = self._live

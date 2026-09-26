@@ -30,7 +30,6 @@ COMPLETE_PERMISSION_ESCALATION: dict[str, Any] = {
     "tool_input": {"command": "git push"},
     "task_intent": "ship the parser fix",
     "reason": "publishes work outside the working tree",
-    "raised_at": "2026-07-29T12:00:00Z",
 }
 
 

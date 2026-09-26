@@ -62,20 +62,14 @@ def test_permission_pane_rendered_names_pane_and_offers_no_dispatch() -> None:
         "tool_input": {"command": "command-value"},
         "task_intent": "task-intent-value",
         "reason": "reason-value",
-        "raised_at": "2026-07-29T12:00:00+00:00",
         "permission_suggestions": [{"type": "setMode", "mode": "mode-value"}],
     }
     rendered = render_permission_escalation(
         PermissionEscalationPayload.model_validate(payload), "w3:p2"
     )
     # Every field the developer judges the prompt on appears byte-for-byte.
-    # raised_at is the resolution baseline, not something they read.
-    judged = {k: v for k, v in payload.items() if k != "raised_at"}
-    for value in _leaf_values(judged):
+    for value in _leaf_values(payload):
         assert value in rendered
-    # No timestamp reaches the block: it is carried into the master's LLM
-    # context, where a clock reading is only ever something to reason from.
-    assert payload["raised_at"] not in rendered
     assert "w3:p2" in rendered  # the pane the native prompt is waiting in
     assert "cannot be answered here" in rendered
     assert "dispatch" not in rendered.lower()  # no affordance to answer it here

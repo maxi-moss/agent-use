@@ -273,7 +273,6 @@ def permission_pane_dict(
         "tool_input": {"command": "command-value"},
         "task_intent": "task-intent-value",
         "reason": "reason-value",
-        "raised_at": "2026-07-29T12:00:00+00:00",
         "permission_suggestions": [
             {"type": "setMode", "mode": "mode-value"}
         ],

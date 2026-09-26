@@ -95,7 +95,6 @@ def _permission_pane(
             "tool_input": {"command": "ls"},
             "task_intent": "intent",
             "reason": "reason",
-            "raised_at": "2026-08-06T12:00:00+00:00",
         }
     )
 

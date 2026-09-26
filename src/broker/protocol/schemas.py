@@ -368,7 +368,6 @@ class PermissionEscalationPayload(WireMessage):
     tool_input: dict[str, Any]
     task_intent: str
     reason: str
-    raised_at: str  # ISO timestamp; every resolution signal is dated against it
     permission_suggestions: list[PermissionSuggestion] = Field(
         default_factory=list[PermissionSuggestion]
     )

@@ -58,7 +58,6 @@ class PermissionEscalate(BaseModel):
     escalation_id: str
     tool_name: str
     tool_input: dict[str, Any]
-    raised_at: str
     expect: str = "ack"
 
 
