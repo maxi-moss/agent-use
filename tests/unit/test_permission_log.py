@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 
-from broker.permission.permission_log import append, render_log
+from broker.permission.permission_log import append, render_permission_log
 
 
 def test_append_render_round_trip(tmp_path: Path) -> None:
@@ -33,7 +33,7 @@ def test_append_render_round_trip(tmp_path: Path) -> None:
     assert first["decision"] == "allow"
     assert first["latency_ms"] == 412
     assert first["tool_input"] == {"file_path": "/repo/a.py"}
-    text = render_log(log)
+    text = render_permission_log(log)
     assert "reversible read inside the working tree" in text
     assert "publishes to a shared remote" in text
     assert "git push" in text
@@ -41,8 +41,24 @@ def test_append_render_round_trip(tmp_path: Path) -> None:
     assert text.index("Read") < text.index("Bash")
 
 
+def test_render_has_no_timestamp(tmp_path: Path) -> None:
+    log = tmp_path / "permissions.ndjson"
+    append(
+        log,
+        tool_name="Read",
+        tool_input={},
+        decision="allow",
+        reason="reversible",
+        model_id="claude-haiku-4-5",
+        latency_ms=1,
+    )
+    ts = json.loads(log.read_text())["ts"]
+    assert ts
+    assert ts not in render_permission_log(log)
+
+
 def test_render_missing_file_is_empty(tmp_path: Path) -> None:
-    assert render_log(tmp_path / "nope.ndjson") == ""
+    assert render_permission_log(tmp_path / "nope.ndjson") == ""
 
 
 def test_append_creates_parents(tmp_path: Path) -> None:

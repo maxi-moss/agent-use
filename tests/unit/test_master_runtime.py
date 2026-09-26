@@ -16,7 +16,7 @@ from pydantic import ValidationError
 
 from broker import decision_log
 from broker import logging_setup
-from broker.decision_log import DecisionKind
+from broker.decision_log import DecisionLogKind, DecisionLogRow
 from broker.config import BrokerConfig
 from broker.herdr import driver
 from broker.master.__main__ import log_notice
@@ -1550,16 +1550,24 @@ async def test_build_session_outcome_reads_log_off_disk(
     runtime, _ = rt
     log = runtime.paths.session_decisions("s1")
     decision_log.append(
-        log, kind=DecisionKind.ANSWERED, reasoning="r", detail="a", task_summary="Did A"
+        log,
+        DecisionLogRow(
+            kind=DecisionLogKind.ANSWERED,
+            reasoning="r",
+            detail="a",
+            task_summary="Did A",
+        ),
     )
     decision_log.append(
         log,
-        kind=DecisionKind.COMPLETED,
-        reasoning="r",
-        detail="",
-        task_summary="Wrapped up",
-        headline="Recovered the session",
-        supporting="budget survived",
+        DecisionLogRow(
+            kind=DecisionLogKind.COMPLETED,
+            reasoning="r",
+            detail="",
+            task_summary="Wrapped up",
+            headline="Recovered the session",
+            supporting="budget survived",
+        ),
     )
     assert (
         await send(

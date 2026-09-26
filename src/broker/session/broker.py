@@ -33,7 +33,7 @@ from anthropic.types import (
 from pydantic import ValidationError
 
 from broker import decision_log
-from broker.decision_log import DecisionKind
+from broker.decision_log import DecisionLogKind, DecisionLogRow
 from broker import llm as llm_module
 from broker.index.embedding import EmbeddingError, OpenAIEmbedder
 from broker.index.retrieval import RetrievalError, retrieve as retrieve_code
@@ -464,7 +464,7 @@ class SessionBroker:
         self.transcript_path = adopt.transcript_path
         self.session_bound.set()
         self._log(
-            DecisionKind.ADOPTED,
+            DecisionLogKind.ADOPTED,
             "reassigned to a session that was already running",
             f"pane={adopt.pane_id} claude_session={adopt.claude_session_id}",
         )
@@ -481,7 +481,7 @@ class SessionBroker:
         """
         self._set_task(self._task.raw, resume.approved_prompt)
         self._log(
-            DecisionKind.RESUMED,
+            DecisionLogKind.RESUMED,
             "attached to a session whose previous broker is gone",
             f"completed={resume.completed}",
         )
@@ -729,10 +729,10 @@ class SessionBroker:
             # The developer is already engaged (escalated/completed/...): do
             # not raise a second escalation on top; let the picker render.
             self._log(
-                DecisionKind.ASK_SKIPPED,
+                DecisionLogKind.ASK_SKIPPED,
                 f"question arrived in state {self.state!r}; picker left to "
                 "the developer",
-                tool_use_id,
+                tool_use_id=tool_use_id,
             )
             self._claim_menu(_OpenMenu(tool_use_id, None, None))
             return escalated
@@ -782,7 +782,7 @@ class SessionBroker:
         call, answers = result
         updated_input = dict(payload.tool_input)
         updated_input["answers"] = answers
-        self._log(DecisionKind.ASK_ANSWERED, call.reasoning, json.dumps(answers))
+        self._log(DecisionLogKind.ASK_ANSWERED, call.reasoning, json.dumps(answers))
         self._ask_expected[tool_use_id] = _InjectedAnswers(
             payload.tool_input, answers
         )
@@ -834,9 +834,9 @@ class SessionBroker:
             events = self._read_transcript()
         except Exception as exc:
             self._log(
-                DecisionKind.CLARIFY_FAILED,
+                DecisionLogKind.CLARIFY_FAILED,
                 f"{type(exc).__name__}: {exc}",
-                req.escalation_id,
+                escalation_id=req.escalation_id,
             )
             return nack_response(env, f"{type(exc).__name__}: {exc}", None)
         task = asyncio.create_task(
@@ -863,9 +863,9 @@ class SessionBroker:
             return resolved
         except Exception as exc:
             self._log(
-                DecisionKind.CLARIFY_FAILED,
+                DecisionLogKind.CLARIFY_FAILED,
                 f"{type(exc).__name__}: {exc}",
-                req.escalation_id,
+                escalation_id=req.escalation_id,
             )
             return nack_response(env, f"{type(exc).__name__}: {exc}", None)
         finally:
@@ -882,7 +882,7 @@ class SessionBroker:
             or live.escalation_id != req.escalation_id
         ):
             return resolved
-        self._log(DecisionKind.CLARIFIED, result.reasoning, result.answer)
+        self._log(DecisionLogKind.CLARIFIED, result.reasoning, result.answer)
         return Response(
             id=env.id,
             ok=True,
@@ -1031,7 +1031,7 @@ class SessionBroker:
                 id=env.id,
                 ok=True,
                 payload=DecisionLogPayload(
-                    text=decision_log.render_log(self.decision_log_path)
+                    text=decision_log.render_decision_log(self.decision_log_path)
                 ).model_dump(),
             )
 
@@ -1094,18 +1094,18 @@ class SessionBroker:
                 if self.state == SessionState.ESCALATED:
                     self.jobs.put_nowait(self._check_out_of_band_resolution)
             case HookEventName.NOTIFICATION:
-                self._log(DecisionKind.NOTIFICATION, "", str(raw.get("message", "")))
+                self._log(DecisionLogKind.NOTIFICATION, "", str(raw.get("message", "")))
                 if raw.get("notification_type") == "permission_prompt":
                     self._set_perm_pending(True)
             case HookEventName.SESSION_END:
                 self.permission.note_session_ended()
                 self._set_state(SessionState.STOPPED)
-                self._log(DecisionKind.SESSION_END, "", "SessionEnd hook received")
+                self._log(DecisionLogKind.SESSION_END, "", "SessionEnd hook received")
                 # Inline, not queued: the terminal report to master must go
                 # now, not wait behind whatever else is already queued.
                 await self._on_session_end()
             case HookEventName.PRE_COMPACT | HookEventName.POST_COMPACT:
-                self._log(DecisionKind.COMPACTION, "", event)  # continue normally
+                self._log(DecisionLogKind.COMPACTION, "", event)  # continue normally
             case HookEventName.PRE_TOOL_USE | HookEventName.PERMISSION_REQUEST:
                 # The hook routes these as permission_request/ask_question,
                 # never as a hook_event; _dispatch_hook should never see them.
@@ -1154,7 +1154,7 @@ class SessionBroker:
         """
         if self.state not in ACTIVE_STATES:
             self._log(
-                DecisionKind.NO_ACTION,
+                DecisionLogKind.NO_ACTION,
                 f"turn boundary ignored in state {self.state!r}",
                 "",
             )
@@ -1180,7 +1180,7 @@ class SessionBroker:
                 await self._escalate_handover(result, last_assistant_message, events)
             else:
                 self._log(
-                    DecisionKind.ANSWERED,
+                    DecisionLogKind.ANSWERED,
                     result.reasoning,
                     result.answer,
                     task_summary=result.task_summary,
@@ -1197,7 +1197,7 @@ class SessionBroker:
             )
         elif isinstance(result, CompleteCall):
             self._log(
-                DecisionKind.COMPLETED,
+                DecisionLogKind.COMPLETED,
                 result.reasoning,
                 "",
                 task_summary=result.task_summary,
@@ -1212,7 +1212,7 @@ class SessionBroker:
         elif isinstance(
             result, NoActionCall  # pyright: ignore[reportUnnecessaryIsInstance]
         ):
-            self._log(DecisionKind.NO_ACTION, result.reasoning, "")
+            self._log(DecisionLogKind.NO_ACTION, result.reasoning, "")
 
     def _new_escalation(self, disclosure: EscalationDisclosure) -> EscalationPayload:
         """Build a decision escalation carrying this session's identifying preamble.
@@ -1311,12 +1311,11 @@ class SessionBroker:
         except ask.AskInputError:
             questions = []  # the reason already names the failure
         self._log(
-            DecisionKind.ESCALATION_RAISED,
+            DecisionLogKind.ESCALATION_RAISED,
             reason,
             f"AskUserQuestion menu open in pane {self.pane_id or '?'}",
             task_summary=task_summary,
             escalation_id=escalation_id,
-            what_was_asked="\n".join(q.question for q in questions),
         )
         payload = QuestionEscalationPayload(
             escalation_id=escalation_id,
@@ -1332,7 +1331,11 @@ class SessionBroker:
         except MasterRefusedError as exc:
             # The picker is still in the pane, so the claim stays; only the
             # escalation the master refused is dropped.
-            self._log(DecisionKind.ERROR, "question escalation refused", str(exc))
+            self._log(
+                DecisionLogKind.QUESTION_REFUSED,
+                "question escalation refused",
+                str(exc),
+            )
             menu = self._open_menu
             if menu is not None and menu.escalation_id == escalation_id:
                 menu.escalation_id = None
@@ -1357,7 +1360,7 @@ class SessionBroker:
             summary: The escalation's Solution line in the outcome history.
         """
         self._log(
-            DecisionKind.RETRACTED,
+            DecisionLogKind.RETRACTED,
             reason,
             "",
             task_summary=summary,
@@ -1396,7 +1399,11 @@ class SessionBroker:
             reason = "answered in pane"
         else:
             reason = "the broker's answer was recorded late"
-            self._log(DecisionKind.ASK_VERIFIED, "recorded late", menu.tool_use_id)
+            self._log(
+                DecisionLogKind.ASK_VERIFIED,
+                "recorded late",
+                tool_use_id=menu.tool_use_id,
+            )
         # A late answer matching the broker's cannot be told apart from the
         # developer picking the same options, so both read as the developer's.
         await self._retract_question(
@@ -1426,7 +1433,9 @@ class SessionBroker:
         )
         if echoed == injected.answers:
             self._log(
-                DecisionKind.ASK_VERIFIED, "PostToolUse echo matches", tool_use_id
+                DecisionLogKind.ASK_VERIFIED,
+                "PostToolUse echo matches",
+                tool_use_id=tool_use_id,
             )
             return
         self.jobs.put_nowait(
@@ -1485,7 +1494,11 @@ class SessionBroker:
             )
             return
         if answer is not None and answer.answers == injected.answers:
-            self._log(DecisionKind.ASK_VERIFIED, "transcript backstop", tool_use_id)
+            self._log(
+                DecisionLogKind.ASK_VERIFIED,
+                "transcript backstop",
+                tool_use_id=tool_use_id,
+            )
             return
         if answer is None:
             reason = (
@@ -1520,7 +1533,7 @@ class SessionBroker:
             answer_recorded: Whether the session already recorded an answer
                 for this id.
         """
-        self._log(DecisionKind.ASK_VERIFY_FAILED, reason, tool_use_id)
+        self._log(DecisionLogKind.ASK_VERIFY_FAILED, reason, tool_use_id=tool_use_id)
         task_summary = "Escalated an AskUserQuestion answer that failed verification"
         # With no answer recorded the menu may still be in the pane, and its
         # answer clears it. Otherwise the session already proceeded on
@@ -1592,12 +1605,11 @@ class SessionBroker:
             task_summary: The escalation's one-line Reason in the outcome history.
         """
         self._log(
-            DecisionKind.ESCALATION_RAISED,
+            DecisionLogKind.ESCALATION_RAISED,
             reasoning,
             payload.disclosure.situation,
             task_summary=task_summary,
             escalation_id=payload.escalation_id,
-            what_was_asked=payload.disclosure.what_was_asked,
         )
         self._active_escalation = payload
         self._user_prompt_baseline = (
@@ -1653,7 +1665,7 @@ class SessionBroker:
         assert self._active_escalation is not None
         escalation_id = self._active_escalation.escalation_id
         self._log(
-            DecisionKind.RETRACTED,
+            DecisionLogKind.RETRACTED,
             reason,
             "",
             task_summary=summary,
@@ -1688,9 +1700,9 @@ class SessionBroker:
             # drop its queue entry (still_live=False). Reachable when a master
             # restart re-surfaces an escalation this broker already answered.
             self._log(
-                DecisionKind.ERROR,
+                DecisionLogKind.DISPATCH_STALE,
                 "stale dispatch_decision ignored",
-                decision.escalation_id,
+                escalation_id=decision.escalation_id,
             )
             await self._to_master(
                 T_DECISION_UNDELIVERED,
@@ -1710,7 +1722,7 @@ class SessionBroker:
             # surfaced for a re-decide.
             detail = f"{type(exc).__name__}: {exc}"
             self._log(
-                DecisionKind.DISPATCH_FAILED,
+                DecisionLogKind.DISPATCH_FAILED,
                 "pane submission failed",
                 detail,
                 escalation_id=decision.escalation_id,
@@ -1728,7 +1740,7 @@ class SessionBroker:
         await self._note_developer_contact()
         self._set_state(SessionState.DRIVING)
         self._log(
-            DecisionKind.DISPATCHED,
+            DecisionLogKind.DISPATCHED,
             "developer decision delivered",
             decision.response,
             escalation_id=decision.escalation_id,
@@ -1752,7 +1764,7 @@ class SessionBroker:
             payload: The new task intent, grounded before anything is typed.
         """
         self._log(
-            DecisionKind.REACTIVATED, "new task in the same session", payload.intent
+            DecisionLogKind.REACTIVATED, "new task in the same session", payload.intent
         )
         self._end_active_escalation()
         await self._note_developer_contact()
@@ -1768,7 +1780,7 @@ class SessionBroker:
             await self._submit(prompt.text)
         except PaneOccupiedError as exc:
             self._log(
-                DecisionKind.DISPATCH_FAILED, "developer prompt not typed", str(exc)
+                DecisionLogKind.DISPATCH_FAILED, "developer prompt not typed", str(exc)
             )
             await self._to_master(
                 T_PROMPT_UNDELIVERED,
@@ -1781,7 +1793,7 @@ class SessionBroker:
             )
         self._set_state(SessionState.DRIVING)
         await self._note_developer_contact()
-        self._log(DecisionKind.DEVELOPER_PROMPT, "relayed by master", prompt.text)
+        self._log(DecisionLogKind.DEVELOPER_PROMPT, "relayed by master", prompt.text)
 
     async def _note_developer_contact(self) -> None:
         """Reset the autonomous answer budget and report it to the master."""
@@ -1834,7 +1846,7 @@ class SessionBroker:
         if last_text is None:
             return
         self._log(
-            DecisionKind.WATCHDOG_RECONCILIATION,
+            DecisionLogKind.WATCHDOG_RECONCILIATION,
             "no hook event before deadline; herdr reports idle/blocked",
             "",
         )
@@ -1961,7 +1973,7 @@ class SessionBroker:
             detail: Human-readable detail for the developer.
         """
         logger.error("fatal: %s: %s", error_class, detail)
-        self._log(DecisionKind.ERROR, error_class, detail)
+        self._log(DecisionLogKind.ERROR, error_class, detail)
         self._set_state(SessionState.ERROR)
         try:
             await self._to_master(
@@ -1981,27 +1993,29 @@ class SessionBroker:
 
     def _log(
         self,
-        kind: DecisionKind,
+        kind: DecisionLogKind,
         reasoning: str,
-        detail: str,
+        detail: str = "",
         *,
         task_summary: str | None = None,
         escalation_id: str | None = None,
-        what_was_asked: str | None = None,
+        tool_use_id: str | None = None,
         headline: str | None = None,
         supporting: str | None = None,
     ) -> None:
         """Append one entry to this session's decision log."""
         decision_log.append(
             self.decision_log_path,
-            kind=kind,
-            reasoning=reasoning,
-            detail=detail,
-            task_summary=task_summary,
-            escalation_id=escalation_id,
-            what_was_asked=what_was_asked,
-            headline=headline,
-            supporting=supporting,
+            DecisionLogRow(
+                kind=kind,
+                reasoning=reasoning,
+                detail=detail,
+                task_summary=task_summary,
+                escalation_id=escalation_id,
+                tool_use_id=tool_use_id,
+                headline=headline,
+                supporting=supporting,
+            ),
         )
 
     def _set_state(self, state: SessionState) -> None:

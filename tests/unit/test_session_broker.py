@@ -61,7 +61,7 @@ from broker.session.broker import (
     PHRASE_TRIAGE,
     SessionBroker,
 )
-from broker.decision_log import DecisionKind, read_rows
+from broker.decision_log import DecisionLogKind, read_rows
 from broker.config import (
     AdoptedSession,
     ClassifierConfig,
@@ -429,7 +429,7 @@ def logged_retractions(h: "Harness") -> list[tuple[str | None, str | None]]:
     return [
         (row.escalation_id, row.task_summary)
         for row in read_rows(h.broker.decision_log_path)
-        if row.kind is DecisionKind.RETRACTED
+        if row.kind is DecisionLogKind.RETRACTED
     ]
 
 

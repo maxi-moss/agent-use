@@ -7,7 +7,7 @@ broker report, not verified proof. The frontend formats timestamps."""
 from dataclasses import dataclass, replace
 from typing import Literal
 
-from broker.decision_log import DecisionKind, DecisionRow
+from broker.decision_log import DecisionLogKind, DecisionLogRow
 from broker.protocol.constants import SessionState
 
 _NO_FOLLOW_UP = "(no recorded follow-up)"
@@ -45,7 +45,7 @@ def build_outcome(
     session_id: str,
     title: str,
     state: SessionState,
-    rows: list[DecisionRow],
+    rows: list[DecisionLogRow],
 ) -> SessionOutcome:
     """Assemble a SessionOutcome from a session's decision-log rows.
 
@@ -69,7 +69,7 @@ def build_outcome(
     open_escalations: dict[str, int] = {}
     headline = ""
     supporting = ""
-    fatal: DecisionRow | None = None
+    fatal: DecisionLogRow | None = None
 
     def resolve(summary: str) -> None:
         for idx in pending:
@@ -78,17 +78,17 @@ def build_outcome(
         open_escalations.clear()
 
     for row in rows:
-        if row.kind is DecisionKind.ANSWERED:
+        if row.kind is DecisionLogKind.ANSWERED:
             if row.task_summary:
                 resolve(row.task_summary)
                 history.append(OutcomeEvent("action", row.ts, row.task_summary))
-        elif row.kind is DecisionKind.COMPLETED:
+        elif row.kind is DecisionLogKind.COMPLETED:
             if row.task_summary:
                 resolve(row.task_summary)
             headline = row.headline or headline
             supporting = row.supporting or supporting
             history.append(OutcomeEvent("terminal", row.ts, "Task completed"))
-        elif row.kind is DecisionKind.ESCALATION_RAISED:
+        elif row.kind is DecisionLogKind.ESCALATION_RAISED:
             if row.escalation_id is not None:
                 open_escalations[row.escalation_id] = len(history)
             pending.append(len(history))
@@ -98,19 +98,19 @@ def build_outcome(
                 )
             )
         elif (
-            row.kind is DecisionKind.RETRACTED
+            row.kind is DecisionLogKind.RETRACTED
             and row.escalation_id in open_escalations
         ):
             idx = open_escalations.pop(row.escalation_id)
             pending.remove(idx)
             history[idx] = replace(history[idx], resolution=row.task_summary)
-        elif row.kind is DecisionKind.DEVELOPER_PROMPT:
+        elif row.kind is DecisionLogKind.DEVELOPER_PROMPT:
             pending.append(len(history))
             history.append(OutcomeEvent("developer", row.ts, "Developer instruction"))
-        elif row.kind is DecisionKind.REACTIVATED:
+        elif row.kind is DecisionLogKind.REACTIVATED:
             history.append(OutcomeEvent("reactivated", row.ts, "New task"))
-        elif row.kind is DecisionKind.ERROR:
-            fatal = row  # last fatal wins; stale-dispatch noise is overwritten
+        elif row.kind is DecisionLogKind.ERROR:
+            fatal = row  # last fatal wins
 
     for idx in pending:
         history[idx] = replace(history[idx], resolution=_NO_FOLLOW_UP)
@@ -128,7 +128,7 @@ def build_outcome(
 
 def _status(
     state: SessionState,
-    fatal: DecisionRow | None,
+    fatal: DecisionLogRow | None,
     headline: str,
     supporting: str,
 ) -> tuple[OutcomeStatus, str, str]:

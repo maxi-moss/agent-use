@@ -2,8 +2,9 @@
 
 Every permission request appends one entry, approvals included, and the entry
 is written before the decision leaves the module — a crash in between must not
-lose the record of a command that then ran. Timestamps are fine here (they
-never enter LLM context)."""
+lose the record of a command that then ran. The rendered text never carries a
+timestamp: it enters the master LLM's context, which must assemble
+byte-identically across calls."""
 
 import json
 from datetime import UTC, datetime
@@ -47,7 +48,7 @@ def append(
         f.flush()
 
 
-def render_log(path: Path) -> str:
+def render_permission_log(path: Path) -> str:
     """Render the permission log as readable text, newest last, no truncation.
 
     Args:
@@ -66,7 +67,7 @@ def render_log(path: Path) -> str:
         entry = cast(dict[str, Any], parsed)
         served = entry.get("model_id") or "-"
         parts.append(
-            f"[{entry.get('ts', '?')}] {entry.get('tool_name', '?')} -> "
+            f"{entry.get('tool_name', '?')} -> "
             f"{entry.get('decision', '?')} "
             f"({served}, {entry.get('latency_ms', '?')}ms)\n"
             f"  input: {json.dumps(entry.get('tool_input', {}), sort_keys=True)}\n"
