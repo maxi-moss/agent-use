@@ -148,7 +148,11 @@ class MasterRuntime:
         self.paths = BrokerPaths(cfg.broker_home)
         self.master_socket_path = self.paths.master_socket
         self.link = BrokerLink(
-            self.paths, cfg, self.master_socket_path, claude_json
+            self.paths,
+            cfg,
+            self.master_socket_path,
+            claude_json,
+            self._on_broker_exit,
         )
         self.board = FleetBoard(registry, queue, panes, cfg.budget_max, emit)
         self._serve_task: asyncio.Task[None] | None = None
@@ -181,13 +185,14 @@ class MasterRuntime:
         self._serve_task = asyncio.create_task(self._serve())
 
     async def aclose(self) -> None:
-        """Stop serving and persist the registry."""
+        """Stop serving and watching brokers, and persist the registry."""
         task, self._serve_task = self._serve_task, None
         try:
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+            await self.link.aclose()
         finally:
             self.registry.save()
 
@@ -1198,6 +1203,24 @@ class MasterRuntime:
         )
         self.board.publish()
         return None
+
+    def _on_broker_exit(self, name: str, returncode: int) -> None:
+        """Mark a session unmanaged when its broker exits on its own.
+
+        Args:
+            name: Registry name of the session whose broker exited.
+            returncode: The broker process's exit code.
+        """
+        record = self.registry.records.get(name)
+        if record is None or record.state in SETTLED_STATES:
+            return
+        self.emit(
+            Notice(
+                f"session {name}: its broker exited unexpectedly (exit code "
+                f"{returncode}) — see {self.paths.session_stderr(name)}"
+            )
+        )
+        self._set_state(name, SessionState.UNMANAGED)
 
     def _set_state(self, name: str, state: SessionState) -> bool:
         """Record a session's new state and tell the TUI, once per change.

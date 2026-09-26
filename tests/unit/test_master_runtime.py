@@ -135,18 +135,24 @@ class ClarifyingSession:
 
 
 class FakeProcess:
-    """Stand-in for the session-broker subprocess."""
+    """Stand-in for the session-broker subprocess: runs until it exits."""
 
     def __init__(self, pid: int) -> None:
         self.pid = pid
         self.returncode: int | None = None
+        self._exited = asyncio.Event()
 
     async def wait(self) -> int:
-        self.returncode = 0
-        return 0
+        await self._exited.wait()
+        assert self.returncode is not None
+        return self.returncode
+
+    def exit(self, returncode: int) -> None:
+        self.returncode = returncode
+        self._exited.set()
 
     def terminate(self) -> None:
-        self.returncode = -15
+        self.exit(-15)
 
 
 class RecordingSpawn:
@@ -155,10 +161,12 @@ class RecordingSpawn:
     def __init__(self, proc_type: type[FakeProcess] = FakeProcess) -> None:
         self.proc_type = proc_type
         self.argvs: list[tuple[str, ...]] = []
+        self.kwargs: list[dict[str, Any]] = []
         self.procs: list[FakeProcess] = []
 
-    async def __call__(self, *argv: str) -> FakeProcess:
+    async def __call__(self, *argv: str, **kwargs: Any) -> FakeProcess:
         self.argvs.append(argv)
+        self.kwargs.append(kwargs)
         proc = self.proc_type(4242 + len(self.argvs))
         self.procs.append(proc)
         return proc
@@ -1949,8 +1957,12 @@ def _bind_session(runtime: MasterRuntime) -> SessionRecord:
 
 
 async def test_reassign_spawns_a_broker_that_adopts_the_live_session(
-    rt: tuple[MasterRuntime, list[Any]], home: Path, spawn: RecordingSpawn
+    rt: tuple[MasterRuntime, list[Any]],
+    home: Path,
+    spawn: RecordingSpawn,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("broker.master.broker_link.STOP_WAIT_S", 0.05)
     runtime, _ = rt
     record = _bind_session(runtime)
     result = await runtime.reassign_session("s1", "take it from here")
@@ -2020,9 +2032,9 @@ class SpawnWatchingSettings(RecordingSpawn):
         self.settings_path = settings_path
         self.existed_at_spawn: list[bool] = []
 
-    async def __call__(self, *argv: str) -> FakeProcess:
+    async def __call__(self, *argv: str, **kwargs: Any) -> FakeProcess:
         self.existed_at_spawn.append(self.settings_path.exists())
-        return await super().__call__(*argv)
+        return await super().__call__(*argv, **kwargs)
 
 
 async def test_spawn_writes_the_session_rules_and_passes_them_on(
@@ -2120,8 +2132,12 @@ async def test_stop_fails_loud_when_the_broker_outlives_terminate(
 
 
 async def test_attach_spawns_a_resuming_broker(
-    rt: tuple[MasterRuntime, list[Any]], home: Path, spawn: RecordingSpawn
+    rt: tuple[MasterRuntime, list[Any]],
+    home: Path,
+    spawn: RecordingSpawn,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("broker.master.broker_link.STOP_WAIT_S", 0.05)
     runtime, _ = rt
     record = _bind_session(runtime)
     intent_before = record.intent
@@ -2151,6 +2167,46 @@ async def test_attach_spawns_a_resuming_broker(
     assert reloaded.state == "spawning"
     await runtime.stop_session("s1")
     assert spawn.procs[-1].returncode is not None
+
+
+async def test_broker_exit_no_stop_asked_for_leaves_the_session_unmanaged(
+    rt: tuple[MasterRuntime, list[Any]], spawn: RecordingSpawn
+) -> None:
+    runtime, posts = rt
+    record = _bind_session(runtime)
+    stderr_path = runtime.paths.session_stderr("s1")
+    await runtime.attach_session("s1")
+    # The child never writes into the TUI's terminal: whatever it prints
+    # before its own logging exists lands in the file the Notice names.
+    kwargs = spawn.kwargs[-1]
+    assert kwargs["stdin"] == asyncio.subprocess.DEVNULL
+    assert kwargs["stdout"].name == str(stderr_path)
+    assert kwargs["stderr"] == asyncio.subprocess.STDOUT
+
+    async def exit_on_shutdown(env: Envelope) -> Response:
+        spawn.procs[-1].exit(0)
+        return Response(id=env.id, ok=True, payload={})
+
+    server = await serve_unix(Path(record.socket_path), exit_on_shutdown)
+    try:
+        await runtime.stop_session("s1")
+    finally:
+        server.close()
+        await server.wait_closed()
+    # An exit a stop asked for is no news.
+    assert runtime.registry.get("s1").state == SessionState.STOPPED
+    assert not [m for m in posts if isinstance(m, Notice) and "exited" in m.text]
+    await runtime.attach_session("s1")
+    spawn.procs[-1].exit(1)
+    for _ in range(100):
+        if runtime.registry.get("s1").state == SessionState.UNMANAGED:
+            break
+        await asyncio.sleep(0.01)
+    assert runtime.registry.get("s1").state == SessionState.UNMANAGED
+    notices = [m.text for m in posts if isinstance(m, Notice) and "exited" in m.text]
+    assert len(notices) == 1
+    assert "exit code 1" in notices[0]
+    assert str(stderr_path) in notices[0]
 
 
 async def test_attach_refuses_while_a_broker_still_answers(
@@ -2376,8 +2432,11 @@ async def test_set_state_is_idempotent(
 
 
 async def test_absorbing_state_ignores_late_pushes(
-    rt: tuple[MasterRuntime, list[Any]], spawn: RecordingSpawn
+    rt: tuple[MasterRuntime, list[Any]],
+    spawn: RecordingSpawn,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("broker.master.broker_link.STOP_WAIT_S", 0.05)
     runtime, _ = rt
     _bind_session(runtime)
     await runtime.stop_session("s1")

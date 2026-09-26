@@ -1,8 +1,8 @@
 """File-based logging setup for the broker's long-lived processes.
 
 Records go to a file and never to stderr: the master hands its terminal to a
-full-screen TUI and session brokers inherit that terminal, so a stream handler
-writes into a display that immediately repaints over it.
+full-screen TUI, so a stream handler writes into a display that immediately
+repaints over it.
 """
 
 import logging
@@ -12,7 +12,7 @@ _FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 
 def configure(path: Path, *, level: int = logging.INFO) -> None:
-    """Route root-logger records to ``path``, replacing any existing handlers.
+    """Route root-logger records and warnings to ``path``, replacing any existing handlers.
 
     Args:
         path: Log file; created, with its parent directories, if absent.
@@ -30,3 +30,4 @@ def configure(path: Path, *, level: int = logging.INFO) -> None:
         existing.close()
     root.addHandler(handler)
     root.setLevel(level)
+    logging.captureWarnings(True)

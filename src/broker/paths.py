@@ -67,6 +67,10 @@ class BrokerPaths:
         """Diagnostic log for session ``name``."""
         return self.session_logs(name) / "broker.log"
 
+    def session_stderr(self, name: str) -> Path:
+        """Captured stdout and stderr of session ``name``'s broker process."""
+        return self.session_logs(name) / "stderr.log"
+
     def session_decisions(self, name: str) -> Path:
         """Append-only triage decision log for session ``name``."""
         return self.session_logs(name) / "decisions.ndjson"
