@@ -415,6 +415,7 @@ class SessionBroker:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+            await self.permission.aclose()
             await self.watchdog.stop()
             server.close()
             await server.wait_closed()
@@ -944,10 +945,12 @@ class SessionBroker:
         previous = self._open_menu
         self._open_menu = menu
         self._status_dirty.set()
-        # A picker opening means the earlier one closed. Its escalation is
-        # retracted ahead of the new raise: the master holds one per session.
+        # A picker opening means the earlier one closed. The master supersedes
+        # its escalation on the new raise, so only the log row is written,
+        # queued behind the earlier raise so it follows that raise's row.
         if previous is not None and previous.escalation_id is not None:
-            self.jobs.put_nowait(lambda: self._retract_superseded_menu(previous))
+            replaced = previous.escalation_id
+            self.jobs.put_nowait(lambda: self._log_replaced_question(replaced))
 
     async def _on_hook_event(
         self, env: Envelope, hook: HookEventPayload
@@ -1423,13 +1426,14 @@ class SessionBroker:
             if menu is not None and menu.escalation_id == escalation_id:
                 menu.escalation_id = None
 
-    async def _retract_superseded_menu(self, menu: _OpenMenu) -> None:
-        """Withdraw the question escalation of a picker a newer one replaced."""
-        assert menu.escalation_id is not None
-        await self._retract_question(
-            menu.escalation_id,
+    async def _log_replaced_question(self, escalation_id: str) -> None:
+        """Close the question escalation of a picker a newer one replaced."""
+        self._log(
+            DecisionLogKind.RETRACTED,
             "a newer AskUserQuestion menu replaced it",
-            "Replaced by a newer question",
+            "",
+            task_summary="Replaced by a newer question",
+            escalation_id=escalation_id,
         )
 
     async def _retract_question(

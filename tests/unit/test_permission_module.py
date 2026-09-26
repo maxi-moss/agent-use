@@ -150,6 +150,7 @@ async def _module(
     try:
         yield module, master, log_path
     finally:
+        await module.aclose()
         if server is not None:
             server.close()
             await server.wait_closed()
@@ -270,27 +271,66 @@ async def test_unrelated_tool_completion_does_not_retract(home: Path) -> None:
         assert master.of_type(T_PANE_RETRACT) == []
 
 
-async def test_second_escalation_supersedes_the_first(home: Path) -> None:
-    """Reaching a second prompt means the first was answered in the pane.
+class DelayingMaster(StubMaster):
+    """Holds its first envelope back before recording it."""
 
-    The first must be retracted rather than orphaned in the master's slot, and
-    the second must still reach the developer — swallowing it would leave the
-    master silent for the rest of the session.
+    def __init__(self) -> None:
+        super().__init__()
+        self.delayed = False
+
+    async def __call__(self, env: Envelope) -> Response | None:
+        if not self.delayed:
+            self.delayed = True
+            await asyncio.sleep(0.2)
+        return await super().__call__(env)
+
+
+async def test_second_escalation_raises_once_in_decision_order(home: Path) -> None:
+    """Reaching a second prompt raises it alone; the master supersedes the first.
+
+    The second must still reach the developer, and after the first even when
+    the master is slow to take the first.
     """
+    master = DelayingMaster()
     llm = FakeLLM(ESCALATE, ESCALATE_2)
-    async with _module(home, llm) as (module, master, log):
+    async with _module(home, llm, master=master) as (module, _, log):
         assert await module.decide("Bash", PUSH_INPUT, []) == DECISION_ESCALATED
-        first = await master.wait_for(T_PANE_ESCALATION)
         assert await module.decide("Bash", DEPLOY_INPUT, []) == DECISION_ESCALATED
-        second = await master.wait_for(T_PANE_ESCALATION, count=2)
-        retract = await master.wait_for(T_PANE_RETRACT)
+        await master.wait_for(T_PANE_ESCALATION, count=2)
         await asyncio.sleep(SETTLE_S)
-    assert retract.payload["escalation_id"] == first.payload["escalation_id"]
-    assert second.payload["tool_input"] == DEPLOY_INPUT
-    order = [e.type for e in master.received]
-    assert order.index(T_PANE_RETRACT) < order.index(T_PANE_ESCALATION, 1)
+    assert [e.type for e in master.received] == [T_PANE_ESCALATION] * 2
+    assert [e.payload["tool_input"] for e in master.received] == [
+        PUSH_INPUT,
+        DEPLOY_INPUT,
+    ]
     written = entries(log)
     assert [e["reason"] for e in written] == ["publishes to a remote", "deploys"]
+
+
+class SilentMaster(StubMaster):
+    """Takes every envelope and replies only once released."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+
+    async def __call__(self, env: Envelope) -> Response | None:
+        self.received.append(env)
+        await self.release.wait()
+        return None
+
+
+async def test_aclose_stops_a_sender_waiting_on_the_master(home: Path) -> None:
+    master = SilentMaster()
+    llm = FakeLLM(ESCALATE)
+    async with _module(home, llm, master=master) as (module, _, _log):
+        await module.decide("Bash", PUSH_INPUT, [])
+        await master.wait_for(T_PANE_ESCALATION)
+        try:
+            async with asyncio.timeout(1.0):
+                await module.aclose()
+        finally:
+            master.release.set()
 
 
 class StoreMaster(StubMaster):

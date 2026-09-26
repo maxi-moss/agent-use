@@ -2285,7 +2285,7 @@ async def test_permission_prompt_not_reported_while_a_menu_is_open(
     )
 
 
-async def test_a_newer_menu_retracts_the_one_it_replaced_first(
+async def test_a_newer_menu_supersedes_the_one_it_replaced(
     harness: Harness,
 ) -> None:
     await launch(harness)
@@ -2295,16 +2295,13 @@ async def test_a_newer_menu_retracts_the_one_it_replaced_first(
         harness.sock, ask_question_env("toolu_second", COLOR_TOOL_INPUT), timeout_s=5.0
     )
     second = await harness.master.wait_for(T_PANE_ESCALATION, count=2)
-    retract = harness.master.of_type(T_PANE_RETRACT)
-    assert [r.payload["escalation_id"] for r in retract] == [
-        first.payload["escalation_id"]
-    ]
+    await asyncio.sleep(0.1)
+    assert second.payload["escalation_id"] != first.payload["escalation_id"]
+    # The master supersedes the first on the second raise; nothing retracts it.
+    assert harness.master.of_type(T_PANE_RETRACT) == []
     assert logged_retractions(harness) == [
         (first.payload["escalation_id"], "Replaced by a newer question")
     ]
-    # Retract before raise: the master holds one question per session.
-    order = [e.id for e in harness.master.received]
-    assert order.index(retract[0].id) < order.index(second.id)
 
 
 async def test_every_session_socket_type_reaches_its_handler(
