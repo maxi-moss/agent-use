@@ -11,7 +11,6 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -27,20 +26,14 @@ from broker.master.broker_link import (
     adoption_fields,
     broker_is_listening,
 )
+from broker.master.fleet_board import FleetBoard
 from broker.master.outcome import SessionOutcome, build_outcome
 from broker.master.viewmodel import (
-    Attention,
     CompletionArrived,
     EscalationArrived,
     EventSink,
-    FleetUpdated,
-    FleetView,
-    HeadRequest,
     Notice,
     PaneEscalationArrived,
-    PaneRequest,
-    ProposalArrived,
-    SessionRow,
     SessionStateChanged,
 )
 from broker.master.pane_escalations import PaneEscalations
@@ -49,11 +42,12 @@ from broker.master.payload_render import (
     pane_label,
     render_escalation,
     render_pane_escalation,
-    render_proposal,
 )
 from broker.master.queue import EscalationProtocolViolation, EscalationQueue
 from broker.master.registry import Registry, SessionRecord
 from broker.protocol.constants import (
+    ABSORBING_STATES,
+    SETTLED_STATES,
     NackCode,
     PaneKind,
     SessionState,
@@ -120,28 +114,6 @@ _Handler = Callable[[str, Any], Awaitable[NackPayload | None]]
 # that cannot be reached must not fail the whole listing.
 PROBE_FAILURES = (OSError, ConnectionError, TimeoutError, ValidationError)
 
-# A session in one of these states is settled: it has no live operating
-# status, so a late-arriving push must not resurrect it. Left only by a
-# master-initiated boundary write (spawn/reassign/attach/reactivate). A
-# session that is gone is not settled here — it is removed from the registry
-# entirely, so no state stands in for "finished".
-_ABSORBING = frozenset(
-    {
-        SessionState.COMPLETED,
-        SessionState.ERROR,
-        SessionState.STOPPED,
-        SessionState.UNMANAGED,
-    }
-)
-
-
-@dataclass(frozen=True, slots=True)
-class PendingProposal:
-    """A prompt proposal awaiting the developer's approval."""
-
-    session_id: str
-    payload: PromptProposalPayload
-
 
 class MasterRuntime:
     def __init__(
@@ -178,13 +150,7 @@ class MasterRuntime:
         self.link = BrokerLink(
             self.paths, cfg, self.master_socket_path, claude_json
         )
-        self.proposals: dict[str, PendingProposal] = {}
-        # Dashboard-only, never persisted: pushed live status per session and
-        # the master's own current activity.
-        self._activity: dict[str, str] = {}
-        self._task_activity: dict[str, str] = {}
-        self._permission_prompt_pending: set[str] = set()
-        self._master_activity: str | None = None
+        self.board = FleetBoard(registry, queue, panes, cfg.budget_max, emit)
         self._serve_task: asyncio.Task[None] | None = None
         self._handlers: dict[str, _Handler] = {
             T_ESCALATION: self._on_escalation,
@@ -231,7 +197,7 @@ class MasterRuntime:
         """Bind the master socket and serve until cancelled."""
         # A head or open pane escalation loaded from disk has never been
         # announced in this process, so each is announced here, exactly once.
-        self._publish_fleet()
+        self.board.publish()
         await self._surface_head()
         for prompt in self.panes.in_session_order():
             await self._announce_pane_escalation(prompt)
@@ -244,15 +210,18 @@ class MasterRuntime:
         """Refresh state, task-activity and any pending proposal from each surviving broker."""
 
         for name in self.registry.names_in_order():
-            if self.registry.records[name].state in _ABSORBING:
+            if (
+                self.registry.records[name].state
+                in SETTLED_STATES | ABSORBING_STATES
+            ):
                 continue
             try:
                 status = await self.probe_status(name)
             except PROBE_FAILURES:
                 continue
             if status.pending_proposal is not None:
-                self._register_proposal(name, status.pending_proposal)
-        self._publish_fleet()
+                self.board.register_proposal(name, status.pending_proposal)
+        self.board.publish()
 
     async def handle(self, env: Envelope) -> Response:
         """Handle one inbound envelope, turning any failure into a NACK.
@@ -344,7 +313,7 @@ class MasterRuntime:
                 error=str(exc), reason_code=NackCode.PROTOCOL_VIOLATION
             )
         self._set_state(session_id, SessionState.ESCALATED)
-        self._publish_fleet()
+        self.board.publish()
         await self._surface_head()
         return None
 
@@ -368,7 +337,7 @@ class MasterRuntime:
                     f"session {session_id} superseded by {p.escalation_id}"
                 )
             )
-        self._publish_fleet()
+        self.board.publish()
         await self._announce_pane_escalation(p)
         return None
 
@@ -448,7 +417,7 @@ class MasterRuntime:
                     f"retracted: {p.reason}"
                 )
             )
-        self._publish_fleet()
+        self.board.publish()
         await self._surface_head()
         return None
 
@@ -472,7 +441,7 @@ class MasterRuntime:
                     f"{session_id} retracted: {p.reason}"
                 )
             )
-            self._publish_fleet()
+            self.board.publish()
         return None
 
     async def _on_prompt_undelivered(
@@ -508,8 +477,8 @@ class MasterRuntime:
             ``None``; a proposal is never refused.
         """
         self._set_state(session_id, SessionState.AWAITING_APPROVAL)
-        self._register_proposal(session_id, p)
-        self._publish_fleet()
+        self.board.register_proposal(session_id, p)
+        self.board.publish()
         return None
 
     async def _on_budget_update(
@@ -527,7 +496,7 @@ class MasterRuntime:
         record = self.registry.get(session_id)
         record.budget_count = p.count
         self.registry.upsert(record)
-        self._publish_fleet()
+        self.board.publish()
         return None
 
     async def _on_live_status(
@@ -542,27 +511,10 @@ class MasterRuntime:
         Returns:
             ``None``; a settled session's push is ACKed and ignored.
         """
-        rec = self.registry.records[session_id]
-        # Outside the absorbing guard: /clear in a settled session binds a new
-        # Claude session id.
-        self._note_identity(rec, p)
-        # A settled session ignores late pushes: absorbing states are left
-        # only by a master-initiated boundary write, never by a stale
-        # in-flight push arriving after the fact (cross-connection sends
-        # reorder even though each is individually ACKed).
-        if rec.state in _ABSORBING:
+        if not self.board.apply_live_status(session_id, p):
             return None
-        if p.activity:
-            self._activity[session_id] = p.activity
-        else:
-            self._activity.pop(session_id, None)
-        self._note_task_activity(session_id, p.task_activity)
-        if p.permission_prompt:
-            self._permission_prompt_pending.add(session_id)
-        else:
-            self._permission_prompt_pending.discard(session_id)
         if not self._set_state(session_id, p.state):
-            self._publish_fleet()  # activity/perm-only change
+            self.board.publish()  # activity/perm-only change
         return None
 
     async def _surface_head(self) -> None:
@@ -638,7 +590,7 @@ class MasterRuntime:
         pid = await self.link.spawn(record, adopt=None, resume=None)
         self.registry.upsert(record)
         self.emit(SessionStateChanged(name, record.state))
-        self._publish_fleet()
+        self.board.publish()
         return f"spawned session {name} (pid {pid}) in {cwd_path}"
 
     async def reassign_session(self, session_id: str, intent: str) -> str:
@@ -780,7 +732,7 @@ class MasterRuntime:
         Returns:
             An outcome line: approved, unknown proposal, or rejected as stale.
         """
-        pending = self.proposals.get(proposal_id)
+        pending = self.board.proposals.get(proposal_id)
         if pending is None:
             msg = f"unknown proposal {proposal_id!r} — nothing approved"
             self.emit(Notice(msg))
@@ -798,11 +750,11 @@ class MasterRuntime:
         if rejected is not None:
             self.emit(Notice(rejected))
             return rejected
-        del self.proposals[proposal_id]
+        del self.board.proposals[proposal_id]
         record.approved_prompt = prompt  # the AUTHORITATIVE intent
         record.title = title
         self.registry.upsert(record)
-        self._publish_fleet()
+        self.board.publish()
         return f"prompt approved for session {name}"
 
     async def dispatch(self, escalation_id: str, decision: str) -> str:
@@ -869,7 +821,7 @@ class MasterRuntime:
             self.queue.clear_inflight(escalation_id)
             self.emit(Notice(rejected))
             return rejected
-        self._publish_fleet()
+        self.board.publish()
         return f"decision dispatched to session {record.name}"
 
     def _pane_escalation_refusal(self, escalation_id: str, lead: str) -> str | None:
@@ -914,7 +866,7 @@ class MasterRuntime:
         if self.queue.resolve(p.escalation_id) is not None:
             # It was the live head: surface whatever is next. DRIVING is the
             # broker's transition to report; the master never invents it.
-            self._publish_fleet()
+            self.board.publish()
             await self._surface_head()
         return None
 
@@ -953,7 +905,7 @@ class MasterRuntime:
                     f"cleared: {p.detail}"
                 )
             )
-        self._publish_fleet()
+        self.board.publish()
         await self._surface_head()
         return None
 
@@ -1042,7 +994,7 @@ class MasterRuntime:
         )
         status = StatusPayload.model_validate(resp.payload)
         self._set_state(session_id, status.state)
-        self._note_task_activity(session_id, status.task_activity)
+        self.board.note_task_activity(session_id, status.task_activity)
         return status
 
     def build_session_outcome(self, session_id: str) -> SessionOutcome:
@@ -1140,10 +1092,6 @@ class MasterRuntime:
         except KeyError:
             return PANE_UNKNOWN
 
-    def pending_proposals(self) -> list[PendingProposal]:
-        """Return every proposal awaiting approval, oldest first."""
-        return list(self.proposals.values())
-
     def registry_summary(self) -> str:
         """Render the registry summary for the LLM context and ``list_sessions``.
 
@@ -1210,7 +1158,7 @@ class MasterRuntime:
                 f"{session_id} retracted: its broker is gone"
             )
         )
-        self._publish_fleet()
+        self.board.publish()
         await self._surface_head()
 
     def _retract_stranded_pane_escalations(self, session_id: str) -> None:
@@ -1228,7 +1176,7 @@ class MasterRuntime:
                 )
             )
         if cleared:
-            self._publish_fleet()
+            self.board.publish()
 
     async def _on_session_ended(
         self, session_id: str, p: SessionEndedPayload
@@ -1242,10 +1190,7 @@ class MasterRuntime:
         Returns:
             ``None``; the report is never refused.
         """
-        self._activity.pop(session_id, None)
-        self._task_activity.pop(session_id, None)
-        self._permission_prompt_pending.discard(session_id)
-        self._discard_proposals(session_id)
+        self.board.forget(session_id)
         self.link.forget(session_id)
         self.registry.remove(session_id)
         # The broker exits without withdrawing its live escalations, so
@@ -1256,7 +1201,7 @@ class MasterRuntime:
         self.emit(
             Notice(f"session {session_id} ended (/exit) — removed from the fleet")
         )
-        self._publish_fleet()
+        self.board.publish()
         return None
 
     def _set_state(self, name: str, state: SessionState) -> bool:
@@ -1283,125 +1228,10 @@ class MasterRuntime:
         logger.info("session %s: %s -> %s", name, record.state, state)
         record.state = state
         self.registry.upsert(record)  # sync; no await before this point
-        if state in _ABSORBING:
-            # A settled session shows no live status, and the absorbing
-            # guard blocks the pushes that would otherwise clear these.
-            self._activity.pop(name, None)
-            self._task_activity.pop(name, None)
-            self._permission_prompt_pending.discard(name)
-            self._discard_proposals(name)
+        if state in SETTLED_STATES | ABSORBING_STATES:
+            # A settled session shows no live status, and the settled guard
+            # blocks the pushes that would otherwise clear it.
+            self.board.forget(name)
         self.emit(SessionStateChanged(name, state))
-        self._publish_fleet()
+        self.board.publish()
         return True
-
-    def _note_identity(self, record: SessionRecord, p: LiveStatusPayload) -> None:
-        """Persist the pane, Claude session and transcript a broker reports."""
-        pane_id = p.pane_id or record.pane_id
-        claude_session_id = p.claude_session_id or record.claude_session_id
-        transcript_path = p.transcript_path or record.transcript_path
-        if (pane_id, claude_session_id, transcript_path) == (
-            record.pane_id,
-            record.claude_session_id,
-            record.transcript_path,
-        ):
-            return
-        record.pane_id = pane_id
-        record.claude_session_id = claude_session_id
-        record.transcript_path = transcript_path
-        self.registry.upsert(record)
-
-    def _note_task_activity(self, name: str, text: str) -> None:
-        """Show ``text`` as a live session's task activity; a settled session shows none."""
-        if not text or self.registry.get(name).state in _ABSORBING:
-            self._task_activity.pop(name, None)
-        else:
-            self._task_activity[name] = text
-
-    def build_fleet_view(self) -> FleetView:
-        """Assemble the structured sidebar view from current runtime state."""
-        badges = self._badges_by_session()
-        rows: list[SessionRow] = []
-        for name in self.registry.names_in_order():
-            r = self.registry.records[name]
-            rows.append(
-                SessionRow(
-                    session_id=name,
-                    state=r.state,
-                    title=r.title,
-                    task_activity=self._task_activity.get(name, ""),
-                    broker_activity=self._activity.get(name, ""),
-                    budget_count=r.budget_count,
-                    budget_max=self.cfg.budget_max,
-                    badges=badges.get(name, ()),
-                    pane_id=r.pane_id,
-                )
-            )
-        return FleetView(
-            master_activity=self._master_activity,
-            rows=tuple(rows),
-            queue_depth=self.queue.depth,
-            waiting=self.queue.waiting,
-            head=self._head_request(),
-            panes=tuple(
-                PaneRequest(p.kind, p.session_id, p.escalation_id, pane_label(p))
-                for p in self.panes.in_session_order()
-            ),
-        )
-
-    def _head_request(self) -> HeadRequest | None:
-        head = self.queue.active
-        if head is None:
-            return None
-        return HeadRequest(
-            head.session_id, head.escalation_id, head.disclosure.what_was_asked
-        )
-
-    def _badges_by_session(self) -> dict[str, tuple[Attention, ...]]:
-        """Distinct attention badges per session, from the four live sources."""
-        acc: dict[str, set[Attention]] = {}
-        for entry in self.queue.entries:
-            acc.setdefault(entry.session_id, set()).add(Attention.ESCALATION)
-        for prompt in self.panes.entries:
-            badge = (
-                Attention.PERMISSION
-                if prompt.kind == PaneKind.PERMISSION
-                else Attention.QUESTION
-            )
-            acc.setdefault(prompt.session_id, set()).add(badge)
-        for pending in self.proposals.values():
-            acc.setdefault(pending.session_id, set()).add(Attention.PROPOSAL)
-        for name in self._permission_prompt_pending:
-            acc.setdefault(name, set()).add(Attention.PERMISSION)
-        return {
-            name: tuple(sorted(kinds, key=lambda a: a.value))
-            for name, kinds in acc.items()
-        }
-
-    def _register_proposal(self, name: str, payload: PromptProposalPayload) -> None:
-        """Store a pending proposal, discarding any the session already had, and surface it to the developer."""
-        self._discard_proposals(name)
-        self.proposals[payload.proposal_id] = PendingProposal(name, payload)
-        self.emit(
-            ProposalArrived(name, payload.proposal_id, render_proposal(payload))
-        )
-
-    def _discard_proposals(self, name: str) -> None:
-        """Drop any pending proposal a session left behind on settling or exit."""
-        for pid in [
-            pid for pid, p in self.proposals.items() if p.session_id == name
-        ]:
-            del self.proposals[pid]
-
-    def _publish_fleet(self) -> None:
-        """Emit the current structured sidebar snapshot."""
-        self.emit(FleetUpdated(self.build_fleet_view()))
-
-    def note_master_activity(self, text: str) -> None:
-        """Show what the master itself is doing on the dashboard header."""
-        self._master_activity = text
-        self._publish_fleet()
-
-    def clear_master_activity(self) -> None:
-        """Return the dashboard header to idle."""
-        self._master_activity = None
-        self._publish_fleet()

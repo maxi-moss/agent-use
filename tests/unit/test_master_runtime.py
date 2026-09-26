@@ -1022,7 +1022,7 @@ async def test_probe_of_a_settled_session_keeps_it_settled(home: Path) -> None:
     assert [
         (m.session_id, m.state) for m in posts if isinstance(m, SessionStateChanged)
     ] == [("s1", SessionState.COMPLETED)]
-    row = runtime.build_fleet_view().rows[0]
+    row = runtime.board.build_view().rows[0]
     assert row.task_activity == ""
 
 
@@ -1115,7 +1115,7 @@ async def test_repopulate_from_brokers_recovers_pending_proposal(
     try:
         runtime.start()
         for _ in range(200):
-            if "pr1" in runtime.proposals:
+            if "pr1" in runtime.board.proposals:
                 break
             await asyncio.sleep(0.01)
         else:
@@ -1125,7 +1125,7 @@ async def test_repopulate_from_brokers_recovers_pending_proposal(
         server.close()
         await server.wait_closed()
 
-    assert runtime.proposals["pr1"].session_id == "s1"
+    assert runtime.board.proposals["pr1"].session_id == "s1"
     arrived = [m for m in posts if isinstance(m, ProposalArrived)]
     assert [(m.session_id, m.proposal_id) for m in arrived] == [("s1", "pr1")]
     assert "add a health endpoint" in arrived[0].rendered
@@ -1176,7 +1176,7 @@ async def test_repopulate_from_brokers_registers_nothing_when_no_proposal(
         server.close()
         await server.wait_closed()
 
-    assert runtime.proposals == {}
+    assert runtime.board.proposals == {}
     assert [m for m in posts if isinstance(m, ProposalArrived)] == []
 
 
@@ -1709,7 +1709,7 @@ async def test_proposal_awaits_approval_and_badges_on_arrival(
     )
     assert resp.ok
     assert len([m for m in posts if isinstance(m, ProposalArrived)]) == 1
-    assert list(runtime.proposals) == ["p1"]
+    assert list(runtime.board.proposals) == ["p1"]
     assert runtime.registry.get("s1").state == SessionState.AWAITING_APPROVAL
     # The badge reaches the sidebar on this push, not on some later unrelated
     # one — the developer needs to see it the moment it arrives.
@@ -1743,8 +1743,8 @@ async def test_second_proposal_from_a_session_replaces_its_first(
             },
         )
     ).ok
-    assert list(runtime.proposals) == ["p2"]
-    row = [row for row in runtime.build_fleet_view().rows if row.session_id == "s1"][
+    assert list(runtime.board.proposals) == ["p2"]
+    row = [row for row in runtime.board.build_view().rows if row.session_id == "s1"][
         0
     ]
     assert row.badges == (Attention.PROPOSAL,)
@@ -2216,165 +2216,6 @@ async def test_attach_retracts_stranded_escalations(
     assert any("q1" in t and "retracted" in t for t in notices)
 
 
-async def test_build_fleet_view_orders_rows_numerically_with_budgets_and_titles(
-    rt: tuple[MasterRuntime, list[Any]]
-) -> None:
-    runtime, _ = rt
-    runtime.registry.upsert(
-        SessionRecord(
-            name="s10",
-            socket_path="/private/tmp/s10.sock",
-            cwd="/private/tmp",
-            anchor_pane="%1",
-            state=SessionState.DRIVING,
-            intent="Fix the auth bug in the checkout flow before the demo",
-            title="fix auth bug",
-        )
-    )
-    runtime.registry.upsert(
-        SessionRecord(
-            name="s2",
-            socket_path="/private/tmp/s2.sock",
-            cwd="/private/tmp",
-            anchor_pane="%1",
-            state=SessionState.ESCALATED,
-            approved_prompt="Migrate the users table",
-            title="migrate users table",
-            budget_count=5,
-        )
-    )
-    view = runtime.build_fleet_view()
-    # Numeric order (s2 before s10), not lexical.
-    assert [row.session_id for row in view.rows] == ["s1", "s2", "s10"]
-    # s1 was never approved: no title is set on it, and the row shows none —
-    # title no longer falls back to approved_prompt or intent.
-    assert view.rows[0].title == ""
-    s2 = view.rows[1]
-    assert s2.state == SessionState.ESCALATED
-    assert s2.title == "migrate users table"
-    assert s2.budget_count == 5
-    assert s2.budget_max == runtime.cfg.budget_max
-    s10 = view.rows[2]
-    assert s10.title == "fix auth bug"
-
-
-async def test_build_fleet_view_idle_master_and_no_sessions(home: Path) -> None:
-    cfg = BrokerConfig(model_id="test-model", broker_home=home)
-    registry = Registry.load(home / "registry.json")
-    queue = EscalationQueue.load(home / "escalation-queue.json")
-    panes = PaneEscalations.load(home / "pane-escalations.json")
-    runtime = MasterRuntime(
-        lambda _event: None,
-        registry,
-        queue,
-        panes,
-        cfg,
-        anchor_pane="%1",
-        claude_json=home / "claude.json",
-    )
-    view = runtime.build_fleet_view()
-    assert view.master_activity is None
-    assert view.rows == ()
-    assert view.queue_depth == 0
-    assert view.panes == ()
-
-
-async def test_build_fleet_view_reports_master_activity_and_queue_state(
-    rt: tuple[MasterRuntime, list[Any]]
-) -> None:
-    runtime, _ = rt
-    for name in ("s2", "s10"):
-        _add_session(runtime, name)
-    runtime.note_master_activity("thinking…")
-    assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-    assert (await send(runtime, T_ESCALATION, escalation_dict("e2", "s2"), "s2")).ok
-    for name, esc_id in (("s10", "p10"), ("s2", "p2")):
-        assert (
-            await send(
-                runtime,
-                T_PANE_ESCALATION,
-                permission_pane_dict(esc_id, name),
-                session=name,
-            )
-        ).ok
-    view = runtime.build_fleet_view()
-    assert view.master_activity == "thinking…"
-    # Only decisions count as waiting; open prompts are listed apart, in
-    # numeric session order (s2 before s10) whatever order they arrived in.
-    assert view.queue_depth == 2
-    assert view.waiting == ("s2",)
-    assert [p.session_id for p in view.panes] == ["s2", "s10"]
-
-
-async def test_build_fleet_view_badges_reflect_queue_proposals_and_prompts(
-    rt: tuple[MasterRuntime, list[Any]]
-) -> None:
-    runtime, _ = rt
-    runtime.registry.upsert(
-        SessionRecord(
-            name="s2",
-            socket_path="/private/tmp/s2.sock",
-            cwd="/private/tmp",
-            anchor_pane="%1",
-            state=SessionState.DRIVING,
-        )
-    )
-    runtime.registry.upsert(
-        SessionRecord(
-            name="s3",
-            socket_path="/private/tmp/s3.sock",
-            cwd="/private/tmp",
-            anchor_pane="%1",
-            state=SessionState.DRIVING,
-            pane_id="w3:p2",
-        )
-    )
-    # s1: a queued decision escalation AND an open permission escalation from
-    # the same session — held apart, so both badges carry.
-    assert (await send(runtime, T_ESCALATION, escalation_dict("e1", "s1"))).ok
-    assert (
-        await send(
-            runtime, T_PANE_ESCALATION, permission_pane_dict("p1", "s1")
-        )
-    ).ok
-    assert (
-        await send(
-            runtime, T_PANE_ESCALATION, question_escalation_dict("q1", "s1")
-        )
-    ).ok
-    # s2: a pending prompt proposal.
-    assert (
-        await send(
-            runtime,
-            T_PROMPT_PROPOSAL,
-            {
-                "proposal_id": "prop-1",
-                "proposed_prompt": "do it",
-                "grounding_summary": "facts",
-            },
-            session="s2",
-        )
-    ).ok
-    # s3: sitting on a native permission prompt.
-    assert (
-        await send(
-            runtime,
-            T_LIVE_STATUS,
-            {"state": "driving", "permission_prompt": True},
-            session="s3",
-        )
-    ).ok
-    rows = {row.session_id: row for row in runtime.build_fleet_view().rows}
-    assert rows["s1"].badges == (
-        Attention.ESCALATION,
-        Attention.PERMISSION,
-        Attention.QUESTION,
-    )
-    assert rows["s2"].badges == (Attention.PROPOSAL,)
-    assert rows["s3"].badges == (Attention.PERMISSION,)
-    assert rows["s3"].pane_id == "w3:p2"
-
-
 async def test_live_status_updates_state_activity_and_perm(
     rt: tuple[MasterRuntime, list[Any]]
 ) -> None:
@@ -2639,7 +2480,7 @@ async def test_every_message_from_an_unknown_session_is_refused(
     assert list(runtime.registry.records) == ["s1"]
     assert runtime.queue.active is None
     assert runtime.panes.entries == ()
-    assert runtime.proposals == {}
+    assert runtime.board.proposals == {}
     assert all(isinstance(m, Notice) for m in posts[before:])
 
 
