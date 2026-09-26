@@ -18,7 +18,7 @@ import contextlib
 import json
 import logging
 import uuid
-from collections.abc import Awaitable, Callable, Generator
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, assert_never, cast
@@ -41,7 +41,6 @@ from broker.herdr import driver
 from broker.herdr.schemas import AgentStatus
 from broker.claude.paths import transcript_dir_for_cwd
 from broker.permission import PermissionModule, render_permission_log
-from broker.protocol import client
 from broker.protocol.constants import (
     ACTIVE_STATES,
     ASK_DECISION_ANSWER,
@@ -88,6 +87,7 @@ from broker.protocol.schemas import (
     FatalErrorPayload,
     HookEventPayload,
     LiveStatusPayload,
+    NackPayload,
     PaneRetractPayload,
     PermissionDecisionPayload,
     PermissionLogPayload,
@@ -107,7 +107,6 @@ from broker.protocol.schemas import (
     StatusRequestPayload,
     WireMessage,
     nack_response,
-    parse_nack,
 )
 from broker.session import ask, clarify
 from broker.session.grounding import (
@@ -116,6 +115,11 @@ from broker.session.grounding import (
     ground_intent,
 )
 from broker.session.llm_stack import EscalateCall, bind_call_tool, disclosure_of
+from broker.session.master_link import (
+    LiveStatusPusher,
+    describe_refusal,
+    send_to_master,
+)
 from broker.session.triage import AnswerCall, CompleteCall, NoActionCall, triage
 from broker.session.watchdog import Watchdog
 from broker.transcript.adapter import ReadReport, read_cleaned
@@ -129,7 +133,6 @@ from broker.transcript.schemas import (
 logger = logging.getLogger(__name__)
 
 SUBMIT_TIMEOUT_S = 15.0
-MASTER_TIMEOUT_S = 10.0
 SESSION_BIND_TIMEOUT_S = 60.0
 
 # Both waits are named and bounded (global rule). The decision deadline sits
@@ -155,8 +158,6 @@ PHRASE_TRIAGE = "reviewing the latest turn…"
 PHRASE_PERMISSION = "reviewing a permission request…"
 PHRASE_ASK = "deciding a question…"
 PHRASE_CLARIFY = "answering a question about the escalation…"
-
-STATUS_RETRY_S = 1.0
 
 Job = Callable[[], Awaitable[None]]
 _Handler = Callable[[Envelope, Any], Awaitable[Response | None]]
@@ -220,20 +221,6 @@ class PaneOccupiedError(Exception):
         self.pane_id = pane_id
 
 
-class MasterRefusedError(Exception):
-    def __init__(
-        self, msg_type: str, error: str, reason_code: NackCode | None
-    ) -> None:
-        """Record the refused message type and the master's stated reason."""
-        super().__init__(
-            f"master refused {msg_type}: {error or '(no reason given)'}"
-            + (f" [{reason_code}]" if reason_code else "")
-        )
-        self.msg_type = msg_type
-        self.error = error
-        self.reason_code = reason_code
-
-
 class FatalSessionError(Exception):
     def __init__(self, error_class: str, detail: str) -> None:
         """Record the machine-readable class and human detail of the failure."""
@@ -288,9 +275,9 @@ class SessionBroker:
         self._permission_prompt_pending = False
         self._last_event_count = -1
 
-        self._status_dirty = asyncio.Event()
-        self._activity_phrases: set[str] = set()
-        self._status_task: asyncio.Task[None] | None = None
+        self._status = LiveStatusPusher(
+            snapshot=self._live_status, send=self._to_master
+        )
 
         self._paths = BrokerPaths(cfg.broker_home)
         self.decision_log_path = self._paths.session_decisions(cfg.name)
@@ -331,7 +318,7 @@ class SessionBroker:
         if self._retrieve is None:
             self._retrieve = bind_index_retriever(self._paths, self.cfg.embedding)
         self.watchdog.start()
-        self._status_task = asyncio.create_task(self._status_sender())
+        self._status.start()
         drive = self._run_task = asyncio.create_task(self._drive())
         try:
             await drive
@@ -342,11 +329,7 @@ class SessionBroker:
             if current is not None and current.cancelling():
                 raise
         finally:
-            # Cancellation, not a shutdown flag: a sender parked in
-            # _status_dirty.wait() would never observe one.
-            self._status_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._status_task
+            await self._status.aclose()
             for task in list(self._ask_verify_tasks.values()):
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -501,7 +484,7 @@ class SessionBroker:
         self._set_state(SessionState.GROUNDING)
         assert self._llm_call is not None
         assert self._retrieve is not None
-        with self._activity(PHRASE_GROUNDING):
+        with self._status.activity(PHRASE_GROUNDING):
             try:
                 grounding = await ground_intent(
                     self._llm_call,
@@ -533,42 +516,17 @@ class SessionBroker:
         self._pending = None
         self._set_state(SessionState.DRIVING)
 
-    async def _status_sender(self) -> None:
-        """Coalesce live-status changes into full-snapshot pushes to the master."""
-        while True:  # exits by cancellation at teardown
-            await self._status_dirty.wait()
-            self._status_dirty.clear()
-            payload = LiveStatusPayload(
-                state=self.state,
-                activity=" · ".join(sorted(self._activity_phrases)),
-                permission_prompt=self._reports_permission_prompt(),
-                task_activity=self.task_activity,
-                pane_id=self.pane_id,
-                claude_session_id=self.claude_session_id,
-                transcript_path=self.transcript_path,
-            )
-            try:
-                await self._to_master(payload)
-            except Exception as exc:
-                # Master unreachable: re-send the current snapshot next loop;
-                # the backoff keeps a dead master from spinning the broker hot.
-                logger.warning("live-status push failed, retrying: %r", exc)
-                self._status_dirty.set()
-                await asyncio.sleep(STATUS_RETRY_S)
-
-    @contextlib.contextmanager
-    def _activity(self, phrase: str) -> Generator[None]:
-        """Show ``phrase`` on the dashboard for the duration of the block."""
-        # A set, not a string: a permission decision on a socket-handler task
-        # and a triage on the event loop run concurrently, so each must show
-        # and clear exactly its own phrase.
-        self._activity_phrases.add(phrase)
-        self._status_dirty.set()
-        try:
-            yield
-        finally:
-            self._activity_phrases.discard(phrase)
-            self._status_dirty.set()
+    def _live_status(self) -> LiveStatusPayload:
+        """Return the session's current live status."""
+        return LiveStatusPayload(
+            state=self.state,
+            activity=self._status.current_activity,
+            permission_prompt=self._reports_permission_prompt(),
+            task_activity=self.task_activity,
+            pane_id=self.pane_id,
+            claude_session_id=self.claude_session_id,
+            transcript_path=self.transcript_path,
+        )
 
     async def _event_loop(self) -> None:
         """Run queued jobs one at a time until the drive task is cancelled."""
@@ -625,7 +583,7 @@ class SessionBroker:
         Returns:
             The decision reply for the hook.
         """
-        with self._activity(PHRASE_PERMISSION):
+        with self._status.activity(PHRASE_PERMISSION):
             decision = await self.permission.decide(
                 payload.tool_name,
                 payload.tool_input,
@@ -655,7 +613,7 @@ class SessionBroker:
         # LLM call.
         cached = self._ask_decisions.get(payload.tool_use_id)
         if cached is None:
-            with self._activity(PHRASE_ASK):
+            with self._status.activity(PHRASE_ASK):
                 cached = await self._decide_ask(payload)
             self._ask_decisions[payload.tool_use_id] = cached
         return Response(id=env.id, ok=True, payload=cached.model_dump())
@@ -806,7 +764,7 @@ class SessionBroker:
         )
         escalation.clarify_tasks.add(task)
         try:
-            with self._activity(PHRASE_CLARIFY):
+            with self._status.activity(PHRASE_CLARIFY):
                 async with asyncio.timeout(CLARIFY_TIMEOUT_S):
                     result = await task
         except asyncio.CancelledError:
@@ -878,7 +836,7 @@ class SessionBroker:
         """Record ``menu`` as the picker open in the pane."""
         previous = self._open_menu
         self._open_menu = menu
-        self._status_dirty.set()
+        self._status.mark_dirty()
         # A picker opening means the earlier one closed. The master supersedes
         # its escalation on the new raise, so only the log row is written,
         # queued behind the earlier raise so it follows that raise's row.
@@ -1003,13 +961,14 @@ class SessionBroker:
         Returns:
             The status reply.
         """
+        live = self._live_status()
         return Response(
             id=env.id,
             ok=True,
             payload=StatusPayload(
-                state=self.state,
-                permission_prompt=self._reports_permission_prompt(),
-                task_activity=self.task_activity,
+                state=live.state,
+                permission_prompt=live.permission_prompt,
+                task_activity=live.task_activity,
                 pending_proposal=(
                     self._pending.payload if self._pending is not None else None
                 ),
@@ -1154,7 +1113,7 @@ class SessionBroker:
                 / f"{self.claude_session_id}.jsonl"
             )
         self.session_bound.set()
-        self._status_dirty.set()
+        self._status.mark_dirty()
 
     # ── queued jobs ───────────────────────────────────────────────────────
 
@@ -1182,7 +1141,7 @@ class SessionBroker:
         events = self._read_transcript()  # context ONLY; input is the message
         self._last_event_count = len(events)
         assert self._llm_call is not None
-        with self._activity(PHRASE_TRIAGE):
+        with self._status.activity(PHRASE_TRIAGE):
             result = await triage(
                 self._llm_call,
                 self.cfg.session_model,
@@ -1193,7 +1152,7 @@ class SessionBroker:
             )
         if not isinstance(result, EscalateCall):
             self.task_activity = result.task_activity
-            self._status_dirty.set()
+            self._status.mark_dirty()
         if isinstance(result, AnswerCall):
             if self.budget_count >= self.cfg.budget_max:
                 await self._escalate_handover(result, last_assistant_message, events)
@@ -1346,19 +1305,19 @@ class SessionBroker:
             reason=reason,
             analysis=analysis,
         )
-        try:
-            await self._to_master(payload)
-        except MasterRefusedError as exc:
-            # The picker is still in the pane, so the claim stays; only the
-            # escalation the master refused is dropped.
-            self._log(
-                DecisionLogKind.QUESTION_REFUSED,
-                "question escalation refused",
-                str(exc),
-            )
-            menu = self._open_menu
-            if menu is not None and menu.escalation_id == escalation_id:
-                menu.escalation_id = None
+        nack = await self._to_master(payload, tolerated=frozenset(NackCode))
+        if nack is None:
+            return
+        # The picker is still in the pane, so the claim stays; only the
+        # escalation the master refused is dropped.
+        self._log(
+            DecisionLogKind.QUESTION_REFUSED,
+            "question escalation refused",
+            describe_refusal(payload.MESSAGE_TYPE, nack),
+        )
+        menu = self._open_menu
+        if menu is not None and menu.escalation_id == escalation_id:
+            menu.escalation_id = None
 
     async def _log_replaced_question(self, escalation_id: str) -> None:
         """Close the question escalation of a picker a newer one replaced."""
@@ -1409,7 +1368,7 @@ class SessionBroker:
         if answer is None:
             return
         self._open_menu = None
-        self._status_dirty.set()
+        self._status.mark_dirty()
         if menu.escalation_id is None:
             return
         answered_by_developer = (
@@ -1953,26 +1912,31 @@ class SessionBroker:
             timeout_s=SUBMIT_TIMEOUT_S,
         )
 
-    async def _to_master(self, payload: WireMessage) -> None:
+    async def _to_master(
+        self,
+        payload: WireMessage,
+        *,
+        tolerated: frozenset[NackCode] = frozenset(),
+    ) -> NackPayload | None:
         """Send one message to the master and wait for its reply.
 
         Args:
             payload: The message; its ``MESSAGE_TYPE`` is the envelope type.
+            tolerated: Refusal codes the caller handles itself.
+
+        Returns:
+            ``None`` once accepted, otherwise the tolerated refusal.
 
         Raises:
-            MasterRefusedError: The master answered ``ok=False``.
+            MasterRefusedError: The master refused it with a code outside
+                ``tolerated``, or with no code.
         """
-        resp = await client.send(
+        return await send_to_master(
             Path(self.cfg.master_socket_path),
+            self.cfg.name,
             payload,
-            session_id=self.cfg.name,
-            timeout_s=MASTER_TIMEOUT_S,
+            tolerated=tolerated,
         )
-        if not resp.ok:
-            nack = parse_nack(resp)
-            raise MasterRefusedError(
-                payload.MESSAGE_TYPE, nack.error, nack.reason_code
-            )
 
     async def _fatal(self, error_class: str, detail: str) -> None:
         """Log the failure, enter the error state, and tell the master.
@@ -2035,12 +1999,12 @@ class SessionBroker:
         """Assign a new state and log the transition."""
         logger.info("session %s: %s -> %s", self.cfg.name, self.state, state)
         self.state = state
-        self._status_dirty.set()
+        self._status.mark_dirty()
 
     def _set_perm_pending(self, pending: bool) -> None:
         """Record whether the session sits on a native permission prompt."""
         self._permission_prompt_pending = pending
-        self._status_dirty.set()
+        self._status.mark_dirty()
 
     def _herdr_state(self) -> AgentStatus:
         """Report the agent's state as Herdr sees it, for the watchdog gate.

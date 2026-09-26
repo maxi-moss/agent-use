@@ -2080,7 +2080,7 @@ async def test_permission_prompt_notification_is_pushed(
 async def test_failed_push_is_retried(
     harness: Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("broker.session.broker.STATUS_RETRY_S", 0.05)
+    monkeypatch.setattr("broker.session.master_link.STATUS_RETRY_S", 0.05)
     h = harness
     await launch(h)
     await wait_live(h.master, lambda p: p["state"] == "driving")
