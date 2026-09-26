@@ -16,6 +16,7 @@ from broker.config import (
     PermissionRules,
     ResumedTask,
     SessionBrokerConfig,
+    SessionModelConfig,
     load,
 )
 
@@ -120,8 +121,7 @@ def _session_config_kwargs() -> dict[str, Any]:
         "cwd": "/private/tmp/work",
         "anchor_pane": "%1",
         "intent": "the raw intent",
-        "model_id": "test-model",
-        "max_tokens": 1024,
+        "session_model": SessionModelConfig(model_id="test-model", max_tokens=1024),
         "classifier": ClassifierConfig(),
         "embedding": EmbeddingConfig(),
         "watchdog_seconds": 300.0,

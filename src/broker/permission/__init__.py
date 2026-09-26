@@ -7,6 +7,6 @@ written here but read by whoever answers the developer.
 """
 
 from broker.permission.module import PermissionModule
-from broker.permission.permission_log import render_log as render_permission_log
+from broker.permission.permission_log import render_permission_log
 
 __all__ = ["PermissionModule", "render_permission_log"]

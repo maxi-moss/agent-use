@@ -23,6 +23,7 @@ from broker.config import (
     EmbeddingConfig,
     ResumedTask,
     SessionBrokerConfig,
+    SessionModelConfig,
 )
 from broker.protocol import client
 from broker.protocol.constants import T_LIVE_STATUS, T_PROMPT_PROPOSAL, T_STATUS
@@ -61,8 +62,7 @@ def _resume_config(home: Path) -> SessionBrokerConfig:
         anchor_pane="w3:p1",
         intent="the raw intent",
         budget_count=6,
-        model_id="test-model",
-        max_tokens=1024,
+        session_model=SessionModelConfig(model_id="test-model", max_tokens=1024),
         classifier=ClassifierConfig(model_id="test-classifier"),
         embedding=EmbeddingConfig(),
         watchdog_seconds=3600.0,  # never fires within the test

@@ -1,15 +1,15 @@
 """build_outcome: decision-log rows -> SessionOutcome, pure and renderer-neutral."""
 
-from broker.decision_log import DecisionKind, DecisionRow
+from broker.decision_log import DecisionLogKind, DecisionLogRow
 from broker.master.outcome import OutcomeEvent, build_outcome
 from broker.protocol.constants import SessionState
 
 
-def _row(kind: DecisionKind, **fields: str) -> DecisionRow:
-    return DecisionRow(kind=kind, ts=f"t-{kind}", **fields)
+def _row(kind: DecisionLogKind, **fields: str) -> DecisionLogRow:
+    return DecisionLogRow(kind=kind, ts=f"t-{kind}", **fields)
 
 
-def _build(state: SessionState, *rows: DecisionRow):
+def _build(state: SessionState, *rows: DecisionLogRow):
     return build_outcome(
         session_id="s1", title="Attach recovery", state=state, rows=list(rows)
     )
@@ -22,10 +22,10 @@ def _kinds_and_labels(history: tuple[OutcomeEvent, ...]) -> list[tuple[str, str]
 def test_kept_actions_in_order_and_empty_summaries_skipped() -> None:
     out = _build(
         SessionState.COMPLETED,
-        _row(DecisionKind.ANSWERED, task_summary="Checked restart behavior"),
-        _row(DecisionKind.ANSWERED, task_summary=""),
-        _row(DecisionKind.ANSWERED, task_summary="Pinned the socket timeout"),
-        _row(DecisionKind.ANSWERED, task_summary="Reran the suite"),
+        _row(DecisionLogKind.ANSWERED, task_summary="Checked restart behavior"),
+        _row(DecisionLogKind.ANSWERED, task_summary=""),
+        _row(DecisionLogKind.ANSWERED, task_summary="Pinned the socket timeout"),
+        _row(DecisionLogKind.ANSWERED, task_summary="Reran the suite"),
     )
     assert _kinds_and_labels(out.history) == [
         ("action", "Checked restart behavior"),
@@ -38,10 +38,12 @@ def test_escalation_carries_reason_and_next_kept_action_as_solution() -> None:
     out = _build(
         SessionState.COMPLETED,
         _row(
-            DecisionKind.ESCALATION_RAISED, task_summary="Reason X", escalation_id="e1"
+            DecisionLogKind.ESCALATION_RAISED,
+            task_summary="Reason X",
+            escalation_id="e1",
         ),
-        _row(DecisionKind.DISPATCHED, escalation_id="e1", detail="go with B"),
-        _row(DecisionKind.ANSWERED, task_summary="Did Y"),
+        _row(DecisionLogKind.DISPATCHED, escalation_id="e1", detail="go with B"),
+        _row(DecisionLogKind.ANSWERED, task_summary="Did Y"),
     )
     assert _kinds_and_labels(out.history) == [
         ("escalation", "Escalation"),
@@ -57,17 +59,21 @@ def test_retraction_closes_only_its_own_escalation() -> None:
     out = _build(
         SessionState.COMPLETED,
         _row(
-            DecisionKind.ESCALATION_RAISED, task_summary="Reason X", escalation_id="e1"
+            DecisionLogKind.ESCALATION_RAISED,
+            task_summary="Reason X",
+            escalation_id="e1",
         ),
         _row(
-            DecisionKind.ESCALATION_RAISED, task_summary="Reason Q", escalation_id="q1"
+            DecisionLogKind.ESCALATION_RAISED,
+            task_summary="Reason Q",
+            escalation_id="q1",
         ),
         _row(
-            DecisionKind.RETRACTED,
+            DecisionLogKind.RETRACTED,
             task_summary="User answered the questions in the pane",
             escalation_id="q1",
         ),
-        _row(DecisionKind.ANSWERED, task_summary="Did Y"),
+        _row(DecisionLogKind.ANSWERED, task_summary="Did Y"),
     )
     assert [ev.resolution for ev in out.history] == [
         "Did Y",
@@ -80,7 +86,9 @@ def test_escalation_without_follow_up_gets_fallback() -> None:
     out = _build(
         SessionState.STOPPED,
         _row(
-            DecisionKind.ESCALATION_RAISED, task_summary="Reason X", escalation_id="e1"
+            DecisionLogKind.ESCALATION_RAISED,
+            task_summary="Reason X",
+            escalation_id="e1",
         ),
     )
     assert out.history[0].resolution == "(no recorded follow-up)"
@@ -89,9 +97,9 @@ def test_escalation_without_follow_up_gets_fallback() -> None:
 def test_developer_prompt_result_and_fallback() -> None:
     out = _build(
         SessionState.COMPLETED,
-        _row(DecisionKind.DEVELOPER_PROMPT, detail="switch to fastapi please"),
-        _row(DecisionKind.ANSWERED, task_summary="Switched to fastapi"),
-        _row(DecisionKind.DEVELOPER_PROMPT, detail="one more thing"),
+        _row(DecisionLogKind.DEVELOPER_PROMPT, detail="switch to fastapi please"),
+        _row(DecisionLogKind.ANSWERED, task_summary="Switched to fastapi"),
+        _row(DecisionLogKind.DEVELOPER_PROMPT, detail="one more thing"),
     )
     assert _kinds_and_labels(out.history) == [
         ("developer", "Developer instruction"),
@@ -106,13 +114,13 @@ def test_completion_sets_headline_and_resolves_pending_escalation() -> None:
     out = _build(
         SessionState.COMPLETED,
         _row(
-            DecisionKind.ESCALATION_RAISED,
+            DecisionLogKind.ESCALATION_RAISED,
             task_summary="Asked about the schema",
             escalation_id="e1",
         ),
-        _row(DecisionKind.DISPATCHED, escalation_id="e1"),
+        _row(DecisionLogKind.DISPATCHED, escalation_id="e1"),
         _row(
-            DecisionKind.COMPLETED,
+            DecisionLogKind.COMPLETED,
             headline="H",
             supporting="S",
             task_summary="Wrapped up",
@@ -131,11 +139,18 @@ def test_completion_sets_headline_and_resolves_pending_escalation() -> None:
 def test_error_state_uses_last_fatal_row_and_keeps_history() -> None:
     out = _build(
         SessionState.ERROR,
-        _row(DecisionKind.ANSWERED, task_summary="Started the migration"),
+        _row(DecisionLogKind.ANSWERED, task_summary="Started the migration"),
+        _row(DecisionLogKind.ERROR, reasoning="HerdrError", detail="pane vanished"),
         _row(
-            DecisionKind.ERROR, reasoning="stale dispatch_decision ignored", detail="e9"
+            DecisionLogKind.DISPATCH_STALE,
+            reasoning="stale dispatch_decision ignored",
+            escalation_id="e9",
         ),
-        _row(DecisionKind.ERROR, reasoning="HerdrError", detail="pane vanished"),
+        _row(
+            DecisionLogKind.QUESTION_REFUSED,
+            reasoning="question escalation refused",
+            escalation_id="q9",
+        ),
     )
     assert out.status == "error"
     assert out.headline == "Session ended with an error"
@@ -149,10 +164,27 @@ def test_error_state_without_error_row() -> None:
     assert out.supporting == "no error detail recorded"
 
 
+def test_non_fatal_error_kinds_are_not_the_fatal() -> None:
+    out = _build(
+        SessionState.ERROR,
+        _row(
+            DecisionLogKind.DISPATCH_STALE,
+            reasoning="stale dispatch_decision ignored",
+            escalation_id="e9",
+        ),
+        _row(
+            DecisionLogKind.QUESTION_REFUSED,
+            reasoning="question escalation refused",
+            escalation_id="q9",
+        ),
+    )
+    assert out.supporting == "no error detail recorded"
+
+
 def test_stopped_state_is_neutral() -> None:
     out = _build(
         SessionState.STOPPED,
-        _row(DecisionKind.ANSWERED, task_summary="Did a thing"),
+        _row(DecisionLogKind.ANSWERED, task_summary="Did a thing"),
     )
     assert out.status == "stopped"
     assert out.headline == "Session ended without completing"
@@ -162,17 +194,17 @@ def test_stopped_state_is_neutral() -> None:
 def test_reactivated_session_renders_both_runs_with_divider() -> None:
     out = _build(
         SessionState.COMPLETED,
-        _row(DecisionKind.ANSWERED, task_summary="A1"),
+        _row(DecisionLogKind.ANSWERED, task_summary="A1"),
         _row(
-            DecisionKind.COMPLETED,
+            DecisionLogKind.COMPLETED,
             headline="First done",
             supporting="S1",
             task_summary="A2",
         ),
-        _row(DecisionKind.REACTIVATED, detail="new intent"),
-        _row(DecisionKind.ANSWERED, task_summary="B1"),
+        _row(DecisionLogKind.REACTIVATED, detail="new intent"),
+        _row(DecisionLogKind.ANSWERED, task_summary="B1"),
         _row(
-            DecisionKind.COMPLETED,
+            DecisionLogKind.COMPLETED,
             headline="Second done",
             supporting="S2",
             task_summary="B2",
@@ -192,10 +224,10 @@ def test_reactivated_session_renders_both_runs_with_divider() -> None:
 def test_ignored_kinds_produce_no_events() -> None:
     out = _build(
         SessionState.COMPLETED,
-        _row(DecisionKind.NO_ACTION),
-        _row(DecisionKind.CLARIFIED, detail="because"),
-        _row(DecisionKind.ASK_VERIFIED, detail="tool-1"),
-        _row(DecisionKind.ADOPTED, detail="count=3"),
+        _row(DecisionLogKind.NO_ACTION),
+        _row(DecisionLogKind.CLARIFIED, detail="because"),
+        _row(DecisionLogKind.ASK_VERIFIED, detail="tool-1"),
+        _row(DecisionLogKind.ADOPTED, detail="count=3"),
     )
     assert out.history == ()
     assert out.title == "Attach recovery"

@@ -26,6 +26,7 @@ from broker.config import (
     BrokerConfig,
     ResumedTask,
     SessionBrokerConfig,
+    SessionModelConfig,
 )
 from broker.herdr import driver
 from broker.paths import BrokerPaths
@@ -1393,8 +1394,9 @@ class MasterRuntime:
             anchor_pane=record.anchor_pane,
             intent=record.intent,
             budget_count=record.budget_count,
-            model_id=self.cfg.model_id,
-            max_tokens=self.cfg.max_tokens,
+            session_model=SessionModelConfig(
+                model_id=self.cfg.model_id, max_tokens=self.cfg.max_tokens
+            ),
             classifier=self.cfg.classifier,
             embedding=self.cfg.embedding,
             watchdog_seconds=self.cfg.watchdog_seconds,

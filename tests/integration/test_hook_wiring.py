@@ -45,7 +45,12 @@ from broker.protocol.constants import (
 from broker.protocol.schemas import Envelope, PermissionSuggestion, Response
 from broker.protocol.server import serve_unix
 from broker.session.broker import SessionBroker
-from broker.config import ClassifierConfig, EmbeddingConfig, SessionBrokerConfig
+from broker.config import (
+    ClassifierConfig,
+    EmbeddingConfig,
+    SessionBrokerConfig,
+    SessionModelConfig,
+)
 from broker.paths import BrokerPaths
 
 FIXTURES = Path(__file__).parent.parent / "fixtures"
@@ -267,8 +272,7 @@ def make_cfg(home: Path, *, budget_max: int = 8) -> SessionBrokerConfig:
         cwd=str(cwd),
         anchor_pane="w3:p1",
         intent="the raw intent",
-        model_id="test-model",
-        max_tokens=1024,
+        session_model=SessionModelConfig(model_id="test-model", max_tokens=1024),
         classifier=ClassifierConfig(model_id="test-classifier"),
         embedding=EmbeddingConfig(),
         watchdog_seconds=300.0,

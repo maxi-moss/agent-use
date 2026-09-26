@@ -33,7 +33,7 @@ from anthropic.types import (
 from pydantic import ValidationError
 
 from broker import decision_log
-from broker.decision_log import DecisionKind
+from broker.decision_log import DecisionLogKind, DecisionLogRow
 from broker import llm as llm_module
 from broker.index.embedding import EmbeddingError, OpenAIEmbedder
 from broker.index.retrieval import RetrievalError, retrieve as retrieve_code
@@ -41,7 +41,6 @@ from broker.index.schemas import GroundingContext
 from broker.llm import LLMCallError, LLMCaller, ToolCall
 from broker.config import (
     AdoptedSession,
-    BrokerConfig,
     EmbeddingConfig,
     ResumedTask,
     SessionBrokerConfig,
@@ -66,26 +65,13 @@ from broker.protocol.constants import (
     T_APPROVE_PROMPT,
     T_CLARIFY_ESCALATION,
     T_ASK_QUESTION,
-    T_BUDGET_UPDATE,
-    T_COMPLETION,
-    T_DECISION_DELIVERED,
-    T_DECISION_UNDELIVERED,
     T_DISPATCH_DECISION,
-    T_ESCALATION,
-    T_ESCALATION_RETRACT,
-    T_FATAL_ERROR,
     T_GET_DECISION_LOG,
     T_GET_PERMISSION_LOG,
     T_HOOK_EVENT,
-    T_LIVE_STATUS,
-    T_PANE_ESCALATION,
-    T_PANE_RETRACT,
     T_PERMISSION_REQUEST,
-    T_PROMPT_PROPOSAL,
-    T_PROMPT_UNDELIVERED,
     T_REACTIVATE,
     T_SEND_PROMPT,
-    T_SESSION_ENDED,
     T_SHUTDOWN,
     T_STATUS,
 )
@@ -96,21 +82,25 @@ from broker.protocol.schemas import (
     BudgetUpdatePayload,
     ClarifyEscalationReplyPayload,
     ClarifyEscalationRequestPayload,
+    CompletionPayload,
     AskQuestionDecisionPayload,
     AskQuestionRequestPayload,
     DecisionDeliveredPayload,
     DecisionLogPayload,
+    DecisionLogRequestPayload,
     DecisionUndeliveredPayload,
     DispatchDecisionPayload,
     Envelope,
     EscalationDisclosure,
     EscalationPayload,
     EscalationRetractPayload,
+    FatalErrorPayload,
     HookEventPayload,
     LiveStatusPayload,
     PaneRetractPayload,
     PermissionDecisionPayload,
     PermissionLogPayload,
+    PermissionLogRequestPayload,
     PermissionRequestPayload,
     PromptProposalPayload,
     PromptUndeliveredPayload,
@@ -118,8 +108,13 @@ from broker.protocol.schemas import (
     ReactivatePayload,
     Response,
     RetrievedSymbol,
+    SESSION_SOCKET_PAYLOADS,
     SendPromptPayload,
+    SessionEndedPayload,
+    ShutdownPayload,
     StatusPayload,
+    StatusRequestPayload,
+    WireMessage,
     nack_response,
     parse_nack,
 )
@@ -176,6 +171,7 @@ PHRASE_CLARIFY = "answering a question about the escalation…"
 STATUS_RETRY_S = 1.0
 
 Job = Callable[[], Awaitable[None]]
+_Handler = Callable[[Envelope, Any], Awaitable[Response | None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,14 +325,6 @@ class SessionBroker:
                 built from ``cfg`` — tests pass a fake or a spy.
         """
         self.cfg = cfg
-        self.broker_cfg = BrokerConfig(
-            model_id=cfg.model_id,
-            max_tokens=cfg.max_tokens,
-            watchdog_seconds=cfg.watchdog_seconds,
-            budget_max=cfg.budget_max,
-            broker_home=cfg.broker_home,
-            embedding=cfg.embedding,
-        )
         self._llm_call = llm_call
         self._retrieve = retrieve
         self.state: SessionState = SessionState.SPAWNING
@@ -381,6 +369,20 @@ class SessionBroker:
         self.watchdog = Watchdog(
             cfg.watchdog_seconds, self._herdr_state, self._reconcile
         )
+        self._handlers: dict[str, _Handler] = {
+            T_PERMISSION_REQUEST: self._on_permission_request,
+            T_ASK_QUESTION: self._on_ask_question,
+            T_CLARIFY_ESCALATION: self._on_clarify_escalation,
+            T_HOOK_EVENT: self._on_hook_event,
+            T_APPROVE_PROMPT: self._on_approve_prompt,
+            T_DISPATCH_DECISION: self._on_dispatch_decision,
+            T_REACTIVATE: self._on_reactivate,
+            T_SEND_PROMPT: self._on_send_prompt,
+            T_STATUS: self._on_status,
+            T_GET_DECISION_LOG: self._on_get_decision_log,
+            T_GET_PERMISSION_LOG: self._on_get_permission_log,
+            T_SHUTDOWN: self._on_shutdown,
+        }
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -391,7 +393,7 @@ class SessionBroker:
         if self._llm_call is None:
             self._llm_call = _bind_llm(llm_module.build_client())
         if self._retrieve is None:
-            self._retrieve = _bind_retrieve(self._paths, self.broker_cfg.embedding)
+            self._retrieve = _bind_retrieve(self._paths, self.cfg.embedding)
         self.watchdog.start()
         self._status_task = asyncio.create_task(self._status_sender())
         drive = self._run_task = asyncio.create_task(self._drive())
@@ -464,7 +466,7 @@ class SessionBroker:
         self.transcript_path = adopt.transcript_path
         self.session_bound.set()
         self._log(
-            DecisionKind.ADOPTED,
+            DecisionLogKind.ADOPTED,
             "reassigned to a session that was already running",
             f"pane={adopt.pane_id} claude_session={adopt.claude_session_id}",
         )
@@ -481,7 +483,7 @@ class SessionBroker:
         """
         self._set_task(self._task.raw, resume.approved_prompt)
         self._log(
-            DecisionKind.RESUMED,
+            DecisionLogKind.RESUMED,
             "attached to a session whose previous broker is gone",
             f"completed={resume.completed}",
         )
@@ -566,7 +568,7 @@ class SessionBroker:
             try:
                 grounding = await ground_intent(
                     self._llm_call,
-                    self.broker_cfg,
+                    self.cfg.session_model,
                     retrieve=self._retrieve,
                     intent=intent,
                     cwd=Path(self.cfg.cwd),
@@ -586,7 +588,7 @@ class SessionBroker:
         )
         self._pending = _PendingApproval(approval, payload)
         self._set_state(SessionState.AWAITING_APPROVAL)
-        await self._to_master(T_PROMPT_PROPOSAL, payload.model_dump())
+        await self._to_master(payload)
         # Approval is synchronous and blocking — no timeout.
         approved = await approval
         self._set_task(intent, approved.prompt)
@@ -609,7 +611,7 @@ class SessionBroker:
                 transcript_path=self.transcript_path,
             )
             try:
-                await self._to_master(T_LIVE_STATUS, payload.model_dump())
+                await self._to_master(payload)
             except Exception as exc:
                 # Master unreachable: re-send the current snapshot next loop;
                 # the backoff keeps a dead master from spinning the broker hot.
@@ -645,21 +647,33 @@ class SessionBroker:
     # ── socket handler: reply, then enqueue — never slow work ─────────────
 
     async def handle(self, env: Envelope) -> Response | None:
-        """Dispatch one socket envelope, turning payload rejects into replies.
+        """Validate one socket envelope and run its message's handler.
 
         Args:
             env: Decoded envelope from the master or the hook client.
 
         Returns:
-            The reply to write back, or ``None`` for fire-and-forget messages.
+            The handler's reply, the NACK refusing an unknown type or a
+            malformed payload, or ``None`` for fire-and-forget messages.
         """
+        validate = SESSION_SOCKET_PAYLOADS.get(env.type)
+        if validate is None:
+            logger.error("unknown message type %r", env.type)
+            return nack_response(
+                env, f"unknown message type {env.type!r}", NackCode.MALFORMED
+            )
         try:
-            return await self._handle(env)
+            payload = validate(env.payload)
         except ValidationError as exc:
             logger.error("invalid %s payload: %s", env.type, exc)
-            return nack_response(env, str(exc), None)
+            return nack_response(
+                env, f"malformed {env.type}: {exc}", NackCode.MALFORMED
+            )
+        return await self._handlers[env.type](env, payload)
 
-    async def _on_permission_request(self, env: Envelope) -> Response:
+    async def _on_permission_request(
+        self, env: Envelope, payload: PermissionRequestPayload
+    ) -> Response:
         """Judge a permission request and reply with the decision.
 
         The triage module is awaited right here rather than enqueued. Each
@@ -668,12 +682,12 @@ class SessionBroker:
         the whole coding session behind an unrelated turn classification.
 
         Args:
-            env: Envelope carrying a ``PermissionRequestPayload``.
+            env: Envelope the request arrived in.
+            payload: The tool call awaiting a permission decision.
 
         Returns:
             The decision reply for the hook.
         """
-        payload = PermissionRequestPayload.model_validate(env.payload)
         with self._activity(PHRASE_PERMISSION):
             decision = await self.permission.decide(
                 payload.tool_name,
@@ -686,17 +700,19 @@ class SessionBroker:
             reply = PermissionDecisionPayload(decision=DECISION_ESCALATED)
         return Response(id=env.id, ok=True, payload=reply.model_dump())
 
-    async def _on_ask_question(self, env: Envelope) -> Response:
+    async def _on_ask_question(
+        self, env: Envelope, payload: AskQuestionRequestPayload
+    ) -> Response:
         """Decide a pending AskUserQuestion and reply answer-or-escalated.
 
         Args:
-            env: Envelope carrying an ``AskQuestionRequestPayload``.
+            env: Envelope the question arrived in.
+            payload: The pending question.
 
         Returns:
             The decision reply for the hook.
         """
         self.watchdog.reset()
-        payload = AskQuestionRequestPayload.model_validate(env.payload)
         # Cached per tool_use_id: PreToolUse can fire several times per logical
         # operation, and a duplicate must get the same reply without a second
         # LLM call.
@@ -729,10 +745,10 @@ class SessionBroker:
             # The developer is already engaged (escalated/completed/...): do
             # not raise a second escalation on top; let the picker render.
             self._log(
-                DecisionKind.ASK_SKIPPED,
+                DecisionLogKind.ASK_SKIPPED,
                 f"question arrived in state {self.state!r}; picker left to "
                 "the developer",
-                tool_use_id,
+                tool_use_id=tool_use_id,
             )
             self._claim_menu(_OpenMenu(tool_use_id, None, None))
             return escalated
@@ -757,7 +773,7 @@ class SessionBroker:
                 events = self._read_transcript()
                 result = await ask.decide_questions(
                     self._llm_call,
-                    self.broker_cfg,
+                    self.cfg.session_model,
                     intent=self._intent(),
                     events=events,
                     questions=questions,
@@ -782,7 +798,7 @@ class SessionBroker:
         call, answers = result
         updated_input = dict(payload.tool_input)
         updated_input["answers"] = answers
-        self._log(DecisionKind.ASK_ANSWERED, call.reasoning, json.dumps(answers))
+        self._log(DecisionLogKind.ASK_ANSWERED, call.reasoning, json.dumps(answers))
         self._ask_expected[tool_use_id] = _InjectedAnswers(
             payload.tool_input, answers
         )
@@ -800,7 +816,9 @@ class SessionBroker:
             decision=ASK_DECISION_ANSWER, updated_input=updated_input
         )
 
-    async def _on_clarify_escalation(self, env: Envelope) -> Response:
+    async def _on_clarify_escalation(
+        self, env: Envelope, req: ClarifyEscalationRequestPayload
+    ) -> Response:
         """Answer a read-only question about the live escalation, inline.
 
         Reuses the broker's own LLM seam; never resolves the escalation or
@@ -810,13 +828,13 @@ class SessionBroker:
         await blocks only this connection.
 
         Args:
-            env: Envelope carrying a ``ClarifyEscalationRequestPayload``.
+            env: Envelope the question arrived in.
+            req: The developer's question about the live escalation.
 
         Returns:
             The answer reply, or an ``ok=False`` reply naming why no answer is
             given (escalation not live, resolved under the call, or LLM error).
         """
-        req = ClarifyEscalationRequestPayload.model_validate(env.payload)
         active = self._active_escalation
         if (
             self.state != SessionState.ESCALATED
@@ -834,15 +852,15 @@ class SessionBroker:
             events = self._read_transcript()
         except Exception as exc:
             self._log(
-                DecisionKind.CLARIFY_FAILED,
+                DecisionLogKind.CLARIFY_FAILED,
                 f"{type(exc).__name__}: {exc}",
-                req.escalation_id,
+                escalation_id=req.escalation_id,
             )
             return nack_response(env, f"{type(exc).__name__}: {exc}", None)
         task = asyncio.create_task(
             clarify.clarify(
                 self._llm_call,
-                self.broker_cfg,
+                self.cfg.session_model,
                 intent=self._intent(),
                 escalation=active,
                 question=req.question,
@@ -863,9 +881,9 @@ class SessionBroker:
             return resolved
         except Exception as exc:
             self._log(
-                DecisionKind.CLARIFY_FAILED,
+                DecisionLogKind.CLARIFY_FAILED,
                 f"{type(exc).__name__}: {exc}",
-                req.escalation_id,
+                escalation_id=req.escalation_id,
             )
             return nack_response(env, f"{type(exc).__name__}: {exc}", None)
         finally:
@@ -882,7 +900,7 @@ class SessionBroker:
             or live.escalation_id != req.escalation_id
         ):
             return resolved
-        self._log(DecisionKind.CLARIFIED, result.reasoning, result.answer)
+        self._log(DecisionLogKind.CLARIFIED, result.reasoning, result.answer)
         return Response(
             id=env.id,
             ok=True,
@@ -931,124 +949,188 @@ class SessionBroker:
         if previous is not None and previous.escalation_id is not None:
             self.jobs.put_nowait(lambda: self._retract_superseded_menu(previous))
 
-    async def _handle(self, env: Envelope) -> Response | None:
-        """Reply to one message type, enqueuing anything slow onto the queue.
+    async def _on_hook_event(
+        self, env: Envelope, hook: HookEventPayload
+    ) -> None:
+        """Route one fire-and-forget Claude Code hook event.
 
         Args:
-            env: Decoded envelope; its ``type`` selects the branch and its
-                ``payload`` is validated per branch.
+            env: Envelope the event arrived in.
+            hook: The hook event.
+        """
+        self.watchdog.reset()
+        await self._dispatch_hook(hook)
+
+    async def _on_approve_prompt(
+        self, env: Envelope, approved: ApprovePromptPayload
+    ) -> Response:
+        """Release the pending proposal with the prompt the developer approved.
+
+        Args:
+            env: Envelope the approval arrived in.
+            approved: The approved prompt and the proposal it answers.
 
         Returns:
-            The reply to write back, or ``None`` for ``hook_event``. Unknown
-            types get an ``ok=False`` reply.
+            The ACK, or a ``STALE_PROPOSAL`` NACK when it answers no pending
+            proposal.
         """
-        if env.type == T_PERMISSION_REQUEST:
-            return await self._on_permission_request(env)
+        if (
+            self._pending is None
+            or self._pending.future.done()
+            or approved.proposal_id != self._pending.payload.proposal_id
+        ):
+            logger.warning("stale approve_prompt ignored")
+            return nack_response(env, "stale proposal", NackCode.STALE_PROPOSAL)
+        self._pending.future.set_result(approved)
+        return Response(id=env.id, ok=True)
 
-        if env.type == T_ASK_QUESTION:
-            return await self._on_ask_question(env)
+    async def _on_dispatch_decision(
+        self, env: Envelope, decision: DispatchDecisionPayload
+    ) -> Response:
+        """Queue delivery of the developer's decision into the pane.
 
-        if env.type == T_CLARIFY_ESCALATION:
-            return await self._on_clarify_escalation(env)
+        Args:
+            env: Envelope the decision arrived in.
+            decision: The developer's decision on an escalation.
 
-        if env.type == T_HOOK_EVENT:
-            self.watchdog.reset()
-            hook = HookEventPayload.model_validate(env.payload)
-            await self._dispatch_hook(hook)
-            return None  # fire-and-forget
+        Returns:
+            The ACK.
+        """
+        self.jobs.put_nowait(lambda: self._deliver_decision(decision))
+        return Response(id=env.id, ok=True)
 
-        if env.type == T_APPROVE_PROMPT:
-            approved = ApprovePromptPayload.model_validate(env.payload)
-            if (
-                self._pending is None
-                or self._pending.future.done()
-                or approved.proposal_id != self._pending.payload.proposal_id
-            ):
-                logger.warning("stale approve_prompt ignored")
-                return nack_response(
-                    env, "stale proposal", NackCode.STALE_PROPOSAL
-                )
-            self._pending.future.set_result(approved)
-            return Response(id=env.id, ok=True)
+    async def _on_reactivate(
+        self, env: Envelope, reactivate: ReactivatePayload
+    ) -> Response:
+        """Queue a new task for a session that has completed its last one.
 
-        if env.type == T_DISPATCH_DECISION:
-            decision = DispatchDecisionPayload.model_validate(env.payload)
-            self.jobs.put_nowait(lambda: self._deliver_decision(decision))
-            return Response(id=env.id, ok=True)
+        Args:
+            env: Envelope the request arrived in.
+            reactivate: The new task's intent.
 
-        if env.type == T_REACTIVATE:
-            reactivate = ReactivatePayload.model_validate(env.payload)
-            if self.state != SessionState.COMPLETED:
-                return nack_response(
-                    env,
-                    f"session is {self.state!r}, not 'completed' — reassign a "
-                    "new broker instead of displacing the task this one is "
-                    "still driving",
-                    NackCode.WRONG_STATE,
-                )
-            # Closes the gate here, not in the job: a second reactivate
-            # arriving before the queue drains must not pass it too.
-            self._set_state(SessionState.GROUNDING)
-            self.jobs.put_nowait(lambda: self._reactivate(reactivate))
-            return Response(id=env.id, ok=True)
-
-        if env.type == T_SEND_PROMPT:
-            prompt = SendPromptPayload.model_validate(env.payload)
-            if self.state in (SessionState.ERROR, SessionState.STOPPED):
-                return nack_response(
-                    env,
-                    f"session is {self.state!r} — this broker no longer drives "
-                    "its pane",
-                    NackCode.WRONG_STATE,
-                )
-            what = self._native_prompt()
-            if what is not None:
-                return nack_response(
-                    env,
-                    f"{what} is open in pane {self.pane_id or '?'} — the "
-                    "developer answers it there before a prompt can be typed",
-                    NackCode.WRONG_STATE,
-                )
-            self.jobs.put_nowait(lambda: self._send_developer_prompt(prompt))
-            return Response(id=env.id, ok=True)
-
-        if env.type == T_STATUS:
-            return Response(
-                id=env.id,
-                ok=True,
-                payload=StatusPayload(
-                    state=self.state,
-                    permission_prompt=self._reports_permission_prompt(),
-                    task_activity=self.task_activity,
-                    pending_proposal=(
-                        self._pending.payload if self._pending is not None else None
-                    ),
-                ).model_dump(),
+        Returns:
+            The ACK, or a ``WRONG_STATE`` NACK unless the session is completed.
+        """
+        if self.state != SessionState.COMPLETED:
+            return nack_response(
+                env,
+                f"session is {self.state!r}, not 'completed' — reassign a "
+                "new broker instead of displacing the task this one is "
+                "still driving",
+                NackCode.WRONG_STATE,
             )
+        # Closes the gate here, not in the job: a second reactivate
+        # arriving before the queue drains must not pass it too.
+        self._set_state(SessionState.GROUNDING)
+        self.jobs.put_nowait(lambda: self._reactivate(reactivate))
+        return Response(id=env.id, ok=True)
 
-        if env.type == T_GET_DECISION_LOG:
-            return Response(
-                id=env.id,
-                ok=True,
-                payload=DecisionLogPayload(
-                    text=decision_log.render_log(self.decision_log_path)
-                ).model_dump(),
+    async def _on_send_prompt(
+        self, env: Envelope, prompt: SendPromptPayload
+    ) -> Response:
+        """Queue the developer's prompt for typing into the pane.
+
+        Args:
+            env: Envelope the prompt arrived in.
+            prompt: The developer's prompt.
+
+        Returns:
+            The ACK, or a ``WRONG_STATE`` NACK when the broker no longer
+            drives the pane or a native prompt holds it.
+        """
+        if self.state in (SessionState.ERROR, SessionState.STOPPED):
+            return nack_response(
+                env,
+                f"session is {self.state!r} — this broker no longer drives "
+                "its pane",
+                NackCode.WRONG_STATE,
             )
-
-        if env.type == T_GET_PERMISSION_LOG:
-            return Response(
-                id=env.id,
-                ok=True,
-                payload=PermissionLogPayload(
-                    text=render_permission_log(self.permission_log_path)
-                ).model_dump(),
+        what = self._native_prompt()
+        if what is not None:
+            return nack_response(
+                env,
+                f"{what} is open in pane {self.pane_id or '?'} — the "
+                "developer answers it there before a prompt can be typed",
+                NackCode.WRONG_STATE,
             )
+        self.jobs.put_nowait(lambda: self._send_developer_prompt(prompt))
+        return Response(id=env.id, ok=True)
 
-        if env.type == T_SHUTDOWN:
-            self._request_stop()
-            return Response(id=env.id, ok=True)
+    async def _on_status(self, env: Envelope, p: StatusRequestPayload) -> Response:
+        """Reply with the session's current status snapshot.
 
-        return nack_response(env, f"unknown type {env.type!r}", None)
+        Args:
+            env: Envelope the request arrived in.
+            p: The empty status request.
+
+        Returns:
+            The status reply.
+        """
+        return Response(
+            id=env.id,
+            ok=True,
+            payload=StatusPayload(
+                state=self.state,
+                permission_prompt=self._reports_permission_prompt(),
+                task_activity=self.task_activity,
+                pending_proposal=(
+                    self._pending.payload if self._pending is not None else None
+                ),
+            ).model_dump(),
+        )
+
+    async def _on_get_decision_log(
+        self, env: Envelope, p: DecisionLogRequestPayload
+    ) -> Response:
+        """Reply with the rendered decision log.
+
+        Args:
+            env: Envelope the request arrived in.
+            p: The empty decision-log request.
+
+        Returns:
+            The decision-log reply.
+        """
+        return Response(
+            id=env.id,
+            ok=True,
+            payload=DecisionLogPayload(
+                text=decision_log.render_decision_log(self.decision_log_path)
+            ).model_dump(),
+        )
+
+    async def _on_get_permission_log(
+        self, env: Envelope, p: PermissionLogRequestPayload
+    ) -> Response:
+        """Reply with the rendered permission log.
+
+        Args:
+            env: Envelope the request arrived in.
+            p: The empty permission-log request.
+
+        Returns:
+            The permission-log reply.
+        """
+        return Response(
+            id=env.id,
+            ok=True,
+            payload=PermissionLogPayload(
+                text=render_permission_log(self.permission_log_path)
+            ).model_dump(),
+        )
+
+    async def _on_shutdown(self, env: Envelope, p: ShutdownPayload) -> Response:
+        """Stop serving and driving the session.
+
+        Args:
+            env: Envelope the request arrived in.
+            p: The empty shutdown request.
+
+        Returns:
+            The ACK.
+        """
+        self._request_stop()
+        return Response(id=env.id, ok=True)
 
     async def _dispatch_hook(self, hook: HookEventPayload) -> None:
         """Route one Claude Code hook event to state changes, queued jobs or a stop.
@@ -1094,18 +1176,18 @@ class SessionBroker:
                 if self.state == SessionState.ESCALATED:
                     self.jobs.put_nowait(self._check_out_of_band_resolution)
             case HookEventName.NOTIFICATION:
-                self._log(DecisionKind.NOTIFICATION, "", str(raw.get("message", "")))
+                self._log(DecisionLogKind.NOTIFICATION, "", str(raw.get("message", "")))
                 if raw.get("notification_type") == "permission_prompt":
                     self._set_perm_pending(True)
             case HookEventName.SESSION_END:
                 self.permission.note_session_ended()
                 self._set_state(SessionState.STOPPED)
-                self._log(DecisionKind.SESSION_END, "", "SessionEnd hook received")
+                self._log(DecisionLogKind.SESSION_END, "", "SessionEnd hook received")
                 # Inline, not queued: the terminal report to master must go
                 # now, not wait behind whatever else is already queued.
                 await self._on_session_end()
             case HookEventName.PRE_COMPACT | HookEventName.POST_COMPACT:
-                self._log(DecisionKind.COMPACTION, "", event)  # continue normally
+                self._log(DecisionLogKind.COMPACTION, "", event)  # continue normally
             case HookEventName.PRE_TOOL_USE | HookEventName.PERMISSION_REQUEST:
                 # The hook routes these as permission_request/ask_question,
                 # never as a hook_event; _dispatch_hook should never see them.
@@ -1154,7 +1236,7 @@ class SessionBroker:
         """
         if self.state not in ACTIVE_STATES:
             self._log(
-                DecisionKind.NO_ACTION,
+                DecisionLogKind.NO_ACTION,
                 f"turn boundary ignored in state {self.state!r}",
                 "",
             )
@@ -1166,7 +1248,7 @@ class SessionBroker:
         with self._activity(PHRASE_TRIAGE):
             result = await triage(
                 self._llm_call,
-                self.broker_cfg,
+                self.cfg.session_model,
                 intent=self._intent(),
                 events=events,
                 event_name=HookEventName.STOP,
@@ -1180,7 +1262,7 @@ class SessionBroker:
                 await self._escalate_handover(result, last_assistant_message, events)
             else:
                 self._log(
-                    DecisionKind.ANSWERED,
+                    DecisionLogKind.ANSWERED,
                     result.reasoning,
                     result.answer,
                     task_summary=result.task_summary,
@@ -1197,7 +1279,7 @@ class SessionBroker:
             )
         elif isinstance(result, CompleteCall):
             self._log(
-                DecisionKind.COMPLETED,
+                DecisionLogKind.COMPLETED,
                 result.reasoning,
                 "",
                 task_summary=result.task_summary,
@@ -1206,13 +1288,14 @@ class SessionBroker:
             )
             self._set_state(SessionState.COMPLETED)  # stop driving; keep serving
             await self._to_master(
-                T_COMPLETION,
-                {"headline": result.headline, "supporting": result.supporting},
+                CompletionPayload(
+                    headline=result.headline, supporting=result.supporting
+                )
             )
         elif isinstance(
             result, NoActionCall  # pyright: ignore[reportUnnecessaryIsInstance]
         ):
-            self._log(DecisionKind.NO_ACTION, result.reasoning, "")
+            self._log(DecisionLogKind.NO_ACTION, result.reasoning, "")
 
     def _new_escalation(self, disclosure: EscalationDisclosure) -> EscalationPayload:
         """Build a decision escalation carrying this session's identifying preamble.
@@ -1311,12 +1394,11 @@ class SessionBroker:
         except ask.AskInputError:
             questions = []  # the reason already names the failure
         self._log(
-            DecisionKind.ESCALATION_RAISED,
+            DecisionLogKind.ESCALATION_RAISED,
             reason,
             f"AskUserQuestion menu open in pane {self.pane_id or '?'}",
             task_summary=task_summary,
             escalation_id=escalation_id,
-            what_was_asked="\n".join(q.question for q in questions),
         )
         payload = QuestionEscalationPayload(
             escalation_id=escalation_id,
@@ -1328,11 +1410,15 @@ class SessionBroker:
             analysis=analysis,
         )
         try:
-            await self._to_master(T_PANE_ESCALATION, payload.model_dump())
+            await self._to_master(payload)
         except MasterRefusedError as exc:
             # The picker is still in the pane, so the claim stays; only the
             # escalation the master refused is dropped.
-            self._log(DecisionKind.ERROR, "question escalation refused", str(exc))
+            self._log(
+                DecisionLogKind.QUESTION_REFUSED,
+                "question escalation refused",
+                str(exc),
+            )
             menu = self._open_menu
             if menu is not None and menu.escalation_id == escalation_id:
                 menu.escalation_id = None
@@ -1357,15 +1443,14 @@ class SessionBroker:
             summary: The escalation's Solution line in the outcome history.
         """
         self._log(
-            DecisionKind.RETRACTED,
+            DecisionLogKind.RETRACTED,
             reason,
             "",
             task_summary=summary,
             escalation_id=escalation_id,
         )
         await self._to_master(
-            T_PANE_RETRACT,
-            PaneRetractPayload(escalation_id=escalation_id, reason=reason).model_dump(),
+            PaneRetractPayload(escalation_id=escalation_id, reason=reason)
         )
 
     async def _check_menu_answered(self) -> None:
@@ -1396,7 +1481,11 @@ class SessionBroker:
             reason = "answered in pane"
         else:
             reason = "the broker's answer was recorded late"
-            self._log(DecisionKind.ASK_VERIFIED, "recorded late", menu.tool_use_id)
+            self._log(
+                DecisionLogKind.ASK_VERIFIED,
+                "recorded late",
+                tool_use_id=menu.tool_use_id,
+            )
         # A late answer matching the broker's cannot be told apart from the
         # developer picking the same options, so both read as the developer's.
         await self._retract_question(
@@ -1426,7 +1515,9 @@ class SessionBroker:
         )
         if echoed == injected.answers:
             self._log(
-                DecisionKind.ASK_VERIFIED, "PostToolUse echo matches", tool_use_id
+                DecisionLogKind.ASK_VERIFIED,
+                "PostToolUse echo matches",
+                tool_use_id=tool_use_id,
             )
             return
         self.jobs.put_nowait(
@@ -1485,7 +1576,11 @@ class SessionBroker:
             )
             return
         if answer is not None and answer.answers == injected.answers:
-            self._log(DecisionKind.ASK_VERIFIED, "transcript backstop", tool_use_id)
+            self._log(
+                DecisionLogKind.ASK_VERIFIED,
+                "transcript backstop",
+                tool_use_id=tool_use_id,
+            )
             return
         if answer is None:
             reason = (
@@ -1520,7 +1615,7 @@ class SessionBroker:
             answer_recorded: Whether the session already recorded an answer
                 for this id.
         """
-        self._log(DecisionKind.ASK_VERIFY_FAILED, reason, tool_use_id)
+        self._log(DecisionLogKind.ASK_VERIFY_FAILED, reason, tool_use_id=tool_use_id)
         task_summary = "Escalated an AskUserQuestion answer that failed verification"
         # With no answer recorded the menu may still be in the pane, and its
         # answer clears it. Otherwise the session already proceeded on
@@ -1592,19 +1687,18 @@ class SessionBroker:
             task_summary: The escalation's one-line Reason in the outcome history.
         """
         self._log(
-            DecisionKind.ESCALATION_RAISED,
+            DecisionLogKind.ESCALATION_RAISED,
             reasoning,
             payload.disclosure.situation,
             task_summary=task_summary,
             escalation_id=payload.escalation_id,
-            what_was_asked=payload.disclosure.what_was_asked,
         )
         self._active_escalation = payload
         self._user_prompt_baseline = (
             _count_user_prompts(events) if events is not None else -1
         )
         self._set_state(SessionState.ESCALATED)  # QUIESCENT until dispatch or retract
-        await self._to_master(T_ESCALATION, payload.model_dump())
+        await self._to_master(payload)
 
     async def _on_turn_end(self, last_assistant_message: str) -> None:
         """Triage one turn boundary, clearing a resolved escalation first.
@@ -1653,7 +1747,7 @@ class SessionBroker:
         assert self._active_escalation is not None
         escalation_id = self._active_escalation.escalation_id
         self._log(
-            DecisionKind.RETRACTED,
+            DecisionLogKind.RETRACTED,
             reason,
             "",
             task_summary=summary,
@@ -1662,10 +1756,7 @@ class SessionBroker:
         self._end_active_escalation()
         self._set_state(SessionState.DRIVING)
         await self._to_master(
-            T_ESCALATION_RETRACT,
-            EscalationRetractPayload(
-                escalation_id=escalation_id, reason=reason
-            ).model_dump(),
+            EscalationRetractPayload(escalation_id=escalation_id, reason=reason)
         )
 
     async def _deliver_decision(self, decision: DispatchDecisionPayload) -> None:
@@ -1688,17 +1779,16 @@ class SessionBroker:
             # drop its queue entry (still_live=False). Reachable when a master
             # restart re-surfaces an escalation this broker already answered.
             self._log(
-                DecisionKind.ERROR,
+                DecisionLogKind.DISPATCH_STALE,
                 "stale dispatch_decision ignored",
-                decision.escalation_id,
+                escalation_id=decision.escalation_id,
             )
             await self._to_master(
-                T_DECISION_UNDELIVERED,
                 DecisionUndeliveredPayload(
                     escalation_id=decision.escalation_id,
                     detail="session had already moved past this escalation",
                     still_live=False,
-                ).model_dump(),
+                )
             )
             return
         try:
@@ -1710,25 +1800,24 @@ class SessionBroker:
             # surfaced for a re-decide.
             detail = f"{type(exc).__name__}: {exc}"
             self._log(
-                DecisionKind.DISPATCH_FAILED,
+                DecisionLogKind.DISPATCH_FAILED,
                 "pane submission failed",
                 detail,
                 escalation_id=decision.escalation_id,
             )
             await self._to_master(
-                T_DECISION_UNDELIVERED,
                 DecisionUndeliveredPayload(
                     escalation_id=decision.escalation_id,
                     detail=detail,
                     still_live=True,
-                ).model_dump(),
+                )
             )
             return
         self._end_active_escalation()
         await self._note_developer_contact()
         self._set_state(SessionState.DRIVING)
         self._log(
-            DecisionKind.DISPATCHED,
+            DecisionLogKind.DISPATCHED,
             "developer decision delivered",
             decision.response,
             escalation_id=decision.escalation_id,
@@ -1736,10 +1825,7 @@ class SessionBroker:
         # Resolution waits for this: the escalation clears on the master only
         # now that the decision has actually reached the pane.
         await self._to_master(
-            T_DECISION_DELIVERED,
-            DecisionDeliveredPayload(
-                escalation_id=decision.escalation_id
-            ).model_dump(),
+            DecisionDeliveredPayload(escalation_id=decision.escalation_id)
         )
 
     async def _reactivate(self, payload: ReactivatePayload) -> None:
@@ -1752,7 +1838,7 @@ class SessionBroker:
             payload: The new task intent, grounded before anything is typed.
         """
         self._log(
-            DecisionKind.REACTIVATED, "new task in the same session", payload.intent
+            DecisionLogKind.REACTIVATED, "new task in the same session", payload.intent
         )
         self._end_active_escalation()
         await self._note_developer_contact()
@@ -1768,12 +1854,9 @@ class SessionBroker:
             await self._submit(prompt.text)
         except PaneOccupiedError as exc:
             self._log(
-                DecisionKind.DISPATCH_FAILED, "developer prompt not typed", str(exc)
+                DecisionLogKind.DISPATCH_FAILED, "developer prompt not typed", str(exc)
             )
-            await self._to_master(
-                T_PROMPT_UNDELIVERED,
-                PromptUndeliveredPayload(detail=str(exc)).model_dump(),
-            )
+            await self._to_master(PromptUndeliveredPayload(detail=str(exc)))
             return
         if self._active_escalation is not None:
             await self._retract_decision(
@@ -1781,7 +1864,7 @@ class SessionBroker:
             )
         self._set_state(SessionState.DRIVING)
         await self._note_developer_contact()
-        self._log(DecisionKind.DEVELOPER_PROMPT, "relayed by master", prompt.text)
+        self._log(DecisionLogKind.DEVELOPER_PROMPT, "relayed by master", prompt.text)
 
     async def _note_developer_contact(self) -> None:
         """Reset the autonomous answer budget and report it to the master."""
@@ -1790,9 +1873,7 @@ class SessionBroker:
 
     async def _report_budget(self, count: int) -> None:
         """Tell the master the autonomous answer budget stands at ``count``."""
-        await self._to_master(
-            T_BUDGET_UPDATE, BudgetUpdatePayload(count=count).model_dump()
-        )
+        await self._to_master(BudgetUpdatePayload(count=count))
 
     def _end_active_escalation(self) -> None:
         """Clear the active escalation and cancel any clarification bound to it.
@@ -1834,7 +1915,7 @@ class SessionBroker:
         if last_text is None:
             return
         self._log(
-            DecisionKind.WATCHDOG_RECONCILIATION,
+            DecisionLogKind.WATCHDOG_RECONCILIATION,
             "no hook event before deadline; herdr reports idle/blocked",
             "",
         )
@@ -1927,28 +2008,26 @@ class SessionBroker:
             timeout_s=SUBMIT_TIMEOUT_S,
         )
 
-    async def _to_master(self, msg_type: str, payload: dict[str, Any]) -> None:
-        """Send one envelope to the master and wait for its reply.
+    async def _to_master(self, payload: WireMessage) -> None:
+        """Send one message to the master and wait for its reply.
 
         Args:
-            msg_type: Protocol message type constant.
-            payload: Already-serialized payload for that type.
+            payload: The message; its ``MESSAGE_TYPE`` is the envelope type.
 
         Raises:
             MasterRefusedError: The master answered ``ok=False``.
         """
-        env = Envelope(
-            id=uuid.uuid4().hex,
-            type=msg_type,
+        resp = await client.send(
+            Path(self.cfg.master_socket_path),
+            payload,
             session_id=self.cfg.name,
-            payload=payload,
-        )
-        resp = await client.request(
-            Path(self.cfg.master_socket_path), env, timeout_s=MASTER_TIMEOUT_S
+            timeout_s=MASTER_TIMEOUT_S,
         )
         if not resp.ok:
             nack = parse_nack(resp)
-            raise MasterRefusedError(msg_type, nack.error, nack.reason_code)
+            raise MasterRefusedError(
+                payload.MESSAGE_TYPE, nack.error, nack.reason_code
+            )
 
     async def _fatal(self, error_class: str, detail: str) -> None:
         """Log the failure, enter the error state, and tell the master.
@@ -1961,11 +2040,11 @@ class SessionBroker:
             detail: Human-readable detail for the developer.
         """
         logger.error("fatal: %s: %s", error_class, detail)
-        self._log(DecisionKind.ERROR, error_class, detail)
+        self._log(DecisionLogKind.ERROR, error_class, detail)
         self._set_state(SessionState.ERROR)
         try:
             await self._to_master(
-                T_FATAL_ERROR, {"error_class": error_class, "detail": detail}
+                FatalErrorPayload(error_class=error_class, detail=detail)
             )
         except Exception:
             # Master unreachable: the pane degrades to stock Claude Code.
@@ -1974,34 +2053,36 @@ class SessionBroker:
     async def _on_session_end(self) -> None:
         """Report the terminal end to the master, then stop serving and exit."""
         try:
-            await self._to_master(T_SESSION_ENDED, {})
+            await self._to_master(SessionEndedPayload())
         except Exception:
             logger.exception("could not report session end to master")
         self._request_stop()
 
     def _log(
         self,
-        kind: DecisionKind,
+        kind: DecisionLogKind,
         reasoning: str,
-        detail: str,
+        detail: str = "",
         *,
         task_summary: str | None = None,
         escalation_id: str | None = None,
-        what_was_asked: str | None = None,
+        tool_use_id: str | None = None,
         headline: str | None = None,
         supporting: str | None = None,
     ) -> None:
         """Append one entry to this session's decision log."""
         decision_log.append(
             self.decision_log_path,
-            kind=kind,
-            reasoning=reasoning,
-            detail=detail,
-            task_summary=task_summary,
-            escalation_id=escalation_id,
-            what_was_asked=what_was_asked,
-            headline=headline,
-            supporting=supporting,
+            DecisionLogRow(
+                kind=kind,
+                reasoning=reasoning,
+                detail=detail,
+                task_summary=task_summary,
+                escalation_id=escalation_id,
+                tool_use_id=tool_use_id,
+                headline=headline,
+                supporting=supporting,
+            ),
         )
 
     def _set_state(self, state: SessionState) -> None:

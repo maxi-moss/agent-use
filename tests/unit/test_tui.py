@@ -22,7 +22,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import RichLog, Static
 
 from broker import decision_log
-from broker.decision_log import DecisionKind
+from broker.decision_log import DecisionLogKind, DecisionLogRow
 from broker.config import BrokerConfig
 from broker.llm import TurnResult
 from broker.master.llm import MasterLLM
@@ -702,42 +702,51 @@ async def test_slash_outcome_opens_modal_from_the_decision_log(home: Path) -> No
     log = app.runtime.paths.session_decisions("s1")
     decision_log.append(
         log,
-        kind=DecisionKind.ANSWERED,
-        reasoning="r",
-        detail="use uv",
-        task_summary="Chose uv",
+        DecisionLogRow(
+            kind=DecisionLogKind.ANSWERED,
+            reasoning="r",
+            detail="use uv",
+            task_summary="Chose uv",
+        ),
     )
     decision_log.append(
         log,
-        kind=DecisionKind.ESCALATION_RAISED,
-        reasoning="r",
-        detail="drop the column?",
-        task_summary="Asked before dropping a column",
-        escalation_id="e1",
-        what_was_asked="drop users.legacy?",
+        DecisionLogRow(
+            kind=DecisionLogKind.ESCALATION_RAISED,
+            reasoning="r",
+            detail="drop the column?",
+            task_summary="Asked before dropping a column",
+            escalation_id="e1",
+        ),
     )
     decision_log.append(
         log,
-        kind=DecisionKind.DISPATCHED,
-        reasoning="d",
-        detail="yes, drop it",
-        escalation_id="e1",
+        DecisionLogRow(
+            kind=DecisionLogKind.DISPATCHED,
+            reasoning="d",
+            detail="yes, drop it",
+            escalation_id="e1",
+        ),
     )
     decision_log.append(
         log,
-        kind=DecisionKind.ANSWERED,
-        reasoning="r",
-        detail="dropped",
-        task_summary="Dropped it",
+        DecisionLogRow(
+            kind=DecisionLogKind.ANSWERED,
+            reasoning="r",
+            detail="dropped",
+            task_summary="Dropped it",
+        ),
     )
     decision_log.append(
         log,
-        kind=DecisionKind.COMPLETED,
-        reasoning="r",
-        detail="",
-        task_summary="Wrapped up",
-        headline="Recovered the session after broker loss",
-        supporting="The budget survived the restart",
+        DecisionLogRow(
+            kind=DecisionLogKind.COMPLETED,
+            reasoning="r",
+            detail="",
+            task_summary="Wrapped up",
+            headline="Recovered the session after broker loss",
+            supporting="The budget survived the restart",
+        ),
     )
     completed = SessionRow(
         session_id="s1",

@@ -1,12 +1,11 @@
 """ask decision stack: parsing, rendering, validation, and the retry loop."""
 
 import asyncio
-from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
-from broker.config import BrokerConfig
+from broker.config import SessionModelConfig
 from broker.llm import LLMCallError, ToolCall
 from broker.session.ask import (
     AnswerQuestionsCall,
@@ -21,7 +20,7 @@ from broker.session.ask import (
 )
 from broker.transcript.schemas import Option, Question
 
-CFG = BrokerConfig(broker_home=Path("/private/tmp/unused"))
+MODEL_CFG = SessionModelConfig(model_id="test-model", max_tokens=8192)
 
 ESCALATE_INPUT: dict[str, Any] = {
     "reasoning": "irreversible",
@@ -255,7 +254,7 @@ async def test_ask_once_unknown_tool_raises() -> None:
     await fake.results.put(ToolCall(name="surprise", input={}))
     with pytest.raises(LLMCallError):
         await ask_once(
-            fake, CFG, intent="i", events=[], questions=[SINGLE],
+            fake, MODEL_CFG, intent="i", events=[], questions=[SINGLE],
             prior_error=None,
         )
 
@@ -267,7 +266,7 @@ async def test_ask_once_invalid_tool_input_raises() -> None:
     )
     with pytest.raises(LLMCallError):
         await ask_once(
-            fake, CFG, intent="i", events=[], questions=[SINGLE],
+            fake, MODEL_CFG, intent="i", events=[], questions=[SINGLE],
             prior_error=None,
         )
 
@@ -276,7 +275,7 @@ async def test_ask_once_escalate_passes_through() -> None:
     fake = FakeLLM()
     await fake.results.put(ToolCall(name="escalate", input=ESCALATE_INPUT))
     result = await ask_once(
-        fake, CFG, intent="i", events=[], questions=[SINGLE], prior_error=None
+        fake, MODEL_CFG, intent="i", events=[], questions=[SINGLE], prior_error=None
     )
     assert isinstance(result, EscalateCall)
     assert result.situation == "the menu picks a production database"
@@ -286,7 +285,7 @@ async def test_ask_once_prior_error_in_working_block() -> None:
     fake = FakeLLM()
     await fake.results.put(ToolCall(name="escalate", input=ESCALATE_INPUT))
     await ask_once(
-        fake, CFG, intent="i", events=[], questions=[SINGLE],
+        fake, MODEL_CFG, intent="i", events=[], questions=[SINGLE],
         prior_error="unknown label 'SQLite'",
     )
     working = working_text(fake.calls[0])
@@ -303,7 +302,7 @@ async def test_decide_valid_first_try() -> None:
         answers_tool_call(entry("Which database?", ["PostgreSQL"]))
     )
     result = await decide_questions(
-        fake, CFG, intent="i", events=[], questions=[SINGLE]
+        fake, MODEL_CFG, intent="i", events=[], questions=[SINGLE]
     )
     assert not isinstance(result, EscalateCall)
     call, answers = result
@@ -321,7 +320,7 @@ async def test_decide_invalid_then_valid_retries_once() -> None:
         answers_tool_call(entry("Which database?", ["PostgreSQL"]))
     )
     result = await decide_questions(
-        fake, CFG, intent="i", events=[], questions=[SINGLE]
+        fake, MODEL_CFG, intent="i", events=[], questions=[SINGLE]
     )
     assert not isinstance(result, EscalateCall)
     _, answers = result
@@ -340,7 +339,7 @@ async def test_decide_invalid_twice_raises() -> None:
     )
     with pytest.raises(AnswerValidationError):
         await decide_questions(
-            fake, CFG, intent="i", events=[], questions=[SINGLE]
+            fake, MODEL_CFG, intent="i", events=[], questions=[SINGLE]
         )
     assert len(fake.calls) == 2
 
@@ -352,7 +351,7 @@ async def test_decide_escalate_on_retry_returns_escalation() -> None:
     )
     await fake.results.put(ToolCall(name="escalate", input=ESCALATE_INPUT))
     result = await decide_questions(
-        fake, CFG, intent="i", events=[], questions=[SINGLE]
+        fake, MODEL_CFG, intent="i", events=[], questions=[SINGLE]
     )
     assert isinstance(result, EscalateCall)
     assert len(fake.calls) == 2

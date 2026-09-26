@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from broker import llm_timing
 from broker import prompts
-from broker.config import BrokerConfig
+from broker.config import SessionModelConfig
 from broker.llm import LLMCaller, LLMCallError, ToolCall, strict_tool
 from broker.session.triage import (
     FORCED_ONE,
@@ -192,7 +192,7 @@ def validate_answers(
 @llm_timing.timed("ask")
 async def ask_once(
     llm_call: LLMCaller[ToolCall],
-    cfg: BrokerConfig,
+    model_cfg: SessionModelConfig,
     *,
     intent: str,
     events: list[TranscriptEvent],
@@ -203,7 +203,7 @@ async def ask_once(
 
     Args:
         llm_call: The injected tool-calling seam.
-        cfg: Supplies the model id and the token cap.
+        model_cfg: Supplies the model id and the token cap.
         intent: Authoritative task intent, taken from the registry.
         events: Cleaned transcript events, as surrounding context.
         questions: The menu being decided.
@@ -228,8 +228,8 @@ async def ask_once(
         )
     system, messages = assemble_context(_ASK_PROMPT, intent, events, working)
     call: ToolCall = await llm_call(
-        model=cfg.model_id,
-        max_tokens=cfg.max_tokens,
+        model=model_cfg.model_id,
+        max_tokens=model_cfg.max_tokens,
         system=system,
         messages=messages,
         tools=ASK_TOOLS,
@@ -246,7 +246,7 @@ async def ask_once(
 
 async def decide_questions(
     llm_call: LLMCaller[ToolCall],
-    cfg: BrokerConfig,
+    model_cfg: SessionModelConfig,
     *,
     intent: str,
     events: list[TranscriptEvent],
@@ -256,7 +256,7 @@ async def decide_questions(
 
     Args:
         llm_call: The injected tool-calling seam.
-        cfg: Supplies the model id and the token cap.
+        model_cfg: Supplies the model id and the token cap.
         intent: Authoritative task intent, taken from the registry.
         events: Cleaned transcript events, as surrounding context.
         questions: The menu being decided.
@@ -269,7 +269,7 @@ async def decide_questions(
         AnswerValidationError: Both attempts produced invalid answers.
     """
     result = await ask_once(
-        llm_call, cfg, intent=intent, events=events, questions=questions,
+        llm_call, model_cfg, intent=intent, events=events, questions=questions,
         prior_error=None,
     )
     if isinstance(result, EscalateCall):
@@ -278,7 +278,7 @@ async def decide_questions(
         return result, validate_answers(result, questions)
     except AnswerValidationError as exc:
         retry = await ask_once(
-            llm_call, cfg, intent=intent, events=events, questions=questions,
+            llm_call, model_cfg, intent=intent, events=events, questions=questions,
             prior_error=str(exc),
         )
         if isinstance(retry, EscalateCall):
