@@ -45,16 +45,6 @@ T_LIVE_STATUS = "live_status"  # broker -> master
 T_SESSION_ENDED = "session_ended"  # broker -> master: SessionEnd fired, exiting
 T_PROMPT_UNDELIVERED = "prompt_undelivered"  # broker -> master
 
-# Machine-readable refusal reasons carried alongside the human-readable error
-# string on a negative Response. Closed set: a sender that cannot tell a
-# capacity refusal from a protocol violation has to treat both as bugs.
-NACK_PROTOCOL_VIOLATION = "protocol_violation"
-NACK_SLOT_OCCUPIED = "slot_occupied"
-NACK_MALFORMED = "malformed"
-NACK_UNKNOWN_SESSION = "unknown_session"
-NACK_STALE_PROPOSAL = "stale_proposal"
-NACK_WRONG_STATE = "wrong_state"
-
 # permission_request reply decisions — NOT Claude Code's enum;
 # "escalated" deliberately avoids colliding with Claude Code's own "defer"
 DECISION_ALLOW = "allow"
@@ -63,6 +53,21 @@ DECISION_ESCALATED = "escalated"
 # ask_question reply decisions — "answer" carries updated_input for the hook
 # to print; anything else (escalated / timeout / malformed) prints nothing.
 ASK_DECISION_ANSWER = "answer"
+
+
+class NackCode(StrEnum):
+    """Machine-readable refusal reasons carried beside a NACK's error string.
+
+    Closed set: a sender that cannot tell a capacity refusal from a protocol
+    violation has to treat both as bugs.
+    """
+
+    PROTOCOL_VIOLATION = "protocol_violation"
+    SLOT_OCCUPIED = "slot_occupied"
+    MALFORMED = "malformed"
+    UNKNOWN_SESSION = "unknown_session"
+    STALE_PROPOSAL = "stale_proposal"
+    WRONG_STATE = "wrong_state"
 
 
 class PaneKind(StrEnum):

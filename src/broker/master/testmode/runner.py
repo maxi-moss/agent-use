@@ -57,6 +57,7 @@ from broker.protocol.schemas import (
     PermissionEscalationPayload,
     QuestionEscalationPayload,
     Response,
+    parse_nack,
 )
 
 _POLL_INTERVAL_S = 0.01
@@ -216,7 +217,7 @@ def _check_expect(index: int, op: str, expect: str, resp: Response) -> StepResul
         detail = "ACKed" if passed else f"expected ACK, got NACK {resp.payload}"
     elif expect.startswith("nack:"):
         code = expect[len("nack:"):]
-        passed = (not resp.ok) and resp.payload.get("reason_code") == code
+        passed = (not resp.ok) and parse_nack(resp).reason_code == code
         detail = (
             f"NACKed {code}"
             if passed

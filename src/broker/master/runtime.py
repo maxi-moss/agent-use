@@ -11,10 +11,8 @@ import asyncio
 import contextlib
 import logging
 import sys
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from pydantic import ValidationError
 
@@ -59,33 +57,22 @@ from broker.master.queue import EscalationProtocolViolation, EscalationQueue
 from broker.master.registry import Registry, SessionRecord
 from broker.protocol import client
 from broker.protocol.constants import (
-    NACK_MALFORMED,
-    NACK_PROTOCOL_VIOLATION,
-    NACK_UNKNOWN_SESSION,
+    NackCode,
     PaneKind,
     SessionState,
-    T_APPROVE_PROMPT,
-    T_CLARIFY_ESCALATION,
     T_BUDGET_UPDATE,
     T_COMPLETION,
     T_DECISION_DELIVERED,
     T_DECISION_UNDELIVERED,
-    T_DISPATCH_DECISION,
     T_ESCALATION,
     T_ESCALATION_RETRACT,
     T_FATAL_ERROR,
-    T_GET_DECISION_LOG,
-    T_GET_PERMISSION_LOG,
     T_LIVE_STATUS,
     T_PANE_ESCALATION,
     T_PANE_RETRACT,
     T_PROMPT_PROPOSAL,
     T_PROMPT_UNDELIVERED,
-    T_REACTIVATE,
-    T_SEND_PROMPT,
     T_SESSION_ENDED,
-    T_SHUTDOWN,
-    T_STATUS,
 )
 from broker.protocol.schemas import (
     PANE_ESCALATION_ADAPTER,
@@ -96,6 +83,7 @@ from broker.protocol.schemas import (
     CompletionPayload,
     DecisionDeliveredPayload,
     DecisionLogPayload,
+    DecisionLogRequestPayload,
     DecisionUndeliveredPayload,
     DispatchDecisionPayload,
     Envelope,
@@ -106,12 +94,18 @@ from broker.protocol.schemas import (
     PaneEscalationPayload,
     PaneRetractPayload,
     PermissionLogPayload,
+    PermissionLogRequestPayload,
     PromptProposalPayload,
     PromptUndeliveredPayload,
     ReactivatePayload,
     Response,
     SendPromptPayload,
+    ShutdownPayload,
     StatusPayload,
+    StatusRequestPayload,
+    WireMessage,
+    nack_response,
+    parse_nack,
 )
 from broker.protocol.server import serve_unix
 
@@ -501,7 +495,9 @@ class MasterRuntime:
                     f"surfaced.\nvalidation: {exc}\nraw payload: {env.payload!r}"
                 )
             )
-            return self._nack(env, f"malformed escalation: {exc}", NACK_MALFORMED)
+            return nack_response(
+                env, f"malformed escalation: {exc}", NackCode.MALFORMED
+            )
         unknown = self._reject_unknown_session(env, p.session_id, "escalation")
         if unknown is not None:
             return unknown
@@ -509,7 +505,7 @@ class MasterRuntime:
             self.queue.accept(p)
         except EscalationProtocolViolation as exc:
             self.emit(Notice(f"PROTOCOL VIOLATION: {exc}"))
-            return self._nack(env, str(exc), NACK_PROTOCOL_VIOLATION)
+            return nack_response(env, str(exc), NackCode.PROTOCOL_VIOLATION)
         self._set_state(p.session_id, SessionState.ESCALATED)
         self._publish_fleet()
         await self._surface_head()
@@ -538,8 +534,8 @@ class MasterRuntime:
                     f"raw payload: {env.payload!r}"
                 )
             )
-            return self._nack(
-                env, f"malformed pane escalation: {exc}", NACK_MALFORMED
+            return nack_response(
+                env, f"malformed pane escalation: {exc}", NackCode.MALFORMED
             )
         unknown = self._reject_unknown_session(
             env, p.session_id, f"{p.kind} escalation"
@@ -550,7 +546,7 @@ class MasterRuntime:
             self.panes.accept(p)
         except PaneProtocolViolation as exc:
             self.emit(Notice(f"PROTOCOL VIOLATION: {exc}"))
-            return self._nack(env, str(exc), NACK_PROTOCOL_VIOLATION)
+            return nack_response(env, str(exc), NackCode.PROTOCOL_VIOLATION)
         self._publish_fleet()
         await self._announce_pane_escalation(p)
         return self._ack(env, ok=True)
@@ -629,7 +625,7 @@ class MasterRuntime:
             return None
         msg = f"{kind} from unknown session {session_id!r} — NOT surfaced"
         self.emit(Notice(msg))
-        return self._nack(env, msg, NACK_UNKNOWN_SESSION)
+        return nack_response(env, msg, NackCode.UNKNOWN_SESSION)
 
     async def _surface_head(self) -> None:
         """Render, announce and notify the queue's head, exactly once."""
@@ -829,12 +825,9 @@ class MasterRuntime:
             completed and so has a task it is still driving.
         """
         record = self.registry.get(session_id)
-        env = self._env(
-            T_REACTIVATE, ReactivatePayload(intent=intent).model_dump()
-        )
         rejected = await self._deliver(
             record.socket_path,
-            env,
+            ReactivatePayload(intent=intent),
             rejection=f"session {session_id} refused reactivation",
         )
         if rejected is not None:
@@ -868,15 +861,9 @@ class MasterRuntime:
             return msg
         name = pending.session_id
         record = self.registry.get(name)
-        env = self._env(
-            T_APPROVE_PROMPT,
-            ApprovePromptPayload(
-                proposal_id=proposal_id, prompt=prompt
-            ).model_dump(),
-        )
         rejected = await self._deliver(
             record.socket_path,
-            env,
+            ApprovePromptPayload(proposal_id=proposal_id, prompt=prompt),
             rejection=(
                 f"session {name} rejected approval for proposal "
                 f"{proposal_id} (stale)"
@@ -932,15 +919,9 @@ class MasterRuntime:
             self.emit(Notice(msg))
             return msg
         record = self.registry.get(active.session_id)
-        env = self._env(
-            T_DISPATCH_DECISION,
-            DispatchDecisionPayload(
-                escalation_id=escalation_id, response=decision
-            ).model_dump(),
-        )
         rejected = await self._deliver(
             record.socket_path,
-            env,
+            DispatchDecisionPayload(escalation_id=escalation_id, response=decision),
             rejection=(
                 f"session {record.name} rejected the dispatched decision "
                 f"for escalation {escalation_id} (stale)"
@@ -1076,22 +1057,21 @@ class MasterRuntime:
             self.emit(Notice(msg))
             return msg
         record = self.registry.get(active.session_id)
-        env = self._env(
-            T_CLARIFY_ESCALATION,
+        resp = await client.send(
+            Path(record.socket_path),
             ClarifyEscalationRequestPayload(
                 escalation_id=escalation_id, question=question
-            ).model_dump(),
-        )
-        resp = await client.request(
-            Path(record.socket_path), env, timeout_s=CLARIFY_ESCALATION_TIMEOUT_S
+            ),
+            session_id=None,
+            timeout_s=CLARIFY_ESCALATION_TIMEOUT_S,
         )
         if not resp.ok:
-            reason = resp.payload.get("error")
+            reason = parse_nack(resp).error
             msg = (
                 f"no clarification from session {record.name} for escalation "
                 f"{escalation_id}"
             )
-            if isinstance(reason, str) and reason:
+            if reason:
                 msg = f"{msg}: {reason}"
             self.emit(Notice(msg))
             return msg
@@ -1113,10 +1093,9 @@ class MasterRuntime:
             rejection carrying the session's reason if it NACKed.
         """
         record = self.registry.get(session_id)
-        env = self._env(T_SEND_PROMPT, SendPromptPayload(text=text).model_dump())
         rejected = await self._deliver(
             record.socket_path,
-            env,
+            SendPromptPayload(text=text),
             rejection=f"session {session_id} rejected the prompt",
         )
         if rejected is not None:
@@ -1134,8 +1113,12 @@ class MasterRuntime:
             The status as reported by the session broker.
         """
         socket_path = Path(self.registry.get(session_id).socket_path)
-        env = self._env(T_STATUS, {})
-        resp = await client.request(socket_path, env, timeout_s=REQUEST_TIMEOUT_S)
+        resp = await client.send(
+            socket_path,
+            StatusRequestPayload(),
+            session_id=None,
+            timeout_s=REQUEST_TIMEOUT_S,
+        )
         status = StatusPayload.model_validate(resp.payload)
         self._set_state(session_id, status.state)
         self._note_task_activity(session_id, status.task_activity)
@@ -1177,9 +1160,11 @@ class MasterRuntime:
             ValidationError: The session's reply was not a decision log.
         """
         record = self.registry.get(session_id)
-        env = self._env(T_GET_DECISION_LOG, {})
-        resp = await client.request(
-            Path(record.socket_path), env, timeout_s=REQUEST_TIMEOUT_S
+        resp = await client.send(
+            Path(record.socket_path),
+            DecisionLogRequestPayload(),
+            session_id=None,
+            timeout_s=REQUEST_TIMEOUT_S,
         )
         return DecisionLogPayload.model_validate(resp.payload).text
 
@@ -1196,9 +1181,11 @@ class MasterRuntime:
             ValidationError: The session's reply was not a permission log.
         """
         record = self.registry.get(session_id)
-        env = self._env(T_GET_PERMISSION_LOG, {})
-        resp = await client.request(
-            Path(record.socket_path), env, timeout_s=REQUEST_TIMEOUT_S
+        resp = await client.send(
+            Path(record.socket_path),
+            PermissionLogRequestPayload(),
+            session_id=None,
+            timeout_s=REQUEST_TIMEOUT_S,
         )
         return PermissionLogPayload.model_validate(resp.payload).text
 
@@ -1213,9 +1200,10 @@ class MasterRuntime:
         """
         record = self.registry.get(session_id)
         with contextlib.suppress(ConnectionError, TimeoutError, OSError):
-            await client.request(
+            await client.send(
                 Path(record.socket_path),
-                self._env(T_SHUTDOWN, {}),
+                ShutdownPayload(),
+                session_id=None,
                 timeout_s=REQUEST_TIMEOUT_S,
             )
         proc = self._procs.pop(session_id, None)
@@ -1602,51 +1590,30 @@ class MasterRuntime:
         self._publish_fleet()
 
     async def _deliver(
-        self, socket_path: str, env: Envelope, *, rejection: str
+        self, socket_path: str, payload: WireMessage, *, rejection: str
     ) -> str | None:
-        """Send ``env`` to a session socket, reporting a NACK.
+        """Send ``payload`` to a session socket, reporting a NACK.
 
         Args:
             socket_path: Session socket to write to.
-            env: Envelope to send.
+            payload: Message to send.
             rejection: Message logged and returned when the session NACKs.
 
         Returns:
             ``None`` when the session ACKed, otherwise ``rejection``, with the
             broker's own reason appended when it sent one.
         """
-        resp = await client.request(
-            Path(socket_path), env, timeout_s=REQUEST_TIMEOUT_S
+        resp = await client.send(
+            Path(socket_path), payload, session_id=None, timeout_s=REQUEST_TIMEOUT_S
         )
         if resp.ok:
             return None
-        reason = resp.payload.get("error")
-        if isinstance(reason, str) and reason:
+        reason = parse_nack(resp).error
+        if reason:
             rejection = f"{rejection}: {reason}"
         logger.warning("%s", rejection)
         return rejection
 
-    def _env(self, msg_type: str, payload: dict[str, Any]) -> Envelope:
-        """Wrap a payload in an envelope with a fresh message id."""
-        return Envelope(id=uuid.uuid4().hex, type=msg_type, payload=payload)
-
     def _ack(self, env: Envelope, *, ok: bool) -> Response:
         """Build the ACK or NACK answering an envelope."""
         return Response(id=env.id, ok=ok)
-
-    def _nack(self, env: Envelope, error: str, reason_code: str) -> Response:
-        """Build a refusal a sender can act on without parsing the message.
-
-        Args:
-            env: Envelope being answered.
-            error: Human-readable reason, carried for the developer.
-            reason_code: Machine-readable reason from the closed NACK set.
-
-        Returns:
-            The refusal.
-        """
-        return Response(
-            id=env.id,
-            ok=False,
-            payload={"error": error, "reason_code": reason_code},
-        )

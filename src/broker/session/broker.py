@@ -61,8 +61,7 @@ from broker.protocol.constants import (
     ENV_BROKER_HOOK_LOG,
     ENV_BROKER_SOCKET,
     HookEventName,
-    NACK_STALE_PROPOSAL,
-    NACK_WRONG_STATE,
+    NackCode,
     SessionState,
     T_APPROVE_PROMPT,
     T_CLARIFY_ESCALATION,
@@ -121,6 +120,8 @@ from broker.protocol.schemas import (
     RetrievedSymbol,
     SendPromptPayload,
     StatusPayload,
+    nack_response,
+    parse_nack,
 )
 from broker.session import ask, clarify
 from broker.session.triage import (
@@ -227,7 +228,9 @@ class PaneOccupiedError(Exception):
 
 
 class MasterRefusedError(Exception):
-    def __init__(self, msg_type: str, error: str, reason_code: str | None) -> None:
+    def __init__(
+        self, msg_type: str, error: str, reason_code: NackCode | None
+    ) -> None:
         """Record the refused message type and the master's stated reason."""
         super().__init__(
             f"master refused {msg_type}: {error or '(no reason given)'}"
@@ -654,7 +657,7 @@ class SessionBroker:
             return await self._handle(env)
         except ValidationError as exc:
             logger.error("invalid %s payload: %s", env.type, exc)
-            return Response(id=env.id, ok=False, payload={"error": str(exc)})
+            return nack_response(env, str(exc), None)
 
     async def _on_permission_request(self, env: Envelope) -> Response:
         """Judge a permission request and reply with the decision.
@@ -820,21 +823,11 @@ class SessionBroker:
             or active is None
             or active.escalation_id != req.escalation_id
         ):
-            return Response(
-                id=env.id,
-                ok=False,
-                payload={
-                    "error": "escalation no longer live",
-                    "reason_code": NACK_WRONG_STATE,
-                },
+            return nack_response(
+                env, "escalation no longer live", NackCode.WRONG_STATE
             )
-        resolved = Response(
-            id=env.id,
-            ok=False,
-            payload={
-                "error": "escalation resolved in the pane",
-                "reason_code": NACK_WRONG_STATE,
-            },
+        resolved = nack_response(
+            env, "escalation resolved in the pane", NackCode.WRONG_STATE
         )
         assert self._llm_call is not None
         try:
@@ -845,9 +838,7 @@ class SessionBroker:
                 f"{type(exc).__name__}: {exc}",
                 req.escalation_id,
             )
-            return Response(
-                id=env.id, ok=False, payload={"error": f"{type(exc).__name__}: {exc}"}
-            )
+            return nack_response(env, f"{type(exc).__name__}: {exc}", None)
         task = asyncio.create_task(
             clarify.clarify(
                 self._llm_call,
@@ -876,9 +867,7 @@ class SessionBroker:
                 f"{type(exc).__name__}: {exc}",
                 req.escalation_id,
             )
-            return Response(
-                id=env.id, ok=False, payload={"error": f"{type(exc).__name__}: {exc}"}
-            )
+            return nack_response(env, f"{type(exc).__name__}: {exc}", None)
         finally:
             # Discard only: awaiting `task` forwards this connection task's
             # cancellation — the timeout's included — into it, so it is
@@ -976,13 +965,8 @@ class SessionBroker:
                 or approved.proposal_id != self._pending.payload.proposal_id
             ):
                 logger.warning("stale approve_prompt ignored")
-                return Response(
-                    id=env.id,
-                    ok=False,
-                    payload={
-                        "error": "stale proposal",
-                        "reason_code": NACK_STALE_PROPOSAL,
-                    },
+                return nack_response(
+                    env, "stale proposal", NackCode.STALE_PROPOSAL
                 )
             self._pending.future.set_result(approved)
             return Response(id=env.id, ok=True)
@@ -995,17 +979,12 @@ class SessionBroker:
         if env.type == T_REACTIVATE:
             reactivate = ReactivatePayload.model_validate(env.payload)
             if self.state != SessionState.COMPLETED:
-                return Response(
-                    id=env.id,
-                    ok=False,
-                    payload={
-                        "error": (
-                            f"session is {self.state!r}, not 'completed' — "
-                            "reassign a new broker instead of displacing the "
-                            "task this one is still driving"
-                        ),
-                        "reason_code": NACK_WRONG_STATE,
-                    },
+                return nack_response(
+                    env,
+                    f"session is {self.state!r}, not 'completed' — reassign a "
+                    "new broker instead of displacing the task this one is "
+                    "still driving",
+                    NackCode.WRONG_STATE,
                 )
             # Closes the gate here, not in the job: a second reactivate
             # arriving before the queue drains must not pass it too.
@@ -1016,30 +995,19 @@ class SessionBroker:
         if env.type == T_SEND_PROMPT:
             prompt = SendPromptPayload.model_validate(env.payload)
             if self.state in (SessionState.ERROR, SessionState.STOPPED):
-                return Response(
-                    id=env.id,
-                    ok=False,
-                    payload={
-                        "error": (
-                            f"session is {self.state!r} — this broker no "
-                            "longer drives its pane"
-                        ),
-                        "reason_code": NACK_WRONG_STATE,
-                    },
+                return nack_response(
+                    env,
+                    f"session is {self.state!r} — this broker no longer drives "
+                    "its pane",
+                    NackCode.WRONG_STATE,
                 )
             what = self._native_prompt()
             if what is not None:
-                return Response(
-                    id=env.id,
-                    ok=False,
-                    payload={
-                        "error": (
-                            f"{what} is open in pane {self.pane_id or '?'} — the "
-                            "developer answers it there before a prompt can be "
-                            "typed"
-                        ),
-                        "reason_code": NACK_WRONG_STATE,
-                    },
+                return nack_response(
+                    env,
+                    f"{what} is open in pane {self.pane_id or '?'} — the "
+                    "developer answers it there before a prompt can be typed",
+                    NackCode.WRONG_STATE,
                 )
             self.jobs.put_nowait(lambda: self._send_developer_prompt(prompt))
             return Response(id=env.id, ok=True)
@@ -1080,9 +1048,7 @@ class SessionBroker:
             self._request_stop()
             return Response(id=env.id, ok=True)
 
-        return Response(
-            id=env.id, ok=False, payload={"error": f"unknown type {env.type!r}"}
-        )
+        return nack_response(env, f"unknown type {env.type!r}", None)
 
     async def _dispatch_hook(self, hook: HookEventPayload) -> None:
         """Route one Claude Code hook event to state changes, queued jobs or a stop.
@@ -1981,13 +1947,8 @@ class SessionBroker:
             Path(self.cfg.master_socket_path), env, timeout_s=MASTER_TIMEOUT_S
         )
         if not resp.ok:
-            error = resp.payload.get("error")
-            reason_code = resp.payload.get("reason_code")
-            raise MasterRefusedError(
-                msg_type,
-                error if isinstance(error, str) else "",
-                reason_code if isinstance(reason_code, str) else None,
-            )
+            nack = parse_nack(resp)
+            raise MasterRefusedError(msg_type, nack.error, nack.reason_code)
 
     async def _fatal(self, error_class: str, detail: str) -> None:
         """Log the failure, enter the error state, and tell the master.

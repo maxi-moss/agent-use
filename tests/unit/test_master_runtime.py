@@ -39,9 +39,7 @@ from broker.master.viewmodel import (
 )
 from broker.protocol import client
 from broker.protocol.constants import (
-    NACK_MALFORMED,
-    NACK_PROTOCOL_VIOLATION,
-    NACK_UNKNOWN_SESSION,
+    NackCode,
     PaneKind,
     SessionState,
     T_APPROVE_PROMPT,
@@ -390,7 +388,7 @@ async def test_second_escalation_while_active_is_protocol_violation(
     resp = await send(runtime, T_ESCALATION, escalation_dict("e2"))
     assert not resp.ok
     # Same session: the broker was told to hold one at a time and did not.
-    assert resp.payload["reason_code"] == NACK_PROTOCOL_VIOLATION
+    assert resp.payload["reason_code"] == NackCode.PROTOCOL_VIOLATION
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("PROTOCOL VIOLATION" in t for t in notices)
     # The first escalation stays active; the second is never surfaced.
@@ -413,7 +411,7 @@ async def test_second_permission_pane_from_a_session_is_protocol_violation(
     )
     # The permission module retracts the old prompt before raising the next.
     assert not resp.ok
-    assert resp.payload["reason_code"] == NACK_PROTOCOL_VIOLATION
+    assert resp.payload["reason_code"] == NackCode.PROTOCOL_VIOLATION
     assert [p.escalation_id for p in runtime.panes.entries] == ["p1"]
     assert (
         len([m for m in posts if isinstance(m, PaneEscalationArrived)]) == 1
@@ -555,7 +553,7 @@ async def test_malformed_permission_pane_nacked_never_surfaced(
     del thin["reason"]
     resp = await send(runtime, T_PANE_ESCALATION, thin)
     assert not resp.ok
-    assert resp.payload["reason_code"] == NACK_MALFORMED
+    assert resp.payload["reason_code"] == NackCode.MALFORMED
     # A prompt the developer cannot act on is worse than none at all.
     assert [m for m in posts if isinstance(m, PaneEscalationArrived)] == []
     notices = [m.text for m in posts if isinstance(m, Notice)]
@@ -573,7 +571,7 @@ async def test_escalation_from_an_unknown_session_never_enters_the_queue(
         runtime, T_ESCALATION, escalation_dict("e1", "ghost"), session="ghost"
     )
     assert not resp.ok
-    assert resp.payload["reason_code"] == NACK_UNKNOWN_SESSION
+    assert resp.payload["reason_code"] == NackCode.UNKNOWN_SESSION
     resp = await send(
         runtime,
         T_PANE_ESCALATION,
@@ -581,7 +579,7 @@ async def test_escalation_from_an_unknown_session_never_enters_the_queue(
         session="ghost",
     )
     assert not resp.ok
-    assert resp.payload["reason_code"] == NACK_UNKNOWN_SESSION
+    assert resp.payload["reason_code"] == NackCode.UNKNOWN_SESSION
     assert runtime.queue.active is None
     assert runtime.panes.entries == ()
     assert [m for m in posts if isinstance(m, EscalationArrived)] == []
