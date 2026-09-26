@@ -274,6 +274,7 @@ class MasterRuntime:
         cfg: BrokerConfig,
         *,
         anchor_pane: str,
+        claude_json: Path,
     ) -> None:
         """Wire the runtime to its frontend sink, its persisted stores and the config.
 
@@ -284,11 +285,14 @@ class MasterRuntime:
             panes: Loaded open pane escalations.
             cfg: Broker configuration.
             anchor_pane: Herdr pane every spawned session is anchored to.
+            claude_json: Claude Code's ``~/.claude.json`` state file, resolved
+                once by the composition root.
         """
         self.emit = emit
         self.registry = registry
         self.cfg = cfg
         self.anchor_pane = anchor_pane
+        self._claude_json = claude_json
         self.queue = queue
         self.panes = panes
         self._surfaced_id: str | None = None
@@ -758,7 +762,8 @@ class MasterRuntime:
             anchor_pane=self.anchor_pane,
             intent=intent,
         )
-        seed_trust(cwd_path)  # BEFORE spawn — the dialog eats input
+        # BEFORE spawn — the dialog eats input.
+        seed_trust(cwd_path, self._claude_json)
         proc = await self._spawn_broker(record, adopt=None)
         record.pid = proc.pid
         self._procs[name] = proc
@@ -1483,9 +1488,6 @@ class MasterRuntime:
         Returns:
             ``None``; the report is never refused.
         """
-        logger.info(
-            "session %s: ended (/exit) — removed from the fleet", session_id
-        )
         self._activity.pop(session_id, None)
         self._task_activity.pop(session_id, None)
         self._permission_prompt_pending.discard(session_id)
@@ -1658,7 +1660,7 @@ class MasterRuntime:
         Args:
             socket_path: Session socket to write to.
             payload: Message to send.
-            rejection: Message logged and returned when the session NACKs.
+            rejection: Message returned when the session NACKs.
 
         Returns:
             ``None`` when the session ACKed, otherwise ``rejection``, with the
@@ -1672,5 +1674,4 @@ class MasterRuntime:
         reason = parse_nack(resp).error
         if reason:
             rejection = f"{rejection}: {reason}"
-        logger.warning("%s", rejection)
         return rejection

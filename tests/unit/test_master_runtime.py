@@ -3,6 +3,7 @@ runtime server; driver.subprocess.run monkeypatched; emit = recording list."""
 
 import asyncio
 import json
+import logging
 import subprocess
 import tempfile
 import uuid
@@ -14,9 +15,11 @@ import pytest
 from pydantic import ValidationError
 
 from broker import decision_log
+from broker import logging_setup
 from broker.decision_log import DecisionKind
 from broker.config import BrokerConfig
 from broker.herdr import driver
+from broker.master.__main__ import log_notice
 from broker.master.pane_escalations import PaneEscalations
 from broker.master.payload_render import (
     PANE_UNKNOWN,
@@ -362,7 +365,13 @@ async def rt(
     queue = EscalationQueue.load(home / "escalation-queue.json")
     panes = PaneEscalations.load(home / "pane-escalations.json")
     runtime = MasterRuntime(
-        posts.append, registry, queue, panes, cfg, anchor_pane="%1"
+        posts.append,
+        registry,
+        queue,
+        panes,
+        cfg,
+        anchor_pane="%1",
+        claude_json=home / "claude.json",
     )
     runtime.start()
     for _ in range(200):
@@ -948,6 +957,7 @@ async def test_startup_resurfaces_the_persisted_head_and_open_prompts(
         PaneEscalations.load(panes_path),
         cfg,
         anchor_pane="%1",
+        claude_json=home / "claude.json",
     )
     runtime.start()
     for _ in range(200):
@@ -1000,6 +1010,7 @@ async def test_probe_of_a_settled_session_keeps_it_settled(home: Path) -> None:
         PaneEscalations.load(home / "pane-escalations.json"),
         cfg,
         anchor_pane="%1",
+        claude_json=home / "claude.json",
     )
     try:
         await runtime.probe_status("s1")
@@ -1039,6 +1050,7 @@ async def test_repopulate_from_brokers_fills_task_activity_at_startup(
         PaneEscalations.load(home / "pane-escalations.json"),
         cfg,
         anchor_pane="%1",
+        claude_json=home / "claude.json",
     )
     try:
         runtime.start()
@@ -1096,6 +1108,7 @@ async def test_repopulate_from_brokers_recovers_pending_proposal(
         PaneEscalations.load(home / "pane-escalations.json"),
         cfg,
         anchor_pane="%1",
+        claude_json=home / "claude.json",
     )
     try:
         runtime.start()
@@ -1142,6 +1155,7 @@ async def test_repopulate_from_brokers_registers_nothing_when_no_proposal(
         PaneEscalations.load(home / "pane-escalations.json"),
         cfg,
         anchor_pane="%1",
+        claude_json=home / "claude.json",
     )
     try:
         runtime.start()
@@ -1810,6 +1824,34 @@ async def test_get_decision_log_raises_on_malformed_reply(
         await server.wait_closed()
 
 
+async def test_spawn_session_seeds_trust_and_registers(
+    home: Path, spawn: RecordingSpawn
+) -> None:
+    cfg = BrokerConfig(model_id="test-model", broker_home=home)
+    registry = Registry.load(home / "registry.json")
+    queue = EscalationQueue.load(home / "escalation-queue.json")
+    panes = PaneEscalations.load(home / "pane-escalations.json")
+    runtime = MasterRuntime(
+        lambda _event: None,
+        registry,
+        queue,
+        panes,
+        cfg,
+        anchor_pane="%1",
+        claude_json=home / "claude.json",
+    )
+    result = await runtime.spawn_session("do the thing", str(home))
+    assert "spawned session" in result
+    assert len(spawn.argvs) == 1
+    assert registry.get("s1").cwd == str(home)
+    assert registry.get("s1").intent == "do the thing"
+    trusted = cast(
+        dict[str, Any],
+        json.loads((home / "claude.json").read_text(encoding="utf-8")),
+    )
+    assert trusted["projects"][str(home)]["hasTrustDialogAccepted"] is True
+
+
 def _bind_session(runtime: MasterRuntime) -> SessionRecord:
     """Give s1 the identifiers a reassignment has to carry over."""
     record = runtime.registry.get("s1")
@@ -2150,7 +2192,13 @@ async def test_build_fleet_view_idle_master_and_no_sessions(home: Path) -> None:
     queue = EscalationQueue.load(home / "escalation-queue.json")
     panes = PaneEscalations.load(home / "pane-escalations.json")
     runtime = MasterRuntime(
-        lambda _event: None, registry, queue, panes, cfg, anchor_pane="%1"
+        lambda _event: None,
+        registry,
+        queue,
+        panes,
+        cfg,
+        anchor_pane="%1",
+        claude_json=home / "claude.json",
     )
     view = runtime.build_fleet_view()
     assert view.master_activity is None
@@ -2551,3 +2599,28 @@ async def test_unknown_or_malformed_message_is_refused_as_malformed(
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("no_such_type" in t for t in notices)
     assert any("MALFORMED" in t and T_BUDGET_UPDATE in t for t in notices)
+
+
+def test_log_notice_writes_every_notice_to_the_configured_log_file(
+    tmp_path: Path,
+) -> None:
+    root = logging.getLogger()
+    saved = list(root.handlers)
+    saved_level = root.level
+    for handler in saved:
+        root.removeHandler(handler)
+    try:
+        log_path = tmp_path / "master.log"
+        logging_setup.configure(log_path)
+        log_notice(Notice("a stranded escalation"))
+        log_notice(SessionStateChanged("s1", SessionState.DRIVING))
+        text = log_path.read_text(encoding="utf-8")
+        assert "a stranded escalation" in text
+        assert text.count("\n") == 1
+    finally:
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+            handler.close()
+        for handler in saved:
+            root.addHandler(handler)
+        root.setLevel(saved_level)
