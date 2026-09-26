@@ -22,7 +22,8 @@ from anthropic.types import (
 
 from broker.config import ClassifierConfig
 from broker.permission import PermissionModule
-from broker.permission.llm import PermissionCallError, ToolCall
+from broker.permission import module as permission_module
+from broker.permission.classifier import PermissionCallError, PermissionToolCall
 from broker.protocol.constants import (
     DECISION_ALLOW,
     DECISION_ESCALATED,
@@ -40,9 +41,11 @@ READ_INPUT: dict[str, Any] = {"file_path": "/repo/a.py"}
 PUSH_INPUT: dict[str, Any] = {"command": "git push origin main"}
 DEPLOY_INPUT: dict[str, Any] = {"command": "./deploy.sh"}
 
-ALLOW = ToolCall(name="allow", input={"reasoning": "reversible read"})
-ESCALATE = ToolCall(name="escalate", input={"reasoning": "publishes to a remote"})
-ESCALATE_2 = ToolCall(name="escalate", input={"reasoning": "deploys"})
+ALLOW = PermissionToolCall(name="allow", input={"reasoning": "reversible read"})
+ESCALATE = PermissionToolCall(
+    name="escalate", input={"reasoning": "publishes to a remote"}
+)
+ESCALATE_2 = PermissionToolCall(name="escalate", input={"reasoning": "deploys"})
 
 # Long enough for an in-process socket round trip to finish, short enough that
 # a test asserting nothing happened still runs fast.
@@ -52,7 +55,7 @@ SETTLE_S = 0.05
 class FakeLLM:
     """Scripted classifier. An empty script means an unexpected extra call."""
 
-    def __init__(self, *results: ToolCall) -> None:
+    def __init__(self, *results: PermissionToolCall) -> None:
         self.results = list(results)
         self.calls: list[dict[str, Any]] = []
         self.error: Exception | None = None
@@ -67,7 +70,7 @@ class FakeLLM:
         messages: list[MessageParam],
         tools: list[ToolParam],
         tool_choice: ToolChoiceParam,
-    ) -> ToolCall:
+    ) -> PermissionToolCall:
         self.calls.append({"model": model, "system": system, "messages": messages})
         if self.never_resolve:
             await asyncio.Event().wait()
@@ -138,7 +141,7 @@ async def _module(
     log_path = home / "permissions.ndjson"
     module = PermissionModule(
         CFG,
-        session_name="s1",
+        session_id="s1",
         master_socket_path=str(sock),
         log_path=log_path,
         intent="add a login page",
@@ -204,6 +207,23 @@ async def test_askuserquestion_gate_no_inference(home: Path) -> None:
     written = entries(log)
     assert len(written) == 1
     assert written[0]["model_id"] is None
+
+
+async def test_classifier_past_the_deadline_resolves_to_escalated(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(permission_module, "PERMISSION_DECISION_TIMEOUT_S", 0.05)
+    llm = FakeLLM()
+    llm.never_resolve = True
+    async with _module(home, llm) as (module, master, log):
+        async with asyncio.timeout(2.0):
+            decision = await module.decide("Bash", PUSH_INPUT, [])
+        await asyncio.sleep(SETTLE_S)
+    assert decision == DECISION_ESCALATED
+    written = entries(log)
+    assert len(written) == 1
+    assert written[0]["decision"] == DECISION_ESCALATED
+    assert master.received == []
 
 
 def _completed(module: PermissionModule) -> None:

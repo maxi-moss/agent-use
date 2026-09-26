@@ -20,10 +20,9 @@ from pathlib import Path
 from typing import Any
 
 from broker.config import ClassifierConfig
-from broker.permission import llm as llm_module
+from broker.permission import classifier
 from broker.permission import permission_log
-from broker.permission.llm import PermissionCaller
-from broker.permission.schemas import AllowCall
+from broker.permission.classifier import AllowCall, PermissionCaller
 from broker.protocol import client
 from broker.protocol.constants import (
     ASK_USER_QUESTION,
@@ -44,6 +43,11 @@ from broker.protocol.schemas import (
 logger = logging.getLogger(__name__)
 
 MASTER_TIMEOUT_S = 10.0
+# Named and bounded like every other wait (global rule). Sits under
+# HOOK_WAIT_SECONDS (30) so the hook never gives up while the module still
+# intends to answer; permission-owned, not shared with the session or master
+# call timeouts.
+PERMISSION_DECISION_TIMEOUT_S = 20.0
 
 _ASK_REASON = (
     "the session is putting a question to the developer; that question travels"
@@ -72,7 +76,7 @@ class PermissionModule:
         self,
         cfg: ClassifierConfig,
         *,
-        session_name: str,
+        session_id: str,
         master_socket_path: str,
         log_path: Path,
         intent: str,
@@ -82,7 +86,7 @@ class PermissionModule:
 
         Args:
             cfg: Supplies the classifier's model id and token cap.
-            session_name: Session this module belongs to.
+            session_id: Session this module belongs to.
             master_socket_path: Master socket escalations and retractions go to.
             log_path: Append-only permission log for this session.
             intent: Authoritative task intent every call is judged against.
@@ -90,7 +94,7 @@ class PermissionModule:
                 from an Anthropic client on first use — tests pass a fake.
         """
         self.cfg = cfg
-        self.session_name = session_name
+        self.session_id = session_id
         self.master_socket_path = Path(master_socket_path)
         self.log_path = log_path
         self.intent = intent
@@ -130,14 +134,30 @@ class PermissionModule:
         key = _call_key(tool_name, tool_input)
         started = time.monotonic()
         try:
-            result = await llm_module.classify(
-                self._caller(),
-                self.cfg,
-                intent=self.intent,
-                tool_name=tool_name,
-                tool_input=tool_input,
-                suggestions=llm_module.render_suggestions(suggestions),
+            async with asyncio.timeout(PERMISSION_DECISION_TIMEOUT_S):
+                result = await classifier.classify(
+                    self._caller(),
+                    self.cfg,
+                    intent=self.intent,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    suggestions=classifier.render_suggestions(suggestions),
+                )
+        except TimeoutError:
+            reason = (
+                "permission decision exceeded PERMISSION_DECISION_TIMEOUT_S "
+                f"({PERMISSION_DECISION_TIMEOUT_S:.0f} s)"
             )
+            logger.warning(reason)
+            self._append(
+                tool_name,
+                tool_input,
+                DECISION_ESCALATED,
+                reason,
+                self.cfg.model_id,
+                _elapsed_ms(started),
+            )
+            return DECISION_ESCALATED
         except Exception as exc:
             logger.warning("permission classification failed: %s", exc)
             self._append(
@@ -207,8 +227,8 @@ class PermissionModule:
     def _caller(self) -> PermissionCaller:
         """Return the injected caller, building one on first use."""
         if self._llm_call is None:
-            self._llm_call = llm_module.bind(
-                llm_module.build_classifier_client(self.cfg)
+            self._llm_call = classifier.bind(
+                classifier.build_classifier_client()
             )
         return self._llm_call
 
@@ -254,7 +274,7 @@ class PermissionModule:
         """
         payload = PermissionEscalationPayload(
             escalation_id=uuid.uuid4().hex,
-            session_id=self.session_name,
+            session_id=self.session_id,
             tool_name=tool_name,
             tool_input=tool_input,
             task_intent=self.intent,
@@ -372,7 +392,7 @@ class PermissionModule:
         env = Envelope(
             id=uuid.uuid4().hex,
             type=msg_type,
-            session_id=self.session_name,
+            session_id=self.session_id,
             payload=payload,
         )
         try:

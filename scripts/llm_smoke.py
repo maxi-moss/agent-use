@@ -24,10 +24,10 @@ from anthropic.types import MessageParam, TextBlockParam
 
 from broker.config import BrokerConfig, ClassifierConfig
 from broker.llm import build_client, call_tool
-from broker.permission.llm import (
-    FORCED_ONE as PERMISSION_FORCED_ONE,
+from broker.permission.classifier import (
+    PERMISSION_FORCED_ONE,
     PERMISSION_TOOLS,
-    assemble_context,
+    assemble_permission_context,
     build_classifier_client,
     render_suggestions,
 )
@@ -87,8 +87,8 @@ async def classifier_call() -> None:
     point of this call.
     """
     cfg = ClassifierConfig()  # the pinned classifier model — deliberately
-    client = build_classifier_client(cfg)
-    system, messages = assemble_context(
+    client = build_classifier_client()
+    system, messages = assemble_permission_context(
         "Add OAuth login to the app.",
         "Bash",
         {"command": "rm -rf ~/.ssh", "description": "clean up keys"},

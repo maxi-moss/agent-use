@@ -178,6 +178,19 @@ Job = Callable[[], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
+class _TaskIntent:
+    """The task this broker drives: the raw intent and its approved prompt."""
+
+    raw: str
+    approved: str | None  # None: superseded until the developer approves
+
+    @property
+    def authoritative(self) -> str:
+        """Return the approved prompt if there is one, else the raw intent."""
+        return self.approved or self.raw
+
+
+@dataclass(frozen=True, slots=True)
 class _PendingApproval:
     """The prompt proposal the broker is awaiting the developer's approval on."""
 
@@ -330,14 +343,13 @@ class SessionBroker:
         self._logged_drift_warnings: set[str] = set()
         self._logged_drift_versions: set[frozenset[str]] = set()
         self.budget_count = cfg.budget_count
-        self.intent = cfg.intent  # replaced outright on reactivation
-        self.approved_prompt: str | None = None
+        self._task = _TaskIntent(cfg.intent, None)
         self.task_activity: str = ""
 
         self.session_bound = asyncio.Event()
         self._pending: _PendingApproval | None = None
-        self.queue: asyncio.Queue[Job | None] = asyncio.Queue()
-        self._shutdown = asyncio.Event()
+        self.jobs: asyncio.Queue[Job] = asyncio.Queue()
+        self._run_task: asyncio.Task[None] | None = None
 
         self._active_escalation: EscalationPayload | None = None
         self._clarify_tasks: set[asyncio.Task[clarify.ClarifyCall]] = set()
@@ -358,10 +370,10 @@ class SessionBroker:
         self.permission_log_path = self._paths.session_permissions(cfg.name)
         self.permission = permission or PermissionModule(
             cfg.classifier,
-            session_name=cfg.name,
+            session_id=cfg.name,
             master_socket_path=cfg.master_socket_path,
             log_path=self.permission_log_path,
-            intent=cfg.intent,
+            intent=self._task.authoritative,
         )
         self.watchdog = Watchdog(
             cfg.watchdog_seconds, self._herdr_state, self._reconcile
@@ -370,7 +382,7 @@ class SessionBroker:
     # ── lifecycle ─────────────────────────────────────────────────────────
 
     async def run(self) -> None:
-        """Serve the socket, launch the session, then drain the event queue."""
+        """Serve the socket and drive the session until it is stopped."""
         # Bind FIRST — hooks may fire before the pane exists.
         server = await serve_unix(Path(self.cfg.socket_path), self.handle)
         if self._llm_call is None:
@@ -379,13 +391,15 @@ class SessionBroker:
             self._retrieve = _bind_retrieve(self._paths, self.broker_cfg.embedding)
         self.watchdog.start()
         self._status_task = asyncio.create_task(self._status_sender())
+        drive = self._run_task = asyncio.create_task(self._drive())
         try:
-            await self._launch()
-            await self._event_loop()
-        except FatalSessionError as exc:
-            await self._fatal(exc.error_class, exc.detail)
-        except Exception as exc:  # fail loud to the master, never to stderr
-            await self._fatal(type(exc).__name__, str(exc))
+            await drive
+        except asyncio.CancelledError:
+            # A requested stop cancels only the drive task; cancellation of
+            # run() itself must propagate.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
         finally:
             # Cancellation, not a shutdown flag: a sender parked in
             # _status_dirty.wait() would never observe one.
@@ -399,6 +413,21 @@ class SessionBroker:
             await self.watchdog.stop()
             server.close()
             await server.wait_closed()
+
+    async def _drive(self) -> None:
+        """Launch the session, then run queued jobs one at a time."""
+        try:
+            await self._launch()
+            await self._event_loop()
+        except FatalSessionError as exc:
+            await self._fatal(exc.error_class, exc.detail)
+        except Exception as exc:  # fail loud to the master, never to stderr
+            await self._fatal(type(exc).__name__, str(exc))
+
+    def _request_stop(self) -> None:
+        """Stop driving the session once the current reply has been written."""
+        assert self._run_task is not None  # set before any handler runs
+        asyncio.get_running_loop().call_soon(self._run_task.cancel)
 
     async def _launch(self) -> None:
         """Take over or start a Claude session, then resume or ground the task.
@@ -447,9 +476,7 @@ class SessionBroker:
         Args:
             resume: The persisted approved prompt and completed-ness.
         """
-        self.approved_prompt = resume.approved_prompt
-        # AFTER restoring the prompt, so the module judges the resumed task.
-        self.permission.set_intent(self._intent())
+        self._set_task(self._task.raw, resume.approved_prompt)
         self._log(
             DecisionKind.RESUMED,
             "attached to a session whose previous broker is gone",
@@ -527,8 +554,7 @@ class SessionBroker:
             FatalSessionError: Retrieval, embedding, or the grounding call
                 failed. The spawn aborts; nothing degraded is proposed.
         """
-        self.intent = intent
-        self.approved_prompt = None  # superseded until the developer approves
+        self._set_task(intent, None)
         self.task_activity = ""
         self._set_state(SessionState.GROUNDING)
         assert self._llm_call is not None
@@ -560,8 +586,7 @@ class SessionBroker:
         await self._to_master(T_PROMPT_PROPOSAL, payload.model_dump())
         # Approval is synchronous and blocking — no timeout.
         approved = await approval
-        self.approved_prompt = approved.prompt
-        self.permission.set_intent(self._intent())
+        self._set_task(intent, approved.prompt)
         await self._submit(approved.prompt)
         self._pending = None
         self._set_state(SessionState.DRIVING)
@@ -604,11 +629,9 @@ class SessionBroker:
             self._status_dirty.set()
 
     async def _event_loop(self) -> None:
-        """Run queued jobs one at a time until shutdown or the sentinel."""
-        while not self._shutdown.is_set():
-            job = await self.queue.get()
-            if job is None:
-                break
+        """Run queued jobs one at a time until the drive task is cancelled."""
+        while True:
+            job = await self.jobs.get()
             try:
                 await job()
             except FatalSessionError as exc:
@@ -767,7 +790,7 @@ class SessionBroker:
         # report the count as of this answer, not whatever it is when the
         # queue drains.
         count = self.budget_count
-        self.queue.put_nowait(
+        self.jobs.put_nowait(
             lambda: self._report_budget(count)
         )
         return AskQuestionDecisionPayload(
@@ -899,7 +922,7 @@ class SessionBroker:
         self._claim_menu(_OpenMenu(tool_use_id, escalation_id, None))
         # Queued: the hook blocks on this reply and must never wait on master
         # traffic.
-        self.queue.put_nowait(
+        self.jobs.put_nowait(
             lambda: self._raise_question(
                 escalation_id,
                 tool_input,
@@ -917,7 +940,7 @@ class SessionBroker:
         # A picker opening means the earlier one closed. Its escalation is
         # retracted ahead of the new raise: the master holds one per session.
         if previous is not None and previous.escalation_id is not None:
-            self.queue.put_nowait(lambda: self._retract_superseded_menu(previous))
+            self.jobs.put_nowait(lambda: self._retract_superseded_menu(previous))
 
     async def _handle(self, env: Envelope) -> Response | None:
         """Reply to one message type, enqueuing anything slow onto the queue.
@@ -942,7 +965,7 @@ class SessionBroker:
         if env.type == T_HOOK_EVENT:
             self.watchdog.reset()
             hook = HookEventPayload.model_validate(env.payload)
-            self._dispatch_hook(hook)
+            await self._dispatch_hook(hook)
             return None  # fire-and-forget
 
         if env.type == T_APPROVE_PROMPT:
@@ -966,7 +989,7 @@ class SessionBroker:
 
         if env.type == T_DISPATCH_DECISION:
             decision = DispatchDecisionPayload.model_validate(env.payload)
-            self.queue.put_nowait(lambda: self._deliver_decision(decision))
+            self.jobs.put_nowait(lambda: self._deliver_decision(decision))
             return Response(id=env.id, ok=True)
 
         if env.type == T_REACTIVATE:
@@ -987,11 +1010,23 @@ class SessionBroker:
             # Closes the gate here, not in the job: a second reactivate
             # arriving before the queue drains must not pass it too.
             self._set_state(SessionState.GROUNDING)
-            self.queue.put_nowait(lambda: self._reactivate(reactivate))
+            self.jobs.put_nowait(lambda: self._reactivate(reactivate))
             return Response(id=env.id, ok=True)
 
         if env.type == T_SEND_PROMPT:
             prompt = SendPromptPayload.model_validate(env.payload)
+            if self.state in (SessionState.ERROR, SessionState.STOPPED):
+                return Response(
+                    id=env.id,
+                    ok=False,
+                    payload={
+                        "error": (
+                            f"session is {self.state!r} — this broker no "
+                            "longer drives its pane"
+                        ),
+                        "reason_code": NACK_WRONG_STATE,
+                    },
+                )
             what = self._native_prompt()
             if what is not None:
                 return Response(
@@ -1006,7 +1041,7 @@ class SessionBroker:
                         "reason_code": NACK_WRONG_STATE,
                     },
                 )
-            self.queue.put_nowait(lambda: self._send_developer_prompt(prompt))
+            self.jobs.put_nowait(lambda: self._send_developer_prompt(prompt))
             return Response(id=env.id, ok=True)
 
         if env.type == T_STATUS:
@@ -1042,16 +1077,15 @@ class SessionBroker:
             )
 
         if env.type == T_SHUTDOWN:
-            self._shutdown.set()
-            self.queue.put_nowait(None)
+            self._request_stop()
             return Response(id=env.id, ok=True)
 
         return Response(
             id=env.id, ok=False, payload={"error": f"unknown type {env.type!r}"}
         )
 
-    def _dispatch_hook(self, hook: HookEventPayload) -> None:
-        """Route one Claude Code hook event to state changes or queued jobs.
+    async def _dispatch_hook(self, hook: HookEventPayload) -> None:
+        """Route one Claude Code hook event to state changes, queued jobs or a stop.
 
         ``Stop`` carries the classification input as ``last_assistant_message``,
         never the transcript tail. ``StopFailure`` is surfaced as fatal, not
@@ -1072,14 +1106,14 @@ class SessionBroker:
             case HookEventName.STOP:
                 self._set_perm_pending(False)
                 message = str(raw.get("last_assistant_message", "") or "")
-                self.queue.put_nowait(lambda: self._on_turn_end(message))
+                self.jobs.put_nowait(lambda: self._on_turn_end(message))
             case HookEventName.STOP_FAILURE:
                 error_class = str(
                     raw.get("matcher") or raw.get("error") or "stop_failure"
                 )
                 detail = str(raw.get("message") or raw)
                 # Surfaced, NOT a completed turn.
-                self.queue.put_nowait(lambda: self._fatal(error_class, detail))
+                self.jobs.put_nowait(lambda: self._fatal(error_class, detail))
             case HookEventName.USER_PROMPT_SUBMIT | HookEventName.POST_TOOL_USE:
                 if event == HookEventName.POST_TOOL_USE:
                     self._set_perm_pending(False)
@@ -1090,9 +1124,9 @@ class SessionBroker:
                 else:
                     self.permission.note_developer_input()
                 if self._open_menu is not None:
-                    self.queue.put_nowait(self._check_menu_answered)
+                    self.jobs.put_nowait(self._check_menu_answered)
                 if self.state == SessionState.ESCALATED:
-                    self.queue.put_nowait(self._check_out_of_band_resolution)
+                    self.jobs.put_nowait(self._check_out_of_band_resolution)
             case HookEventName.NOTIFICATION:
                 self._log(DecisionKind.NOTIFICATION, "", str(raw.get("message", "")))
                 if raw.get("notification_type") == "permission_prompt":
@@ -1101,7 +1135,9 @@ class SessionBroker:
                 self.permission.note_session_ended()
                 self._set_state(SessionState.STOPPED)
                 self._log(DecisionKind.SESSION_END, "", "SessionEnd hook received")
-                self.queue.put_nowait(self._on_session_end)
+                # Inline, not queued: the terminal report to master must go
+                # now, not wait behind whatever else is already queued.
+                await self._on_session_end()
             case HookEventName.PRE_COMPACT | HookEventName.POST_COMPACT:
                 self._log(DecisionKind.COMPACTION, "", event)  # continue normally
             case HookEventName.PRE_TOOL_USE | HookEventName.PERMISSION_REQUEST:
@@ -1137,7 +1173,7 @@ class SessionBroker:
 
     # ── queued jobs ───────────────────────────────────────────────────────
 
-    async def _classify(self, last_assistant_message: str) -> None:
+    async def _triage_turn(self, last_assistant_message: str) -> None:
         """Triage one turn boundary into an answer, escalation or completion.
 
         Only runs while driving. The transcript is read for context only — the
@@ -1202,11 +1238,11 @@ class SessionBroker:
                 headline=result.headline,
                 supporting=result.supporting,
             )
+            self._set_state(SessionState.COMPLETED)  # stop driving; keep serving
             await self._to_master(
                 T_COMPLETION,
                 {"headline": result.headline, "supporting": result.supporting},
             )
-            self._set_state(SessionState.COMPLETED)  # stop driving; keep serving
         elif isinstance(
             result, NoActionCall  # pyright: ignore[reportUnnecessaryIsInstance]
         ):
@@ -1427,7 +1463,7 @@ class SessionBroker:
                 DecisionKind.ASK_VERIFIED, "PostToolUse echo matches", tool_use_id
             )
             return
-        self.queue.put_nowait(
+        self.jobs.put_nowait(
             lambda: self._ask_verify_failed(
                 tool_use_id,
                 injected,
@@ -1476,7 +1512,7 @@ class SessionBroker:
                 f"verification itself failed ({type(exc).__name__}: {exc}) "
                 "— the broker cannot confirm its answers were delivered"
             )
-            self.queue.put_nowait(
+            self.jobs.put_nowait(
                 lambda: self._ask_verify_failed(
                     tool_use_id, injected, reason, answer_recorded=True
                 )
@@ -1495,7 +1531,7 @@ class SessionBroker:
                 "the recorded answers differ from what the broker injected"
             )
         answer_recorded = answer is not None
-        self.queue.put_nowait(
+        self.jobs.put_nowait(
             lambda: self._ask_verify_failed(
                 tool_use_id, injected, reason, answer_recorded=answer_recorded
             )
@@ -1622,7 +1658,7 @@ class SessionBroker:
             await self._check_out_of_band_resolution()
             if self.state == SessionState.ESCALATED:
                 return  # still escalated: stay quiescent
-        await self._classify(last_assistant_message)
+        await self._triage_turn(last_assistant_message)
 
     async def _check_out_of_band_resolution(self) -> None:
         """Retract the active decision escalation if the developer already answered.
@@ -1805,7 +1841,7 @@ class SessionBroker:
 
     async def _reconcile(self) -> None:
         """Enqueue reconciliation work on watchdog expiry."""
-        self.queue.put_nowait(self._reconcile_job)
+        self.jobs.put_nowait(self._reconcile_job)
 
     async def _reconcile_job(self) -> None:
         """Recover a turn boundary that produced no hook event.
@@ -1836,13 +1872,18 @@ class SessionBroker:
             "no hook event before deadline; herdr reports idle/blocked",
             "",
         )
-        await self._classify(last_text)
+        await self._triage_turn(last_text)
 
     # ── plumbing ──────────────────────────────────────────────────────────
 
     def _intent(self) -> str:
-        """Return the authoritative intent: the approved prompt if any."""
-        return self.approved_prompt or self.intent
+        """Return the authoritative intent of the task being driven."""
+        return self._task.authoritative
+
+    def _set_task(self, raw: str, approved: str | None) -> None:
+        """Replace the task being driven, and judge permissions against it."""
+        self._task = _TaskIntent(raw, approved)
+        self.permission.set_intent(self._task.authoritative)
 
     def _read_transcript(self) -> list[TranscriptEvent]:
         """Read the session transcript as cleaned events.
@@ -1975,8 +2016,7 @@ class SessionBroker:
             await self._to_master(T_SESSION_ENDED, {})
         except Exception:
             logger.exception("could not report session end to master")
-        self._shutdown.set()
-        self.queue.put_nowait(None)
+        self._request_stop()
 
     def _log(
         self,

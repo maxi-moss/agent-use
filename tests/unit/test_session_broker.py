@@ -22,7 +22,7 @@ from broker.index.retrieval import RetrievalError
 from broker.index.schemas import ContextSymbol, GroundingContext, SymbolKind
 from broker.llm import LLMCallError, ToolCall
 from broker.permission import PermissionModule
-from broker.permission.llm import ToolCall as PermissionToolCall
+from broker.permission.classifier import PermissionToolCall
 from broker.protocol import client
 from broker.protocol.constants import (
     MAX_LINE_BYTES,
@@ -272,7 +272,7 @@ class SpyPermission(PermissionModule):
     def __init__(self, log_path: Path, master_socket_path: str) -> None:
         super().__init__(
             ClassifierConfig(),
-            session_name="s1",
+            session_id="s1",
             master_socket_path=master_socket_path,
             log_path=log_path,
             intent="the raw intent",
@@ -527,7 +527,7 @@ async def _harness(
         retrieve=retriever,
         permission=PermissionModule(
             cfg.classifier,
-            session_name=cfg.name,
+            session_id=cfg.name,
             master_socket_path=cfg.master_socket_path,
             log_path=BrokerPaths(home).session_permissions(cfg.name),
             intent=cfg.intent,
@@ -626,6 +626,25 @@ async def ground_and_approve(h: Harness, *, count: int, prompt: str) -> None:
     await wait_state(h.broker, "driving")
 
 
+async def reach_approval(h: Harness) -> None:
+    """Walk the launch sequence to the first proposal, and leave it unanswered."""
+    await _notify(
+        h.sock,
+        hook_env(
+            "SessionStart",
+            {"session_id": "cc-1", "transcript_path": str(h.transcript)},
+        ),
+    )
+    await h.llm.results.put(
+        ToolCall(
+            name="propose_prompt",
+            input={"reasoning": "grounded in cwd", "prompt": "GROUNDED PROMPT"},
+        )
+    )
+    await h.master.wait_for(T_PROMPT_PROPOSAL)
+    await wait_state(h.broker, "awaiting_approval")
+
+
 async def launch(h: Harness) -> None:
     """Walk the launch sequence to the driving state."""
     await _notify(
@@ -717,9 +736,9 @@ async def test_permission_request_bypasses_serial_queue(
     harness: Harness,
 ) -> None:
     await launch(harness)
-    harness.broker.queue.put_nowait(never_finishes)
+    harness.broker.jobs.put_nowait(never_finishes)
     await asyncio.sleep(0.05)
-    assert harness.broker.queue.qsize() == 0  # the stalling job is in flight
+    assert harness.broker.jobs.qsize() == 0  # the stalling job is in flight
     await harness.classifier.script("allow", "a read is reversible")
     start = time.monotonic()
     resp = await client.request(
@@ -789,6 +808,18 @@ async def test_session_end_reports_terminal_and_exits(
         await harness.run_task
 
 
+async def test_session_end_during_approval_reports_and_exits(
+    harness: Harness,
+) -> None:
+    await reach_approval(harness)
+    # The developer ran /exit while the proposal was still unanswered.
+    await _notify(harness.sock, hook_env("SessionEnd", {}))
+    await harness.master.wait_for(T_SESSION_ENDED)
+    async with asyncio.timeout(5.0):
+        await harness.run_task
+    assert harness.run.drive_calls() == []
+
+
 async def test_launch_failure_is_reported_to_the_master(harness: Harness) -> None:
     await _notify(
         harness.sock,
@@ -838,7 +869,12 @@ async def test_ground_and_reactivate_call_set_intent(harness: Harness) -> None:
     await complete(harness)
     assert (await reactivate(harness, "now write the docs")).ok is True
     await ground_and_approve(harness, count=2, prompt="THE SECOND TASK")
-    assert spy.intents == ["APPROVED PROMPT", "THE SECOND TASK"]
+    assert spy.intents == [
+        "the raw intent",
+        "APPROVED PROMPT",
+        "now write the docs",
+        "THE SECOND TASK",
+    ]
 
 
 async def test_permission_prompt_notification_shows_up_on_status(
@@ -1781,7 +1817,6 @@ async def test_resume_skips_grounding(resumed: Harness) -> None:
     assert resumed.llm.calls == []
     assert resumed.run.calls == []
     assert resumed.master.of_type(T_PROMPT_PROPOSAL) == []
-    assert resumed.broker.approved_prompt == RESUMED_PROMPT
     # The permission module judges against the resumed task, not the raw
     # intent the config also carries.
     assert resumed.broker.permission.intent == RESUMED_PROMPT
@@ -1860,6 +1895,33 @@ async def test_reactivate_refused_while_a_task_is_still_running(
     # A refused reactivation must not displace the running task.
     assert harness.run.drive_calls() == []
     assert harness.broker.state == "driving"
+
+
+async def test_permission_request_before_reapproval_is_judged_on_the_new_task(
+    harness: Harness,
+) -> None:
+    await launch(harness)
+    await complete(harness)
+    calls = len(harness.llm.calls)
+    assert (await reactivate(harness, "now write the docs")).ok is True
+    # Grounding is in flight (empty LLM queue): the new prompt is not yet
+    # proposed, let alone approved.
+    async with asyncio.timeout(5.0):
+        while len(harness.llm.calls) == calls:
+            await asyncio.sleep(0.01)
+    await harness.classifier.script("allow", "writing docs is in scope")
+    resp = await client.request(
+        harness.sock,
+        permission_env("Write", {"file_path": "/private/tmp/x/README.md"}),
+        timeout_s=5.0,
+    )
+    assert resp.payload["decision"] == "allow"
+    content = cast(
+        list[dict[str, Any]], harness.classifier.calls[-1]["messages"][0]["content"]
+    )
+    # Judging against the finished task's prompt would let a call through
+    # that the new task never asked for.
+    assert content[0]["text"] == "# Authoritative task intent\nnow write the docs"
 
 
 async def test_live_status_carries_bound_identifiers(harness: Harness) -> None:
@@ -2014,6 +2076,34 @@ async def test_shutdown_cancels_the_status_sender_cleanly(
         await h.run_task
 
 
+async def test_shutdown_during_approval_exits(harness: Harness) -> None:
+    await reach_approval(harness)
+    resp = await client.request(
+        harness.sock,
+        Envelope(id=uuid.uuid4().hex, type=T_SHUTDOWN, session_id="s1"),
+        timeout_s=5.0,
+    )
+    assert resp.ok is True
+    async with asyncio.timeout(5.0):
+        await harness.run_task
+    assert harness.run.drive_calls() == []
+
+
+async def test_send_prompt_refused_after_a_fatal_error(harness: Harness) -> None:
+    await launch(harness)
+    await _notify(
+        harness.sock,
+        hook_env("StopFailure", {"matcher": "rate_limit", "message": "429"}),
+    )
+    await wait_state(harness.broker, "error")
+    harness.run.calls.clear()
+    resp = await send_prompt(harness, "hello")
+    assert resp.ok is False
+    assert resp.payload["reason_code"] == NACK_WRONG_STATE
+    await asyncio.sleep(0.1)
+    assert harness.run.drive_calls() == []
+
+
 async def test_send_prompt_refused_while_a_native_prompt_is_open(
     harness: Harness,
 ) -> None:
@@ -2049,7 +2139,7 @@ async def test_menu_opening_after_accept_leaves_the_prompt_undelivered(
     async def held() -> None:
         await gate.wait()
 
-    harness.broker.queue.put_nowait(held)
+    harness.broker.jobs.put_nowait(held)
     harness.run.calls.clear()
     assert (await send_prompt(harness, "hello")).ok is True
     # A menu opens while the accepted prompt waits its turn on the queue.
@@ -2150,7 +2240,7 @@ async def test_reconcile_never_classifies_while_a_native_prompt_is_open(
     await open_escalated_menu(harness)
     harness.run.calls.clear()
     calls_before = len(harness.llm.calls)
-    harness.broker.queue.put_nowait(
+    harness.broker.jobs.put_nowait(
         harness.broker._reconcile_job  # pyright: ignore[reportPrivateUsage]
     )
     await asyncio.sleep(0.2)
@@ -2159,7 +2249,7 @@ async def test_reconcile_never_classifies_while_a_native_prompt_is_open(
     # Once the menu is answered, the same reconcile does classify.
     append_menu(harness, "toolu_open", answers={"Pick a color": "Red"})
     await harness.llm.results.put(ANSWER_RESULT)
-    harness.broker.queue.put_nowait(
+    harness.broker.jobs.put_nowait(
         harness.broker._reconcile_job  # pyright: ignore[reportPrivateUsage]
     )
     await harness.master.wait_for(T_PANE_RETRACT)

@@ -24,10 +24,10 @@ import sys
 from broker.config import BrokerConfig, ClassifierConfig
 from broker import prompts
 from broker.llm import build_client
-from broker.permission.llm import (
-    FORCED_ONE as PERMISSION_FORCED_ONE,
+from broker.permission.classifier import (
+    PERMISSION_FORCED_ONE,
     PERMISSION_TOOLS,
-    assemble_context as assemble_permission_context,
+    assemble_permission_context,
     build_classifier_client,
     render_suggestions,
 )
@@ -73,7 +73,7 @@ async def probe_triage() -> None:
 async def probe_permission() -> None:
     """Issue one classifier call and report its cache-creation count."""
     cfg = ClassifierConfig()
-    client = build_classifier_client(cfg)
+    client = build_classifier_client()
     system, messages = assemble_permission_context(
         _INTENT,
         "Bash",
