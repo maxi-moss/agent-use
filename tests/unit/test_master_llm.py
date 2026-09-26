@@ -37,7 +37,8 @@ from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry, SessionRecord
 from broker.paths import BrokerPaths
 from broker.protocol.constants import SessionState
-from broker.master.runtime import MasterRuntime, PendingProposal
+from broker.master.fleet_board import PendingProposal
+from broker.master.runtime import MasterRuntime
 from broker.protocol.schemas import (
     EscalationPayload,
     PermissionEscalationPayload,
@@ -325,7 +326,7 @@ async def test_llm_context_carries_only_the_surfaced_head(
 async def test_pending_proposal_reaches_llm_context(
     runtime: RecordingRuntime,
 ) -> None:
-    runtime.proposals["p1"] = PendingProposal("s1", PROPOSAL)
+    runtime.board.proposals["p1"] = PendingProposal("s1", PROPOSAL)
     fake = FakeLLM([TurnResult(text="ok")])
     master = make_master(runtime, fake)
     await master.handle_developer_message("approve it")

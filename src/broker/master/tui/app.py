@@ -182,7 +182,7 @@ class BrokerMasterApp(App[None]):
 
     async def _master_turn(self, text: str) -> None:
         reply = await self.master_llm.handle_developer_message(
-            text, on_activity=self.runtime.note_master_activity
+            text, on_activity=self.runtime.board.note_master_activity
         )
         self.post_message(LLMReply(reply))
 
@@ -202,7 +202,7 @@ class BrokerMasterApp(App[None]):
             self.query_one("#box", PromptArea).disabled = False
             self._remove_thinking()
             if worker.group == "llm":
-                self.runtime.clear_master_activity()
+                self.runtime.board.clear_master_activity()
         if event.state is WorkerState.ERROR:
             # Fail loud; the app (and its socket server) survives.
             self._chat_block(f"[master error] {worker.error!r}")

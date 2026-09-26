@@ -9,12 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
-from broker.protocol.constants import PaneKind, SessionState
-
-# Lifecycle states a session has settled into: the ones with an outcome to view.
-_SETTLED_STATES = frozenset(
-    {SessionState.COMPLETED, SessionState.ERROR, SessionState.STOPPED}
-)
+from broker.protocol.constants import SETTLED_STATES, PaneKind, SessionState
 
 
 class Attention(StrEnum):
@@ -45,7 +40,7 @@ class SessionRow:
     @property
     def is_settled(self) -> bool:
         """True when the session has reached a state with an outcome to view."""
-        return self.state in _SETTLED_STATES
+        return self.state in SETTLED_STATES
 
 
 @dataclass(frozen=True, slots=True)

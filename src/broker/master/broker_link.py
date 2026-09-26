@@ -4,7 +4,9 @@ every socket call it makes to them.
 
 import asyncio
 import contextlib
+import logging
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from broker.claude.settings import write_session_permissions
@@ -25,6 +27,8 @@ REQUEST_TIMEOUT_S = 10.0
 STOP_WAIT_S = 10.0
 SOCKET_POLL_S = 0.1
 SOCKET_PROBE_TIMEOUT_S = 2.0
+
+logger = logging.getLogger(__name__)
 
 
 async def broker_is_listening(path: Path) -> bool:
@@ -94,6 +98,7 @@ class BrokerLink:
         cfg: BrokerConfig,
         master_socket_path: Path,
         claude_json: Path,
+        on_exit: Callable[[str, int], None],
     ) -> None:
         """Hold what a spawned broker is configured from.
 
@@ -102,12 +107,17 @@ class BrokerLink:
             cfg: Broker configuration.
             master_socket_path: Socket every spawned broker reports to.
             claude_json: Claude Code's ``~/.claude.json`` state file.
+            on_exit: Called with the session name and exit code when a tracked
+                broker exits without a ``stop`` having asked it to.
         """
         self.paths = paths
         self.cfg = cfg
         self.master_socket_path = master_socket_path
         self._claude_json = claude_json
+        self._on_exit = on_exit
         self._procs: dict[str, asyncio.subprocess.Process] = {}
+        self._stopping: set[asyncio.subprocess.Process] = set()
+        self._watchers: set[asyncio.Task[None]] = set()
 
     async def spawn(
         self,
@@ -158,19 +168,42 @@ class BrokerLink:
             adopt=adopt,
             resume=resume,
         )
+        stderr_path = self.paths.session_stderr(record.name)
+        stderr_path.parent.mkdir(parents=True, exist_ok=True)
         # By module string, never by import — keeps the module boundary
         # structural. -I isolates the subprocess from the master's cwd and
         # PYTHONPATH.
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-I",
-            "-m",
-            "broker.session",
-            "--config-json",
-            config.model_dump_json(),
-        )
+        with stderr_path.open("ab") as stderr_file:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-I",
+                "-m",
+                "broker.session",
+                "--config-json",
+                config.model_dump_json(),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=stderr_file,
+                stderr=asyncio.subprocess.STDOUT,
+            )
         self._procs[record.name] = proc
+        watcher = asyncio.create_task(self._watch(record.name, proc))
+        self._watchers.add(watcher)
+        watcher.add_done_callback(self._watchers.discard)
         return proc.pid
+
+    async def _watch(self, name: str, proc: asyncio.subprocess.Process) -> None:
+        """Report a tracked broker's exit unless a stop asked for it."""
+        returncode = await proc.wait()
+        if proc in self._stopping:
+            self._stopping.discard(proc)
+            return
+        if self._procs.get(name) is not proc:
+            return
+        del self._procs[name]
+        try:
+            self._on_exit(name, returncode)
+        except Exception:
+            logger.exception("session %s: broker exit handler failed", name)
 
     async def stop(self, record: SessionRecord) -> None:
         """Ask a session's broker to shut down and wait for the process to exit.
@@ -184,9 +217,11 @@ class BrokerLink:
             RuntimeError: The spawned process was still running
                 ``STOP_WAIT_S`` after it was terminated.
         """
+        proc = self._procs.get(record.name)
+        if proc is not None:
+            self._stopping.add(proc)
         with contextlib.suppress(ConnectionError, TimeoutError, OSError):
             await self.request(record, ShutdownPayload(), timeout_s=REQUEST_TIMEOUT_S)
-        proc = self._procs.get(record.name)
         if proc is None:
             return
         try:
@@ -208,6 +243,15 @@ class BrokerLink:
     def forget(self, name: str) -> None:
         """Stop tracking a session's broker process without waiting on it."""
         self._procs.pop(name, None)
+
+    async def aclose(self) -> None:
+        """Stop watching every tracked broker; the processes keep running."""
+        watchers = set(self._watchers)
+        if not watchers:
+            return
+        for watcher in watchers:
+            watcher.cancel()
+        await asyncio.wait(watchers)
 
     async def require_socket_free(self, record: SessionRecord) -> None:
         """Block until nothing answers on a session's socket.

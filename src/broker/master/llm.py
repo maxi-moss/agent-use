@@ -416,7 +416,7 @@ class MasterLLM:
                     ),
                 }
             )
-        for pending in self.runtime.pending_proposals():
+        for pending in self.runtime.board.pending_proposals():
             blocks.append(
                 {
                     "type": "text",

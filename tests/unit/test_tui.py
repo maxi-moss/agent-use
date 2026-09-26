@@ -32,7 +32,11 @@ from broker.master.registry import Registry, SessionRecord
 from broker.master.runtime import MasterRuntime
 from broker.master.testmode import InjectCommand
 from broker.master.tui.app import BrokerMasterApp
-from broker.master.tui.fleet import FleetSidebar, SessionRowWidget
+from broker.master.tui.fleet import (
+    _STATE_STYLE,  # pyright: ignore[reportPrivateUsage]
+    FleetSidebar,
+    SessionRowWidget,
+)
 from broker.master.tui.notice import AttentionNotice
 from broker.master.tui.outcome_modal import OutcomeModal
 from broker.master.tui.prompt_area import PromptArea
@@ -447,6 +451,11 @@ async def test_llm_worker_error_reenables_input_and_surfaces(
         box = app.query_one("#box", PromptArea)
         assert box.disabled is False  # app survived, input usable (fail loud)
         assert any("master error" in t for t in chat_texts(app))
+
+
+def test_state_style_covers_every_session_state() -> None:
+    """A state missing from the map would render with a KeyError, not a row."""
+    assert set(_STATE_STYLE) == set(SessionState)
 
 
 async def test_fleet_sidebar_renders_badges_and_waiting_count(home: Path) -> None:

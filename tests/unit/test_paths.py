@@ -49,6 +49,7 @@ def test_session_paths_follow_the_configured_home_not_the_env(
         paths.session_permissions(cfg.name),
         paths.session_claude_settings(cfg.name),
         paths.session_hook_log(cfg.name),
+        paths.session_stderr(cfg.name),
     ):
         assert path.is_relative_to(configured)
         assert not path.is_relative_to(tmp_path / "env")

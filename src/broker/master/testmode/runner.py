@@ -51,7 +51,7 @@ from broker.master.testmode.schemas import (
     StopSocketStep,
 )
 from broker.paths import BrokerPaths
-from broker.protocol.constants import T_DISPATCH_DECISION
+from broker.protocol.constants import SessionState, T_DISPATCH_DECISION
 from broker.protocol.schemas import (
     Alternative,
     EscalationDisclosure,
@@ -225,6 +225,16 @@ def _check_expect(
     return StepResult(index=index, op=op, passed=passed, detail=detail)
 
 
+def _push_refused(index: int, op: str, resp: Response) -> StepResult:
+    """Fail a step whose preceding status push the master NACKed."""
+    return StepResult(
+        index=index,
+        op=op,
+        passed=False,
+        detail=f"status push NACKed: {resp.payload}",
+    )
+
+
 class _Context:
     """Mutable state threaded through a scenario's steps."""
 
@@ -357,6 +367,9 @@ async def _run_escalate(
 ) -> StepResult:
     """Raise a developer escalation and check the expected reply."""
     broker = ctx.broker(index, step.session, timeout_s)
+    pushed = await broker.push_status(SessionState.ESCALATED)
+    if not pushed.ok:
+        return _push_refused(index, step.op, pushed)
     resp = await broker.escalate(_escalation_payload(step))
     return _check_expect(index, step.op, step.expect, resp)
 
@@ -384,6 +397,9 @@ async def _run_escalation_retract(
 ) -> StepResult:
     """Retract a developer escalation."""
     broker = ctx.broker(index, step.session, timeout_s)
+    pushed = await broker.push_status(SessionState.DRIVING)
+    if not pushed.ok:
+        return _push_refused(index, step.op, pushed)
     resp = await broker.escalation_retract(step.escalation_id, step.reason)
     passed = resp.ok
     detail = "retracted" if passed else f"retract NACKed: {resp.payload}"

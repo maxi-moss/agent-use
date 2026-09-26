@@ -116,6 +116,31 @@ class SessionState(StrEnum):
 # A session live enough to accept a decision or a prompt.
 ACTIVE_STATES = frozenset({SessionState.DRIVING})
 
+# States the broker is the sole writer of.
+BROKER_OWNED_STATES = frozenset(
+    {
+        SessionState.GROUNDING,
+        SessionState.AWAITING_APPROVAL,
+        SessionState.DRIVING,
+        SessionState.ESCALATED,
+        SessionState.COMPLETED,
+        SessionState.ERROR,
+    }
+)
+
+# States the master is the sole writer of.
+MASTER_OWNED_STATES = frozenset(
+    {SessionState.SPAWNING, SessionState.STOPPED, SessionState.UNMANAGED}
+)
+
+# Lifecycle states a session has settled into: the ones with an outcome to view.
+SETTLED_STATES = frozenset(
+    {SessionState.COMPLETED, SessionState.ERROR, SessionState.STOPPED}
+)
+
+# States a late broker push must not overwrite: the session has moved on.
+ABSORBING_STATES = frozenset({SessionState.STOPPED, SessionState.UNMANAGED})
+
 # The hook's own deadline must always expire first, so it exits 0 on its own
 # terms and degrades the session predictably. If Claude Code's settings.json
 # timeout fired first it would kill the process mid-wait instead.
