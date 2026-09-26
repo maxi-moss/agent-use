@@ -152,12 +152,16 @@ class FakeProcess:
 class RecordingSpawn:
     """Stand-in for asyncio.create_subprocess_exec that records each argv."""
 
-    def __init__(self) -> None:
+    def __init__(self, proc_type: type[FakeProcess] = FakeProcess) -> None:
+        self.proc_type = proc_type
         self.argvs: list[tuple[str, ...]] = []
+        self.procs: list[FakeProcess] = []
 
     async def __call__(self, *argv: str) -> FakeProcess:
         self.argvs.append(argv)
-        return FakeProcess(4242 + len(self.argvs))
+        proc = self.proc_type(4242 + len(self.argvs))
+        self.procs.append(proc)
+        return proc
 
     def config(self) -> dict[str, Any]:
         """Decode --config-json from the most recent spawn."""
@@ -1377,6 +1381,32 @@ async def test_second_dispatch_refused_while_inflight(
         await server.wait_closed()
 
 
+async def test_delivery_reply_before_dispatch_ack_leaves_no_inflight_marker(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, _ = rt
+
+    async def deliver_then_ack(env: Envelope) -> Response:
+        reply = await send(runtime, T_DECISION_DELIVERED, {"escalation_id": "e1"})
+        assert reply.ok
+        return Response(id=env.id, ok=True)
+
+    server = await serve_unix(home / "s" / "s1.sock", deliver_then_ack)
+    try:
+        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
+        first = await runtime.dispatch("e1", "go")
+        assert first.startswith("decision dispatched"), first
+        assert runtime.queue.active is None
+        # A marker set after the ACK would name the resolved e1 and refuse
+        # every later dispatch as already being delivered.
+        assert (await send(runtime, T_ESCALATION, escalation_dict("e2"))).ok
+        second = await runtime.dispatch("e2", "go")
+        assert second.startswith("decision dispatched"), second
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
 async def test_fatal_error_retracts_a_live_escalation(
     rt: tuple[MasterRuntime, list[Any]], home: Path
 ) -> None:
@@ -1897,7 +1927,9 @@ async def test_reassign_spawns_a_broker_that_adopts_the_live_session(
     assert reloaded.approved_prompt is None  # superseded until re-approved
     assert reloaded.budget_count == 0
     assert reloaded.state == "spawning"
-    assert reloaded.pid is not None  # the new broker, not the dead one
+    # The new broker, not the dead one, is the process a stop now waits on.
+    await runtime.stop_session("s1")
+    assert spawn.procs[-1].returncode is not None
 
 
 async def test_reassign_does_not_resurrect_a_session_ended_during_its_stop_wait(
@@ -1989,7 +2021,7 @@ async def test_reassign_refuses_while_a_broker_still_answers(
     spawn: RecordingSpawn,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("broker.master.runtime.STOP_WAIT_S", 0.3)
+    monkeypatch.setattr("broker.master.broker_link.STOP_WAIT_S", 0.3)
     runtime, _ = rt
     _bind_session(runtime)
     stub = StubSession()
@@ -2004,6 +2036,39 @@ async def test_reassign_refuses_while_a_broker_still_answers(
     finally:
         server.close()
         await server.wait_closed()
+
+
+class UnkillableProcess(FakeProcess):
+    """Broker process that never exits, not even when terminated."""
+
+    def __init__(self, pid: int) -> None:
+        super().__init__(pid)
+        self.terminated = False
+
+    async def wait(self) -> int:
+        await asyncio.Event().wait()
+        return 0
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+
+async def test_stop_fails_loud_when_the_broker_outlives_terminate(
+    rt: tuple[MasterRuntime, list[Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("broker.master.broker_link.STOP_WAIT_S", 0.05)
+    spawn = RecordingSpawn(UnkillableProcess)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    runtime, _ = rt
+    _bind_session(runtime)
+    await runtime.attach_session("s1")
+    with pytest.raises(RuntimeError) as exc:
+        await runtime.stop_session("s1")
+    assert "still running" in str(exc.value)
+    assert cast(UnkillableProcess, spawn.procs[-1]).terminated
+    # A broker still driving the pane is not reported stopped.
+    assert runtime.registry.get("s1").state != SessionState.STOPPED
 
 
 async def test_attach_spawns_a_resuming_broker(
@@ -2036,7 +2101,8 @@ async def test_attach_spawns_a_resuming_broker(
     assert reloaded.approved_prompt == "the first task"
     assert reloaded.budget_count == 6
     assert reloaded.state == "spawning"
-    assert reloaded.pid is not None
+    await runtime.stop_session("s1")
+    assert spawn.procs[-1].returncode is not None
 
 
 async def test_attach_refuses_while_a_broker_still_answers(

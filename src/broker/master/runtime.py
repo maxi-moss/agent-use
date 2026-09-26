@@ -10,7 +10,6 @@ answers.
 import asyncio
 import contextlib
 import logging
-import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,19 +18,15 @@ from typing import Any
 from pydantic import ValidationError
 
 from broker import decision_log
-from broker.claude.settings import write_session_permissions
-from broker.claude.trust import seed_trust
-from broker.config import (
-    AdoptedSession,
-    BrokerConfig,
-    ResumedTask,
-    SessionBrokerConfig,
-    SessionModelConfig,
-)
-from broker.herdr import driver
+from broker.config import BrokerConfig, ResumedTask
 from broker.paths import BrokerPaths
 from broker.master import notifier
-from broker.master.broker_link import adoption_fields, broker_is_listening
+from broker.master.broker_link import (
+    REQUEST_TIMEOUT_S,
+    BrokerLink,
+    adoption_fields,
+    broker_is_listening,
+)
 from broker.master.outcome import SessionOutcome, build_outcome
 from broker.master.viewmodel import (
     Attention,
@@ -58,7 +53,6 @@ from broker.master.payload_render import (
 )
 from broker.master.queue import EscalationProtocolViolation, EscalationQueue
 from broker.master.registry import Registry, SessionRecord
-from broker.protocol import client
 from broker.protocol.constants import (
     NackCode,
     PaneKind,
@@ -107,10 +101,8 @@ from broker.protocol.schemas import (
     Response,
     SendPromptPayload,
     SessionEndedPayload,
-    ShutdownPayload,
     StatusPayload,
     StatusRequestPayload,
-    WireMessage,
     nack_response,
     parse_nack,
 )
@@ -118,13 +110,9 @@ from broker.protocol.server import serve_unix
 
 logger = logging.getLogger(__name__)
 
-REQUEST_TIMEOUT_S = 10.0
 # The broker runs an LLM call before it can reply, so this is far longer than
 # REQUEST_TIMEOUT_S and must exceed the broker's own CLARIFY_TIMEOUT_S.
 CLARIFY_ESCALATION_TIMEOUT_S = 60.0
-STOP_WAIT_S = 10.0
-SOCKET_POLL_S = 0.1
-AGENT_PROBE_TIMEOUT_S = 5.0
 
 _Handler = Callable[[str, Any], Awaitable[NackPayload | None]]
 
@@ -145,116 +133,6 @@ _ABSORBING = frozenset(
         SessionState.UNMANAGED,
     }
 )
-
-
-def _drop_from_fleet(
-    registry: Registry,
-    queue: EscalationQueue,
-    panes: PaneEscalations,
-    name: str,
-) -> list[str]:
-    """Remove a session no broker can drive again, retracting its escalations.
-
-    Args:
-        registry: Session registry; the removal persists on its own.
-        queue: Persisted escalation queue.
-        panes: Persisted pane escalations.
-        name: Session to drop.
-
-    Returns:
-        One line per retracted escalation.
-    """
-    lines: list[str] = []
-    queued = queue.retract_for_session(name)
-    if queued is not None:
-        lines.append(
-            f"session {name}: queued escalation {queued.escalation_id} "
-            "retracted — no decision can reach it"
-        )
-    for prompt in panes.retract_for_session(name):
-        lines.append(
-            f"session {name}: {prompt.kind} escalation "
-            f"{prompt.escalation_id} retracted — no broker will see it closed"
-        )
-    registry.remove(name)
-    return lines
-
-
-async def reconcile_registry(
-    registry: Registry,
-    queue: EscalationQueue,
-    panes: PaneEscalations,
-) -> list[str]:
-    """Classify every registry session at startup, dropping finished ones.
-
-    Probes are client-side connects and herdr reads only — nothing is spawned
-    and nothing binds a socket. A session with no answering broker is dropped
-    once its Claude Code no longer runs, or when the registry lacks what a
-    replacement broker needs to adopt it. An inconclusive probe never drops a
-    session — a wrong ``unmanaged`` costs the developer a glance, a wrong
-    removal throws away queued decisions.
-
-    Args:
-        registry: Loaded session registry; a dropped session is removed, every
-            other classification updates its state in place and is saved once.
-        queue: Persisted escalation queue; a dropped session's queued
-            escalation is retracted from it before the TUI re-announces
-            the head.
-        panes: Persisted pane escalations; a dropped session's open ones are
-            retracted before the TUI re-announces what remains.
-
-    Returns:
-        One classification line per session, plus one line per retraction.
-    """
-    warnings: list[str] = []
-    for name in registry.names_in_order():
-        record = registry.records[name]
-        if await broker_is_listening(Path(record.socket_path)):
-            warnings.append(
-                f"session {name}: broker still answering — left as-is"
-            )
-            continue
-        try:
-            running = await asyncio.to_thread(
-                driver.agent_running, name, timeout_s=AGENT_PROBE_TIMEOUT_S
-            )
-        except Exception as exc:
-            record.state = SessionState.UNMANAGED
-            warnings.append(
-                f"session {name}: agent probe inconclusive ({exc!r}) — "
-                "marked unmanaged"
-            )
-            continue
-        if not running:
-            warnings.append(
-                f"session {name}: Claude Code no longer runs — it exited or "
-                "its pane closed; removed"
-            )
-            warnings.extend(_drop_from_fleet(registry, queue, panes, name))
-            continue
-        try:
-            adoption_fields(record)
-        except ValueError as exc:
-            warnings.append(
-                f"session {name}: Claude Code still runs but no broker can "
-                f"take it over ({exc}) — removed; its pane is left untouched"
-            )
-            warnings.extend(_drop_from_fleet(registry, queue, panes, name))
-            continue
-        record.state = SessionState.UNMANAGED
-        line = (
-            f"session {name}: Claude Code alive with nothing driving it — "
-            "marked unmanaged; recover it with attach_session"
-        )
-        if record.approved_prompt is None:
-            line += (
-                " (no approved prompt persisted — reassign_session with a "
-                "new task is the route instead)"
-            )
-        warnings.append(line)
-    if registry.records:
-        registry.save()
-    return warnings
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,18 +171,14 @@ class MasterRuntime:
         self.registry = registry
         self.cfg = cfg
         self.anchor_pane = anchor_pane
-        self._claude_json = claude_json
         self.queue = queue
         self.panes = panes
-        self._surfaced_id: str | None = None
-        # Escalation whose decision has been dispatched but not yet confirmed
-        # delivered to the pane. Memory-only: an unconfirmed dispatch simply
-        # re-surfaces on restart, and the developer re-decides.
-        self._inflight: str | None = None
         self.paths = BrokerPaths(cfg.broker_home)
         self.master_socket_path = self.paths.master_socket
+        self.link = BrokerLink(
+            self.paths, cfg, self.master_socket_path, claude_json
+        )
         self.proposals: dict[str, PendingProposal] = {}
-        self._procs: dict[str, asyncio.subprocess.Process] = {}
         # Dashboard-only, never persisted: pushed live status per session and
         # the master's own current activity.
         self._activity: dict[str, str] = {}
@@ -560,16 +434,14 @@ class MasterRuntime:
         Returns:
             ``None``; a retract is never refused.
         """
-        self._clear_inflight(p.escalation_id)
         cleared = self.queue.retract(p.escalation_id)
         if cleared is not None:
             # Raising it set ESCALATED here; withdrawing it must undo that
             # or the registry outlives the escalation it describes.
             self._set_state(session_id, SessionState.DRIVING)
-        if cleared is not None and cleared.escalation_id == self._surfaced_id:
+        if cleared is not None and cleared.was_surfaced:
             # It was surfaced, so the developer must learn it is no longer
             # live; a waiting entry they never saw retracts silently.
-            self._surfaced_id = None
             self.emit(
                 Notice(
                     f"escalation {p.escalation_id} from session {session_id} "
@@ -695,10 +567,9 @@ class MasterRuntime:
 
     async def _surface_head(self) -> None:
         """Render, announce and notify the queue's head, exactly once."""
-        head = self.queue.active
-        if head is None or head.escalation_id == self._surfaced_id:
+        head = self.queue.take_unsurfaced_head()
+        if head is None:
             return
-        self._surfaced_id = head.escalation_id
         self.emit(
             EscalationArrived(
                 head.session_id,
@@ -764,15 +635,11 @@ class MasterRuntime:
             anchor_pane=self.anchor_pane,
             intent=intent,
         )
-        # BEFORE spawn — the dialog eats input.
-        seed_trust(cwd_path, self._claude_json)
-        proc = await self._spawn_broker(record, adopt=None)
-        record.pid = proc.pid
-        self._procs[name] = proc
+        pid = await self.link.spawn(record, adopt=None, resume=None)
         self.registry.upsert(record)
         self.emit(SessionStateChanged(name, record.state))
         self._publish_fleet()
-        return f"spawned session {name} (pid {proc.pid}) in {cwd_path}"
+        return f"spawned session {name} (pid {pid}) in {cwd_path}"
 
     async def reassign_session(self, session_id: str, intent: str) -> str:
         """Hand a live session to a freshly spawned broker with a new task.
@@ -801,21 +668,17 @@ class MasterRuntime:
         adopt = adoption_fields(record)
         await self.stop_session(session_id)
         record = self.registry.get(session_id)  # KeyError if ended meanwhile
-        await self._require_socket_free(record)
+        await self.link.require_socket_free(record)
         record = self.registry.get(session_id)  # KeyError if ended meanwhile
         record.intent = intent
         record.approved_prompt = None  # superseded; set again on approval
         record.title = ""
         record.budget_count = 0
-        proc = await self._spawn_broker(record, adopt=adopt)
+        pid = await self.link.spawn(record, adopt=adopt, resume=None)
         record = self.registry.get(session_id)  # KeyError if ended meanwhile
-        record.pid = proc.pid
-        self._procs[session_id] = proc
         self.registry.upsert(record)
         self._set_state(session_id, SessionState.SPAWNING)
-        return (
-            f"session {session_id} reassigned to a new broker (pid {proc.pid})"
-        )
+        return f"session {session_id} reassigned to a new broker (pid {pid})"
 
     async def attach_session(self, session_id: str) -> str:
         """Bind a fresh broker to a session whose own broker is gone.
@@ -870,15 +733,11 @@ class MasterRuntime:
             approved_prompt=record.approved_prompt,
             completed=record.state == SessionState.COMPLETED,
         )
-        proc = await self._spawn_broker(record, adopt=adopt, resume=resume)
+        pid = await self.link.spawn(record, adopt=adopt, resume=resume)
         self.registry.get(session_id)  # KeyError if ended meanwhile
-        record.pid = proc.pid
-        self._procs[session_id] = proc
         self.registry.upsert(record)
         self._set_state(session_id, SessionState.SPAWNING)
-        return (
-            f"session {session_id} reattached to a new broker (pid {proc.pid})"
-        )
+        return f"session {session_id} reattached to a new broker (pid {pid})"
 
     async def reactivate_session(self, session_id: str, intent: str) -> str:
         """Give a completed session a new task without replacing its broker.
@@ -892,8 +751,8 @@ class MasterRuntime:
             completed and so has a task it is still driving.
         """
         record = self.registry.get(session_id)
-        rejected = await self._deliver(
-            record.socket_path,
+        rejected = await self.link.deliver(
+            record,
             ReactivatePayload(intent=intent),
             rejection=f"session {session_id} refused reactivation",
         )
@@ -928,8 +787,8 @@ class MasterRuntime:
             return msg
         name = pending.session_id
         record = self.registry.get(name)
-        rejected = await self._deliver(
-            record.socket_path,
+        rejected = await self.link.deliver(
+            record,
             ApprovePromptPayload(proposal_id=proposal_id, prompt=prompt),
             rejection=(
                 f"session {name} rejected approval for proposal "
@@ -976,32 +835,40 @@ class MasterRuntime:
             )
             self.emit(Notice(msg))
             return msg
-        if self._inflight is not None:
+        inflight = self.queue.inflight
+        if inflight is not None:
             # A decision is already on its way to the pane; a second would
             # double-submit the same escalation.
             msg = (
                 f"decision NOT dispatched — a decision for escalation "
-                f"{self._inflight} is already being delivered"
+                f"{inflight} is already being delivered"
             )
             self.emit(Notice(msg))
             return msg
         record = self.registry.get(active.session_id)
-        rejected = await self._deliver(
-            record.socket_path,
-            DispatchDecisionPayload(escalation_id=escalation_id, response=decision),
-            rejection=(
-                f"session {record.name} rejected the dispatched decision "
-                f"for escalation {escalation_id} (stale)"
-            ),
-        )
+        # The ACK only confirms the broker accepted the decision; resolution
+        # waits for T_DECISION_DELIVERED, and until then no second decision
+        # may be dispatched. The marker is set before the send because that
+        # reply can be handled before the ACK returns.
+        self.queue.mark_inflight(escalation_id)
+        try:
+            rejected = await self.link.deliver(
+                record,
+                DispatchDecisionPayload(
+                    escalation_id=escalation_id, response=decision
+                ),
+                rejection=(
+                    f"session {record.name} rejected the dispatched decision "
+                    f"for escalation {escalation_id} (stale)"
+                ),
+            )
+        except BaseException:
+            self.queue.clear_inflight(escalation_id)
+            raise
         if rejected is not None:
+            self.queue.clear_inflight(escalation_id)
             self.emit(Notice(rejected))
             return rejected
-        # The ACK only confirms the broker accepted the decision for
-        # processing. Resolution waits for T_DECISION_DELIVERED confirming it
-        # reached the pane; until then the escalation stays surfaced and no
-        # second decision may be dispatched for it.
-        self._inflight = escalation_id
         self._publish_fleet()
         return f"decision dispatched to session {record.name}"
 
@@ -1032,11 +899,6 @@ class MasterRuntime:
         self.emit(Notice(msg))
         return msg
 
-    def _clear_inflight(self, escalation_id: str) -> None:
-        """Drop the in-flight dispatch marker if it names ``escalation_id``."""
-        if self._inflight == escalation_id:
-            self._inflight = None
-
     async def _on_decision_delivered(
         self, session_id: str, p: DecisionDeliveredPayload
     ) -> NackPayload | None:
@@ -1049,11 +911,9 @@ class MasterRuntime:
         Returns:
             ``None``; a delivery report is never refused.
         """
-        self._clear_inflight(p.escalation_id)
         if self.queue.resolve(p.escalation_id) is not None:
             # It was the live head: surface whatever is next. DRIVING is the
             # broker's transition to report; the master never invents it.
-            self._surfaced_id = None
             self._publish_fleet()
             await self._surface_head()
         return None
@@ -1076,8 +936,8 @@ class MasterRuntime:
         Returns:
             ``None``; a miss report is never refused.
         """
-        self._clear_inflight(p.escalation_id)
         if p.still_live:
+            self.queue.clear_inflight(p.escalation_id)
             self.emit(
                 Notice(
                     f"decision for escalation {p.escalation_id} did NOT reach "
@@ -1086,8 +946,7 @@ class MasterRuntime:
             )
             return None
         cleared = self.queue.retract(p.escalation_id)
-        if cleared is not None and cleared.escalation_id == self._surfaced_id:
-            self._surfaced_id = None
+        if cleared is not None and cleared.was_surfaced:
             self.emit(
                 Notice(
                     f"escalation {p.escalation_id} from session {session_id} "
@@ -1122,12 +981,11 @@ class MasterRuntime:
             self.emit(Notice(msg))
             return msg
         record = self.registry.get(active.session_id)
-        resp = await client.send(
-            Path(record.socket_path),
+        resp = await self.link.request(
+            record,
             ClarifyEscalationRequestPayload(
                 escalation_id=escalation_id, question=question
             ),
-            session_id=None,
             timeout_s=CLARIFY_ESCALATION_TIMEOUT_S,
         )
         if not resp.ok:
@@ -1158,8 +1016,8 @@ class MasterRuntime:
             rejection carrying the session's reason if it NACKed.
         """
         record = self.registry.get(session_id)
-        rejected = await self._deliver(
-            record.socket_path,
+        rejected = await self.link.deliver(
+            record,
             SendPromptPayload(text=text),
             rejection=f"session {session_id} rejected the prompt",
         )
@@ -1177,11 +1035,9 @@ class MasterRuntime:
         Returns:
             The status as reported by the session broker.
         """
-        socket_path = Path(self.registry.get(session_id).socket_path)
-        resp = await client.send(
-            socket_path,
+        resp = await self.link.request(
+            self.registry.get(session_id),
             StatusRequestPayload(),
-            session_id=None,
             timeout_s=REQUEST_TIMEOUT_S,
         )
         status = StatusPayload.model_validate(resp.payload)
@@ -1225,11 +1081,8 @@ class MasterRuntime:
             ValidationError: The session's reply was not a decision log.
         """
         record = self.registry.get(session_id)
-        resp = await client.send(
-            Path(record.socket_path),
-            DecisionLogRequestPayload(),
-            session_id=None,
-            timeout_s=REQUEST_TIMEOUT_S,
+        resp = await self.link.request(
+            record, DecisionLogRequestPayload(), timeout_s=REQUEST_TIMEOUT_S
         )
         return DecisionLogPayload.model_validate(resp.payload).text
 
@@ -1246,11 +1099,8 @@ class MasterRuntime:
             ValidationError: The session's reply was not a permission log.
         """
         record = self.registry.get(session_id)
-        resp = await client.send(
-            Path(record.socket_path),
-            PermissionLogRequestPayload(),
-            session_id=None,
-            timeout_s=REQUEST_TIMEOUT_S,
+        resp = await self.link.request(
+            record, PermissionLogRequestPayload(), timeout_s=REQUEST_TIMEOUT_S
         )
         return PermissionLogPayload.model_validate(resp.payload).text
 
@@ -1262,31 +1112,17 @@ class MasterRuntime:
 
         Returns:
             A confirmation line naming the session.
+
+        Raises:
+            RuntimeError: The broker process outlived its terminate.
         """
-        record = self.registry.get(session_id)
-        with contextlib.suppress(ConnectionError, TimeoutError, OSError):
-            await client.send(
-                Path(record.socket_path),
-                ShutdownPayload(),
-                session_id=None,
-                timeout_s=REQUEST_TIMEOUT_S,
-            )
-        proc = self._procs.pop(session_id, None)
-        if proc is not None and proc.returncode is None:
-            try:
-                async with asyncio.timeout(STOP_WAIT_S):
-                    await proc.wait()
-            except TimeoutError:
-                proc.terminate()
-                await proc.wait()
+        await self.link.stop(self.registry.get(session_id))
         self._retract_stranded_pane_escalations(session_id)
         # A hard stop mid-delivery leaves no delivered/undelivered reply to
-        # clear the in-flight marker. Drop it for this session's own head (the
-        # broker escalation is intentionally kept) so a re-dispatch is not
-        # refused as still being delivered.
-        active = self.queue.active
-        if active is not None and active.session_id == session_id:
-            self._clear_inflight(active.escalation_id)
+        # clear the in-flight marker. Drop it for this session's own entry
+        # (the escalation itself is intentionally kept) so a re-dispatch is
+        # not refused as still being delivered.
+        self.queue.clear_inflight_for_session(session_id)
         self._set_state(session_id, SessionState.STOPPED)
         return f"session {session_id} stopped"
 
@@ -1359,88 +1195,6 @@ class MasterRuntime:
 
     # ── internals ────────────────────────────────────────────────────────────
 
-    async def _spawn_broker(
-        self,
-        record: SessionRecord,
-        *,
-        adopt: AdoptedSession | None,
-        resume: ResumedTask | None = None,
-    ) -> asyncio.subprocess.Process:
-        """Start a session-broker subprocess for ``record``.
-
-        Args:
-            record: Supplies the identity, socket, cwd, intent and budget the
-                broker starts from.
-            adopt: Pane, Claude session and transcript of a running session the
-                broker takes over; ``None`` starts a fresh one.
-            resume: Approved prompt and completed-ness the broker resumes
-                instead of grounding; ``None`` grounds a new task.
-
-        Returns:
-            The spawned process.
-        """
-        settings_path = self.paths.session_claude_settings(record.name)
-        # The rules have to be on disk before the session reads them: the
-        # master is the only writer of anything outside the repo.
-        write_session_permissions(
-            settings_path, self.cfg.permission_rules.model_dump()
-        )
-        config = SessionBrokerConfig(
-            name=record.name,
-            socket_path=record.socket_path,
-            master_socket_path=str(self.master_socket_path),
-            broker_home=self.paths.home,
-            cwd=record.cwd,
-            anchor_pane=record.anchor_pane,
-            intent=record.intent,
-            budget_count=record.budget_count,
-            session_model=SessionModelConfig(
-                model_id=self.cfg.model_id, max_tokens=self.cfg.max_tokens
-            ),
-            classifier=self.cfg.classifier,
-            embedding=self.cfg.embedding,
-            watchdog_seconds=self.cfg.watchdog_seconds,
-            budget_max=self.cfg.budget_max,
-            claude_settings_path=str(settings_path),
-            adopt=adopt,
-            resume=resume,
-        )
-        # By module string, never by import — keeps the module boundary
-        # structural. -I isolates the subprocess from the master's cwd and
-        # PYTHONPATH.
-        return await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-I",
-            "-m",
-            "broker.session",
-            "--config-json",
-            config.model_dump_json(),
-        )
-
-    async def _require_socket_free(self, record: SessionRecord) -> None:
-        """Block until nothing answers on a session's socket.
-
-        The replacement broker binds the same path, and a unix socket rebind
-        over a live listener succeeds silently — two brokers would then split
-        the pane's hook traffic between them.
-
-        Args:
-            record: Registry record of the session being reassigned.
-
-        Raises:
-            RuntimeError: A broker was still accepting connections after
-                ``STOP_WAIT_S``.
-        """
-        path = Path(record.socket_path)
-        deadline = asyncio.get_running_loop().time() + STOP_WAIT_S
-        while await broker_is_listening(path):
-            if asyncio.get_running_loop().time() >= deadline:
-                raise RuntimeError(
-                    f"session {record.name}: a broker is still serving "
-                    f"{path} after {STOP_WAIT_S:.0f} s — refusing to reassign"
-                )
-            await asyncio.sleep(SOCKET_POLL_S)
-
     async def _retract_stranded_escalation(self, session_id: str) -> None:
         """Clear a queued decision escalation whose broker is gone.
 
@@ -1450,12 +1204,9 @@ class MasterRuntime:
         cleared = self.queue.retract_for_session(session_id)
         if cleared is None:
             return
-        self._clear_inflight(cleared.escalation_id)
-        if cleared.escalation_id == self._surfaced_id:
-            self._surfaced_id = None
         self.emit(
             Notice(
-                f"escalation {cleared.escalation_id} from session "
+                f"escalation {cleared.payload.escalation_id} from session "
                 f"{session_id} retracted: its broker is gone"
             )
         )
@@ -1495,7 +1246,7 @@ class MasterRuntime:
         self._task_activity.pop(session_id, None)
         self._permission_prompt_pending.discard(session_id)
         self._discard_proposals(session_id)
-        self._procs.pop(session_id, None)
+        self.link.forget(session_id)
         self.registry.remove(session_id)
         # The broker exits without withdrawing its live escalations, so
         # retract them all — a stranded head would wedge the FIFO queue,
@@ -1654,27 +1405,3 @@ class MasterRuntime:
         """Return the dashboard header to idle."""
         self._master_activity = None
         self._publish_fleet()
-
-    async def _deliver(
-        self, socket_path: str, payload: WireMessage, *, rejection: str
-    ) -> str | None:
-        """Send ``payload`` to a session socket, reporting a NACK.
-
-        Args:
-            socket_path: Session socket to write to.
-            payload: Message to send.
-            rejection: Message returned when the session NACKs.
-
-        Returns:
-            ``None`` when the session ACKed, otherwise ``rejection``, with the
-            broker's own reason appended when it sent one.
-        """
-        resp = await client.send(
-            Path(socket_path), payload, session_id=None, timeout_s=REQUEST_TIMEOUT_S
-        )
-        if resp.ok:
-            return None
-        reason = parse_nack(resp).error
-        if reason:
-            rejection = f"{rejection}: {reason}"
-        return rejection

@@ -14,7 +14,7 @@ from broker.herdr.driver import HerdrError
 from broker.master.pane_escalations import PaneEscalations
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry, SessionRecord
-from broker.master.runtime import reconcile_registry
+from broker.master.registry_reconcile import reconcile_registry
 from broker.protocol.constants import SessionState
 from broker.protocol.schemas import (
     Envelope,

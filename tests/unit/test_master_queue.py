@@ -1,5 +1,5 @@
-"""EscalationQueue: FIFO order, the per-session invariant, keyed clears, and
-eager persistence through the queue file."""
+"""EscalationQueue: FIFO order, the per-session invariant, keyed clears, the
+memory-only head markers, and eager persistence through the queue file."""
 
 import tempfile
 from collections.abc import Iterator
@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from broker.master.queue import (
+    ClearedEscalation,
     EscalationProtocolViolation,
     EscalationQueue,
     QueueError,
@@ -33,6 +34,10 @@ def escalation(esc_id: str = "e1", session: str = "s1") -> EscalationPayload:
             },
         }
     )
+
+
+def _payload(cleared: ClearedEscalation | None) -> EscalationPayload | None:
+    return cleared.payload if cleared is not None else None
 
 
 @pytest.fixture
@@ -76,11 +81,11 @@ def test_fifo_order_preserved_across_resolves(queue_path: Path) -> None:
     queue.accept(e2)
     queue.accept(e3)
     assert queue.active is e1
-    assert queue.resolve("e1") is e1
+    assert _payload(queue.resolve("e1")) is e1
     assert queue.active is e2
-    assert queue.resolve("e2") is e2
+    assert _payload(queue.resolve("e2")) is e2
     assert queue.active is e3
-    assert queue.resolve("e3") is e3
+    assert _payload(queue.resolve("e3")) is e3
     assert queue.active is None
 
 
@@ -104,7 +109,7 @@ def test_retract_removes_a_queued_entry(queue_path: Path) -> None:
     queue.accept(e1)
     queue.accept(e2)
     queue.accept(e3)
-    assert queue.retract("e2") is e2
+    assert _payload(queue.retract("e2")) is e2
     assert queue.active is e1  # the head is untouched
     assert queue.waiting == ("s3",)
 
@@ -115,7 +120,7 @@ def test_retract_of_the_head_advances_active(queue_path: Path) -> None:
     e2 = escalation("e2", "s2")
     queue.accept(e1)
     queue.accept(e2)
-    assert queue.retract("e1") is e1
+    assert _payload(queue.retract("e1")) is e1
     assert queue.active is e2
 
 
@@ -137,7 +142,7 @@ def test_retract_for_session_clears_that_sessions_entry(queue_path: Path) -> Non
     e2 = escalation("e2", "s2")
     queue.accept(e1)
     queue.accept(e2)
-    assert queue.retract_for_session("s2") is e2
+    assert _payload(queue.retract_for_session("s2")) is e2
     assert queue.active is e1
     assert queue.retract_for_session("s2") is None
 
@@ -182,3 +187,66 @@ def test_every_mutation_is_persisted(queue_path: Path) -> None:
     assert EscalationQueue.load(queue_path).depth == 1
     queue.resolve("e1")
     assert EscalationQueue.load(queue_path).depth == 0
+
+
+def test_head_surfaces_once_and_its_successor_after_it_clears(
+    queue_path: Path,
+) -> None:
+    queue = EscalationQueue.load(queue_path)
+    e1 = escalation("e1", "s1")
+    e2 = escalation("e2", "s2")
+    queue.accept(e1)
+    queue.accept(e2)
+    assert queue.take_unsurfaced_head() is e1
+    assert queue.take_unsurfaced_head() is None
+    assert queue.resolve("e1") == ClearedEscalation(e1, was_surfaced=True)
+    assert queue.take_unsurfaced_head() is e2
+
+
+def test_clears_report_whether_the_entry_was_surfaced(queue_path: Path) -> None:
+    queue = EscalationQueue.load(queue_path)
+    e1 = escalation("e1", "s1")
+    e2 = escalation("e2", "s2")
+    queue.accept(e1)
+    queue.accept(e2)
+    queue.take_unsurfaced_head()
+    # A waiting entry the developer never saw retracts silently.
+    assert queue.retract("e2") == ClearedEscalation(e2, was_surfaced=False)
+    assert queue.retract_for_session("s1") == ClearedEscalation(
+        e1, was_surfaced=True
+    )
+
+
+def test_popping_the_inflight_entry_clears_the_marker(queue_path: Path) -> None:
+    queue = EscalationQueue.load(queue_path)
+    queue.accept(escalation("e1", "s1"))
+    queue.accept(escalation("e2", "s2"))
+    queue.mark_inflight("e1")
+    queue.retract("e2")
+    assert queue.inflight == "e1"
+    queue.retract_for_session("s1")
+    assert queue.inflight is None
+
+
+def test_clear_inflight_ignores_another_escalation(queue_path: Path) -> None:
+    queue = EscalationQueue.load(queue_path)
+    queue.accept(escalation("e1", "s1"))
+    queue.accept(escalation("e2", "s2"))
+    queue.mark_inflight("e1")
+    queue.clear_inflight("e2")
+    queue.clear_inflight_for_session("s2")
+    assert queue.inflight == "e1"
+    queue.clear_inflight_for_session("s1")
+    assert queue.inflight is None
+
+
+def test_markers_do_not_survive_a_reload(queue_path: Path) -> None:
+    queue = EscalationQueue.load(queue_path)
+    e1 = escalation("e1", "s1")
+    queue.accept(e1)
+    queue.take_unsurfaced_head()
+    queue.mark_inflight("e1")
+    # After a restart the head surfaces again and the developer re-decides.
+    reloaded = EscalationQueue.load(queue_path)
+    assert reloaded.inflight is None
+    assert reloaded.take_unsurfaced_head() == e1
