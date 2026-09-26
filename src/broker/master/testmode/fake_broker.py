@@ -1,7 +1,7 @@
 """Synthetic peers that speak the real NDJSON protocol.
 
-``FakeBrokerClient`` raises and retracts decision and pane escalations over
-the master socket through ``protocol.client.send``.
+``FakeBrokerClient`` pushes live status and raises and retracts decision and
+pane escalations over the master socket through ``protocol.client.send``.
 ``FakeSessionSocket`` binds a session socket that records every envelope it
 receives and ACKs it, standing in for a broker's listening end.
 """
@@ -17,6 +17,7 @@ from broker.protocol.schemas import (
     Envelope,
     EscalationPayload,
     EscalationRetractPayload,
+    LiveStatusPayload,
     PaneEscalationPayload,
     PaneRetractPayload,
     Response,
@@ -36,6 +37,10 @@ class FakeBrokerClient:
         self._master_socket = master_socket
         self._session = session
         self._timeout_s = timeout_s
+
+    async def push_status(self, state: SessionState) -> Response:
+        """Push a live status carrying ``state`` and return the master's reply."""
+        return await self._send(LiveStatusPayload(state=state))
 
     async def escalate(self, payload: EscalationPayload) -> Response:
         """Raise a broker escalation and return the master's reply."""

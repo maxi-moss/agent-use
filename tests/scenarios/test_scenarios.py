@@ -17,6 +17,7 @@ from broker.master.registry import Registry
 from broker.master.runtime import MasterRuntime
 from broker.master.testmode import SCENARIO_DIR, load_scenario, run_scenario
 from broker.master.testmode.schemas import Scenario
+from broker.protocol.constants import SessionState
 
 pytestmark = pytest.mark.scenarios
 
@@ -84,6 +85,14 @@ async def test_retract_while_surfaced(
     rt: tuple[MasterRuntime, list[Any]]
 ) -> None:
     await _run(rt, "retract-while-surfaced")
+    # The master takes a session's state only from its broker, so the rows
+    # reflect escalations only because the fake pushes what a broker would.
+    runtime, _ = rt
+    rows = runtime.board.build_view().rows
+    assert {row.session_id: row.state for row in rows} == {
+        "s1": SessionState.DRIVING,
+        "s2": SessionState.ESCALATED,
+    }
 
 
 async def test_dispatch_race(rt: tuple[MasterRuntime, list[Any]]) -> None:

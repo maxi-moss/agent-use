@@ -221,6 +221,25 @@ class StatusSession:
         )
 
 
+class PushingStatusSession:
+    """Session-socket handler that pushes a newer state before answering a probe."""
+
+    def __init__(self, master_socket: Path, pushed: str, probed: str) -> None:
+        self.master_socket = master_socket
+        self.pushed = pushed
+        self.probed = probed
+
+    async def handler(self, env: Envelope) -> Response:
+        push = Envelope(
+            id=uuid.uuid4().hex,
+            type=T_LIVE_STATUS,
+            session_id="s1",
+            payload={"state": self.pushed},
+        )
+        assert (await client.request(self.master_socket, push, timeout_s=5.0)).ok
+        return Response(id=env.id, ok=True, payload={"state": self.probed})
+
+
 class ProposalStatusSession:
     """Session-socket handler reporting a pending proposal on status."""
 
@@ -761,6 +780,7 @@ async def test_retract_clears_head_and_informs(
     rt: tuple[MasterRuntime, list[Any]]
 ) -> None:
     runtime, posts = rt
+    assert (await send(runtime, T_LIVE_STATUS, {"state": "escalated"})).ok
     assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
     resp = await send(
         runtime,
@@ -769,9 +789,9 @@ async def test_retract_clears_head_and_informs(
     )
     assert resp.ok
     assert runtime.queue.active is None
-    # Raising it set ESCALATED; leaving it there outlives the escalation and
-    # every later read of the registry is wrong about the session.
-    assert runtime.registry.get("s1").state == SessionState.DRIVING
+    # The broker pushes its own way out of ESCALATED; the master never
+    # invents the state it moved to.
+    assert runtime.registry.get("s1").state == SessionState.ESCALATED
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("resolved in pane" in t for t in notices)
 
@@ -1026,6 +1046,26 @@ async def test_probe_of_a_settled_session_keeps_it_settled(home: Path) -> None:
     assert row.task_activity == ""
 
 
+async def test_push_during_the_probe_await_wins(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, _ = rt
+    # The reply was built before the push but resumes after it; the older
+    # state must not overwrite the newer one, even once the push settled
+    # the session.
+    stub = PushingStatusSession(
+        runtime.master_socket_path, pushed="completed", probed="driving"
+    )
+    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
+    try:
+        status = await runtime.probe_status("s1")
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert status.state is SessionState.DRIVING
+    assert runtime.registry.get("s1").state is SessionState.COMPLETED
+
+
 async def test_repopulate_from_brokers_fills_task_activity_at_startup(
     home: Path,
 ) -> None:
@@ -1248,6 +1288,7 @@ async def test_dispatch_delivers_decision_when_live(
     stub = StubSession()
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
+        assert (await send(runtime, T_LIVE_STATUS, {"state": "escalated"})).ok
         assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
         result = await runtime.dispatch("e1", "use option B")
         assert "dispatched" in result
@@ -1426,6 +1467,7 @@ async def test_fatal_error_retracts_a_live_escalation(
         # A session that dies with a live escalation would otherwise wedge the
         # head forever, undispatchable to a dead session, and its open prompts
         # would stay shown with no raiser left to retract them.
+        assert (await send(runtime, T_LIVE_STATUS, {"state": "error"})).ok
         assert (
             await send(
                 runtime,
@@ -1553,6 +1595,7 @@ async def test_completion_notifies_done(
     rt: tuple[MasterRuntime, list[Any]], recording_run: RecordingRun
 ) -> None:
     runtime, posts = rt
+    assert (await send(runtime, T_LIVE_STATUS, {"state": "completed"})).ok
     resp = await send(
         runtime,
         T_COMPLETION,
@@ -1599,6 +1642,7 @@ async def test_build_session_outcome_reads_log_off_disk(
             supporting="budget survived",
         ),
     )
+    assert (await send(runtime, T_LIVE_STATUS, {"state": "completed"})).ok
     assert (
         await send(
             runtime,
@@ -1698,6 +1742,9 @@ async def test_proposal_awaits_approval_and_badges_on_arrival(
     rt: tuple[MasterRuntime, list[Any]]
 ) -> None:
     runtime, posts = rt
+    assert (
+        await send(runtime, T_LIVE_STATUS, {"state": "awaiting_approval"})
+    ).ok
     resp = await send(
         runtime,
         T_PROMPT_PROPOSAL,
@@ -1793,6 +1840,7 @@ async def test_dispatch_reports_rejection_when_session_nacks(
     stub = NackingSession()
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
+        assert (await send(runtime, T_LIVE_STATUS, {"state": "escalated"})).ok
         assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
         result = await runtime.dispatch("e1", "use option B")
         assert "rejected" in result
@@ -2275,17 +2323,17 @@ async def test_live_status_persists_the_session_identity(
     # A push that has not learned a field never erases what the registry holds.
     assert (await send(runtime, T_LIVE_STATUS, {"state": "driving"})).ok
     assert Registry.load(home / "registry.json").get("s1").pane_id == "w3:p2"
-    # /clear in a settled session binds a new Claude session: the absorbing
-    # guard that drops late state must not drop the new identity with it.
-    assert (
-        await send(runtime, T_COMPLETION, {"headline": "done", "supporting": "s"})
-    ).ok
+    # The absorbing guard drops the state a push carries, never the identity
+    # a broker that still answers reports.
+    record = runtime.registry.get("s1")
+    record.state = SessionState.UNMANAGED
+    runtime.registry.upsert(record)
     assert (
         await send(
             runtime,
             T_LIVE_STATUS,
             {
-                "state": "completed",
+                "state": "driving",
                 **identity,
                 "claude_session_id": "cc-2",
                 "transcript_path": "/private/tmp/cc-2.jsonl",
@@ -2295,6 +2343,7 @@ async def test_live_status_persists_the_session_identity(
     record = Registry.load(home / "registry.json").get("s1")
     assert record.claude_session_id == "cc-2"
     assert record.transcript_path == "/private/tmp/cc-2.jsonl"
+    assert record.state == SessionState.UNMANAGED
 
 
 async def test_set_state_is_idempotent(
@@ -2327,35 +2376,53 @@ async def test_set_state_is_idempotent(
 
 
 async def test_absorbing_state_ignores_late_pushes(
-    rt: tuple[MasterRuntime, list[Any]], home: Path
+    rt: tuple[MasterRuntime, list[Any]], spawn: RecordingSpawn
 ) -> None:
     runtime, _ = rt
-    assert (
-        await send(runtime, T_COMPLETION, {"headline": "done", "supporting": "s"})
-    ).ok
-    assert runtime.registry.get("s1").state == "completed"
-    # A stale in-flight push carrying an older state arrives late: it must
-    # not resurrect the settled session — but it is still ACKed.
+    _bind_session(runtime)
+    await runtime.stop_session("s1")
+    assert runtime.registry.get("s1").state == "stopped"
+    # A push still in flight from the stopped broker arrives late: it must
+    # not resurrect the session — but it is still ACKed.
     resp = await send(
         runtime,
         T_LIVE_STATUS,
         {"state": "driving", "activity": "reviewing the latest turn…"},
     )
     assert resp.ok
+    assert runtime.registry.get("s1").state == "stopped"
+    # The sanctioned exit is a master-initiated boundary write: attach binds
+    # a new broker, after which pushes apply again.
+    await runtime.attach_session("s1")
+    assert runtime.registry.get("s1").state == "spawning"
+    assert (await send(runtime, T_LIVE_STATUS, {"state": "driving"})).ok
+    assert runtime.registry.get("s1").state == "driving"
+    await runtime.stop_session("s1")
+
+
+async def test_completed_session_follows_its_broker_back_into_work(
+    rt: tuple[MasterRuntime, list[Any]]
+) -> None:
+    runtime, _ = rt
+    assert (await send(runtime, T_LIVE_STATUS, {"state": "completed"})).ok
     assert runtime.registry.get("s1").state == "completed"
-    # The sanctioned exit is a master-initiated boundary write: reactivate
-    # lifts the session back into work, after which pushes apply again.
-    stub = StubSession()
-    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
-    try:
-        result = await runtime.reactivate_session("s1", "next task")
-        assert "reactivated" in result
-        assert runtime.registry.get("s1").state == "grounding"
-        assert (await send(runtime, T_LIVE_STATUS, {"state": "driving"})).ok
-        assert runtime.registry.get("s1").state == "driving"
-    finally:
-        server.close()
-        await server.wait_closed()
+    # A prompt sent to a completed broker drives it again; the row must
+    # follow, not stay completed until some later probe.
+    assert (
+        await send(
+            runtime,
+            T_LIVE_STATUS,
+            {
+                "state": "driving",
+                "activity": "editing the handler…",
+                "task_activity": "fixing the login flow",
+            },
+        )
+    ).ok
+    assert runtime.registry.get("s1").state == "driving"
+    row = runtime.board.build_view().rows[0]
+    assert row.broker_activity == "editing the handler…"
+    assert row.task_activity == "fixing the login flow"
 
 
 async def test_absorbing_transition_clears_live_status(
@@ -2385,12 +2452,12 @@ async def test_absorbing_transition_clears_live_status(
     assert row.badges == ()
 
 
-async def test_list_sessions_probes_rather_than_reading_the_pushed_map(
+async def test_list_sessions_folds_the_probed_permission_flag(
     rt: tuple[MasterRuntime, list[Any]], home: Path
 ) -> None:
     runtime, _ = rt
     # The last push said no prompt was pending — as after a master restart,
-    # where the transient map is empty and no re-seeding push is coming for a
+    # where the board is empty and no re-seeding push is coming for a
     # session already sitting on its prompt.
     assert (
         await send(
@@ -2403,8 +2470,11 @@ async def test_list_sessions_probes_rather_than_reading_the_pushed_map(
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
         listing = await runtime.list_sessions()
-        # The tool's authoritative probe wins over the stale pushed state.
+        # The probe refreshes the flag the listing and the sidebar badge
+        # both read, so the two never disagree.
         assert "sitting on a permission prompt" in listing
+        row = runtime.board.build_view().rows[0]
+        assert Attention.PERMISSION in row.badges
     finally:
         server.close()
         await server.wait_closed()
@@ -2434,7 +2504,6 @@ async def test_reactivate_relays_the_intent_and_supersedes_the_old_one(
         assert reloaded.title == ""  # cleared alongside the approved prompt
         # Acceptance is not delivery: only the broker's budget update resets it.
         assert reloaded.budget_count == 4
-        assert reloaded.state == "grounding"
     finally:
         server.close()
         await server.wait_closed()

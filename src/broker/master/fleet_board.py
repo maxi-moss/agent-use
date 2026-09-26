@@ -25,8 +25,13 @@ from broker.protocol.constants import (
     ABSORBING_STATES,
     SETTLED_STATES,
     PaneKind,
+    SessionState,
 )
-from broker.protocol.schemas import LiveStatusPayload, PromptProposalPayload
+from broker.protocol.schemas import (
+    LiveStatusPayload,
+    PromptProposalPayload,
+    StatusPayload,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +49,7 @@ class _SessionLiveStatus:
     activity: str = ""
     task_activity: str = ""
     permission_prompt: bool = False
+    pushes: int = 0
 
 
 class FleetBoard:
@@ -85,36 +91,70 @@ class FleetBoard:
 
         Returns:
             ``True`` when the status applies and its state is the caller's to
-            record, ``False`` when the session is settled and the push is
+            record, ``False`` when the session is absorbed and the push is
             ignored.
         """
         record = self.registry.records[session_id]
-        # Outside the settled guard: /clear in a settled session binds a new
-        # Claude session id.
+        # Outside the absorbing guard: a broker that still answers knows its
+        # own pane and Claude session.
         self._note_identity(record, status)
-        # Left only by a master-initiated boundary write, never by a stale
-        # in-flight push arriving after the fact (cross-connection sends
-        # reorder even though each is individually ACKed).
-        if record.state in SETTLED_STATES | ABSORBING_STATES:
+        # Left only by a master-initiated boundary write, never by a push.
+        if record.state in ABSORBING_STATES:
             return False
         live = self._live.setdefault(session_id, _SessionLiveStatus())
+        live.pushes += 1
         live.activity = status.activity
         live.permission_prompt = status.permission_prompt
-        self.note_task_activity(session_id, status.task_activity)
+        self.note_task_activity(session_id, status.state, status.task_activity)
         return True
 
-    def note_task_activity(self, session_id: str, text: str) -> None:
-        """Show ``text`` as a live session's task activity; a settled session shows none."""
-        state = self.registry.get(session_id).state
-        if not text or state in SETTLED_STATES | ABSORBING_STATES:
-            live = self._live.get(session_id)
-            if live is not None:
-                live.task_activity = ""
-            return
-        self._live.setdefault(session_id, _SessionLiveStatus()).task_activity = text
+    def apply_probed_status(self, session_id: str, status: StatusPayload) -> bool:
+        """Fold a session's probed status into the board.
+
+        Args:
+            session_id: Registry name of the probed session.
+            status: The broker's reply to the probe.
+
+        Returns:
+            ``True`` when the status applies and its state is the caller's to
+            record, ``False`` when the session is absorbed and the reply is
+            ignored.
+        """
+        if self.registry.get(session_id).state in ABSORBING_STATES:
+            return False
+        live = self._live.setdefault(session_id, _SessionLiveStatus())
+        live.permission_prompt = status.permission_prompt
+        self.note_task_activity(session_id, status.state, status.task_activity)
+        return True
+
+    def push_count(self, session_id: str) -> int:
+        """Return how many pushes from a session the board has applied."""
+        live = self._live.get(session_id)
+        return live.pushes if live is not None else 0
+
+    def permission_prompt(self, session_id: str) -> bool:
+        """Return whether a session last reported a native permission prompt open."""
+        live = self._live.get(session_id)
+        return live is not None and live.permission_prompt
+
+    def note_task_activity(
+        self, session_id: str, state: SessionState, text: str
+    ) -> None:
+        """Show a session's task activity; one reporting a settled state shows none."""
+        live = self._live.setdefault(session_id, _SessionLiveStatus())
+        live.task_activity = (
+            "" if state in SETTLED_STATES | ABSORBING_STATES else text
+        )
+
+    def settle(self, session_id: str) -> None:
+        """Clear the live status and pending proposals of a session that settled."""
+        live = self._live.get(session_id)
+        if live is not None:
+            self._live[session_id] = _SessionLiveStatus(pushes=live.pushes)
+        self.discard_proposals(session_id)
 
     def forget(self, session_id: str) -> None:
-        """Drop the live status and pending proposals of a session that settled or left."""
+        """Drop everything the board holds for a session that left the fleet."""
         self._live.pop(session_id, None)
         self.discard_proposals(session_id)
 

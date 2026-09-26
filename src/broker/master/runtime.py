@@ -210,10 +210,7 @@ class MasterRuntime:
         """Refresh state, task-activity and any pending proposal from each surviving broker."""
 
         for name in self.registry.names_in_order():
-            if (
-                self.registry.records[name].state
-                in SETTLED_STATES | ABSORBING_STATES
-            ):
+            if self.registry.records[name].state in ABSORBING_STATES:
                 continue
             try:
                 status = await self.probe_status(name)
@@ -312,7 +309,6 @@ class MasterRuntime:
             return NackPayload(
                 error=str(exc), reason_code=NackCode.PROTOCOL_VIOLATION
             )
-        self._set_state(session_id, SessionState.ESCALATED)
         self.board.publish()
         await self._surface_head()
         return None
@@ -344,7 +340,7 @@ class MasterRuntime:
     async def _on_completion(
         self, session_id: str, p: CompletionPayload
     ) -> NackPayload | None:
-        """Settle a session that finished its task and tell the developer.
+        """Tell the developer a session finished its task.
 
         Args:
             session_id: Session that completed.
@@ -353,7 +349,6 @@ class MasterRuntime:
         Returns:
             ``None``; a completion is never refused.
         """
-        self._set_state(session_id, SessionState.COMPLETED)
         self.emit(CompletionArrived(session_id, p.headline, p.supporting))
         await notifier.notify_or_notice(
             self.emit,
@@ -366,7 +361,7 @@ class MasterRuntime:
     async def _on_fatal_error(
         self, session_id: str, p: FatalErrorPayload
     ) -> NackPayload | None:
-        """Mark a session errored and retract the escalations it can no longer answer.
+        """Report a session's failure and retract the escalations it can no longer answer.
 
         Args:
             session_id: Session that failed.
@@ -375,7 +370,6 @@ class MasterRuntime:
         Returns:
             ``None``; a fatal error is never refused.
         """
-        self._set_state(session_id, SessionState.ERROR)
         self.emit(
             Notice(f"session {session_id} FATAL [{p.error_class}]: {p.detail}")
         )
@@ -404,10 +398,6 @@ class MasterRuntime:
             ``None``; a retract is never refused.
         """
         cleared = self.queue.retract(p.escalation_id)
-        if cleared is not None:
-            # Raising it set ESCALATED here; withdrawing it must undo that
-            # or the registry outlives the escalation it describes.
-            self._set_state(session_id, SessionState.DRIVING)
         if cleared is not None and cleared.was_surfaced:
             # It was surfaced, so the developer must learn it is no longer
             # live; a waiting entry they never saw retracts silently.
@@ -476,7 +466,6 @@ class MasterRuntime:
         Returns:
             ``None``; a proposal is never refused.
         """
-        self._set_state(session_id, SessionState.AWAITING_APPROVAL)
         self.board.register_proposal(session_id, p)
         self.board.publish()
         return None
@@ -509,7 +498,7 @@ class MasterRuntime:
             p: The broker's current live status.
 
         Returns:
-            ``None``; a settled session's push is ACKed and ignored.
+            ``None``; an absorbed session's push is ACKed and ignored.
         """
         if not self.board.apply_live_status(session_id, p):
             return None
@@ -715,7 +704,7 @@ class MasterRuntime:
         record.approved_prompt = None  # superseded; set again on approval
         record.title = ""
         self.registry.upsert(record)
-        self._set_state(session_id, SessionState.GROUNDING)
+        self.board.publish()
         return f"session {session_id} reactivated — grounding the new task"
 
     async def approve_prompt(
@@ -987,14 +976,20 @@ class MasterRuntime:
         Returns:
             The status as reported by the session broker.
         """
+        pushes = self.board.push_count(session_id)
         resp = await self.link.request(
             self.registry.get(session_id),
             StatusRequestPayload(),
             timeout_s=REQUEST_TIMEOUT_S,
         )
         status = StatusPayload.model_validate(resp.payload)
-        self._set_state(session_id, status.state)
-        self.board.note_task_activity(session_id, status.task_activity)
+        # A push applied during the await is newer than this reply.
+        if self.board.push_count(session_id) != pushes:
+            return status
+        if not self.board.apply_probed_status(session_id, status):
+            return status
+        if not self._set_state(session_id, status.state):
+            self.board.publish()
         return status
 
     def build_session_outcome(self, session_id: str) -> SessionOutcome:
@@ -1114,8 +1109,8 @@ class MasterRuntime:
     async def list_sessions(self) -> str:
         """Render the registry summary, probing each session for a live prompt.
 
-        The prompt flag lives in broker memory and is read on demand, so it
-        never enters the summary the master carries into every turn.
+        The prompt flag is refreshed by the probe and never enters the
+        summary the master carries into every turn.
 
         Returns:
             The registry summary, followed by a line for each session found
@@ -1125,7 +1120,7 @@ class MasterRuntime:
         lines = [self.registry_summary()]
         for name in self.registry.names_in_order():
             try:
-                status = await self.probe_status(name)
+                await self.probe_status(name)
             except PROBE_FAILURES as exc:
                 # An unreachable session costs one line of the listing, never
                 # the whole listing.
@@ -1134,7 +1129,7 @@ class MasterRuntime:
                     "whether it is sitting on a permission prompt"
                 )
                 continue
-            if status.permission_prompt:
+            if self.board.permission_prompt(name):
                 lines.append(
                     f"- {name}: sitting on a permission prompt, answered in "
                     f"pane {self.pane_of(name)}"
@@ -1228,10 +1223,8 @@ class MasterRuntime:
         logger.info("session %s: %s -> %s", name, record.state, state)
         record.state = state
         self.registry.upsert(record)  # sync; no await before this point
-        if state in SETTLED_STATES | ABSORBING_STATES:
-            # A settled session shows no live status, and the settled guard
-            # blocks the pushes that would otherwise clear it.
-            self.board.forget(name)
+        if state in SETTLED_STATES | {SessionState.UNMANAGED}:
+            self.board.settle(name)
         self.emit(SessionStateChanged(name, state))
         self.board.publish()
         return True
