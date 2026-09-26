@@ -1,0 +1,13 @@
+{
+  "name": "pane-supersede",
+  "steps": [
+    {"op": "seed_session", "name": "s1"},
+    {"op": "start_socket", "session": "s1"},
+    {"op": "permission_escalate", "session": "s1", "escalation_id": "p1", "tool_name": "Bash", "tool_input": {"command": "rm work"}, "expect": "ack"},
+    {"op": "assert_open_panes", "kind": "permission", "session_ids": ["s1"], "ids": ["p1"]},
+    {"op": "permission_escalate", "session": "s1", "escalation_id": "p2", "tool_name": "Bash", "tool_input": {"command": "rm work again"}, "expect": "ack"},
+    {"op": "assert_open_panes", "kind": "permission", "session_ids": ["s1"], "ids": ["p2"]},
+    {"op": "assert_surfaced", "escalation_id": "p2"},
+    {"op": "assert_isolated"}
+  ]
+}

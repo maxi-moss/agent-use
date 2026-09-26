@@ -144,6 +144,7 @@ class AssertOpenPanes(BaseModel):
     op: Literal["assert_open_panes"]
     kind: PaneKind
     session_ids: list[str] = Field(default_factory=list[str])
+    ids: list[str] = Field(default_factory=list[str])
 
 
 class AssertIsolated(BaseModel):

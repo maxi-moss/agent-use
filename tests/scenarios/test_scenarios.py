@@ -102,6 +102,10 @@ async def test_broker_death(rt: tuple[MasterRuntime, list[Any]]) -> None:
     await _run(rt, "broker-death")
 
 
+async def test_pane_supersede(rt: tuple[MasterRuntime, list[Any]]) -> None:
+    await _run(rt, "pane-supersede")
+
+
 async def test_attach_refusal(rt: tuple[MasterRuntime, list[Any]]) -> None:
     # Attach probes the socket once and never polls, so the refusal is
     # immediate — no wait to compress.

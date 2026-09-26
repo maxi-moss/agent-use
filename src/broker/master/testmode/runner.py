@@ -458,25 +458,31 @@ async def _run_step(
 
     if isinstance(step, AssertOpenPanes):
         want_sessions = step.session_ids
+        want_ids = step.ids
 
         def open_sessions(view: FleetView) -> list[str]:
             return [p.session_id for p in view.panes if p.kind == step.kind]
 
+        def open_ids(view: FleetView) -> list[str]:
+            return [p.escalation_id for p in view.panes if p.kind == step.kind]
+
         def panes_match() -> bool:
             latest = _latest(posts, FleetUpdated)
-            return latest is not None and open_sessions(latest.view) == want_sessions
+            if latest is None or open_sessions(latest.view) != want_sessions:
+                return False
+            return not want_ids or open_ids(latest.view) == want_ids
 
         passed = await _poll_until(panes_match, timeout_s)
         latest = _latest(posts, FleetUpdated)
         seen = (
-            f"open {step.kind}={open_sessions(latest.view)}"
+            f"open {step.kind}={open_sessions(latest.view)} ids={open_ids(latest.view)}"
             if latest is not None
             else "no fleet view posted"
         )
         detail = (
             seen
             if passed
-            else f"expected open {step.kind}={want_sessions}, saw {seen}"
+            else f"expected open {step.kind}={want_sessions} ids={want_ids}, saw {seen}"
         )
         return StepResult(index=index, op=op, passed=passed, detail=detail)
 
