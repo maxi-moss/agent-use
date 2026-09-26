@@ -9,7 +9,7 @@ from broker.master.escalation_desk import CLARIFY_ESCALATION_TIMEOUT_S
 from broker.permission.module import PERMISSION_DECISION_TIMEOUT_S
 from broker.protocol.constants import HOOK_SETTINGS_TIMEOUT
 from broker.protocol.constants import HOOK_WAIT_SECONDS
-from broker.session.broker import ASK_DECISION_TIMEOUT_S
+from broker.session.ask_menu import ASK_DECISION_TIMEOUT_S
 from broker.session.broker import CLARIFY_TIMEOUT_S
 
 

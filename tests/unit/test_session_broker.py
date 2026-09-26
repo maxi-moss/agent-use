@@ -1319,6 +1319,43 @@ async def test_ask_verified_on_matching_post_tool_use(harness: Harness) -> None:
     assert harness.broker.state == "driving"
 
 
+async def test_verified_ask_drops_its_cached_hook_reply(harness: Harness) -> None:
+    await launch(harness)
+    await harness.llm.results.put(ANSWER_QUESTIONS_RESULT)
+    await client.request(
+        harness.sock,
+        ask_question_env("toolu_new_1", COLOR_TOOL_INPUT),
+        timeout_s=5.0,
+    )
+    await _notify(
+        harness.sock,
+        hook_env(
+            "PostToolUse",
+            {
+                "tool_name": "AskUserQuestion",
+                "tool_use_id": "toolu_new_1",
+                "tool_input": COLOR_TOOL_INPUT,
+                "tool_response": {
+                    "questions": COLOR_TOOL_INPUT["questions"],
+                    "answers": {"Pick a color": "Blue (Recommended)"},
+                },
+            },
+        ),
+    )
+    async with asyncio.timeout(5.0):
+        while "ask_verified" not in await decision_log_text(harness):
+            await asyncio.sleep(0.01)
+    # The cache is gone once the tool call ended: the same id is decided anew.
+    await harness.llm.results.put(ANSWER_QUESTIONS_RESULT)
+    calls_before = len(harness.llm.calls)
+    await client.request(
+        harness.sock,
+        ask_question_env("toolu_new_1", COLOR_TOOL_INPUT),
+        timeout_s=5.0,
+    )
+    assert len(harness.llm.calls) == calls_before + 1
+
+
 async def test_ask_verify_mismatch_escalates_without_auto_retract(
     harness: Harness,
 ) -> None:
@@ -1361,7 +1398,7 @@ async def test_ask_verify_mismatch_escalates_without_auto_retract(
 async def test_late_injected_answer_retracts_without_budget_reset(
     harness: Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("broker.session.broker.ASK_VERIFY_TIMEOUT_S", 0.1)
+    monkeypatch.setattr("broker.session.ask_menu.ASK_VERIFY_TIMEOUT_S", 0.1)
     await launch(harness)
     await harness.llm.results.put(ANSWER_QUESTIONS_RESULT)
     await client.request(
@@ -1402,7 +1439,7 @@ async def test_late_injected_answer_retracts_without_budget_reset(
 async def test_ask_verify_backstop_read_failure_escalates_without_auto_retract(
     harness: Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("broker.session.broker.ASK_VERIFY_TIMEOUT_S", 0.1)
+    monkeypatch.setattr("broker.session.ask_menu.ASK_VERIFY_TIMEOUT_S", 0.1)
     await launch(harness)
     await harness.llm.results.put(ANSWER_QUESTIONS_RESULT)
     await client.request(

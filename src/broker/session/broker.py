@@ -14,8 +14,6 @@ Structure:
 """
 
 import asyncio
-import contextlib
-import json
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
@@ -41,7 +39,6 @@ from broker.claude.paths import transcript_dir_for_cwd
 from broker.permission import PermissionModule, render_permission_log
 from broker.protocol.constants import (
     ACTIVE_STATES,
-    ASK_DECISION_ANSWER,
     ASK_USER_QUESTION,
     DECISION_ALLOW,
     DECISION_ESCALATED,
@@ -71,7 +68,6 @@ from broker.protocol.schemas import (
     ClarifyEscalationReplyPayload,
     ClarifyEscalationRequestPayload,
     CompletionPayload,
-    AskQuestionDecisionPayload,
     AskQuestionRequestPayload,
     DecisionDeliveredPayload,
     DecisionLogPayload,
@@ -86,14 +82,12 @@ from broker.protocol.schemas import (
     HookEventPayload,
     LiveStatusPayload,
     NackPayload,
-    PaneRetractPayload,
     PermissionDecisionPayload,
     PermissionLogPayload,
     PermissionLogRequestPayload,
     PermissionRequestPayload,
     PromptProposalPayload,
     PromptUndeliveredPayload,
-    QuestionEscalationPayload,
     ReactivatePayload,
     Response,
     RetrievedSymbol,
@@ -106,42 +100,25 @@ from broker.protocol.schemas import (
     WireMessage,
     nack_response,
 )
-from broker.session import ask, clarify
+from broker.session import clarify
+from broker.session.ask_menu import AskMenu
 from broker.session.grounding import (
     Retriever,
     bind_index_retriever,
     ground_intent,
 )
 from broker.session.llm_stack import EscalateCall, bind_call_tool, disclosure_of
-from broker.session.master_link import (
-    LiveStatusPusher,
-    describe_refusal,
-    send_to_master,
-)
-from broker.session.pane import OpenMenu, PaneOccupiedError, SessionPane
+from broker.session.master_link import LiveStatusPusher, send_to_master
+from broker.session.pane import PaneOccupiedError, SessionPane
 from broker.session.triage import AnswerCall, CompleteCall, NoActionCall, triage
 from broker.session.watchdog import Watchdog
 from broker.transcript.adapter import ReadReport, read_cleaned
-from broker.transcript.schemas import (
-    AnswerValue,
-    AskUserAnswer,
-    AssistantText,
-    TranscriptEvent,
-    UserPrompt,
-)
+from broker.transcript.schemas import AssistantText, TranscriptEvent, UserPrompt
 
 logger = logging.getLogger(__name__)
 
 SESSION_BIND_TIMEOUT_S = 60.0
 
-# Both waits are named and bounded (global rule). The decision deadline sits
-# inside HOOK_WAIT_SECONDS (30) so the hook never gives up while the broker
-# still intends to answer — a reply after hook death would be an answer the
-# broker believes in and Claude Code never saw.
-ASK_DECISION_TIMEOUT_S = 20.0
-# updatedInput delivery is instantaneous when it works (duration_ms: 0
-# observed); this only fires when the mechanism broke or a hook was dropped.
-ASK_VERIFY_TIMEOUT_S = 30.0
 # Sits under the master's CLARIFY_ESCALATION_TIMEOUT_S so the broker's own deadline
 # expires first and it fails loud on its own terms.
 CLARIFY_TIMEOUT_S = 45.0
@@ -150,7 +127,6 @@ CLARIFY_TIMEOUT_S = 45.0
 PHRASE_GROUNDING = "constructing the prompt…"
 PHRASE_TRIAGE = "reviewing the latest turn…"
 PHRASE_PERMISSION = "reviewing a permission request…"
-PHRASE_ASK = "deciding a question…"
 PHRASE_CLARIFY = "answering a question about the escalation…"
 
 Job = Callable[[], Awaitable[None]]
@@ -187,14 +163,6 @@ class DecisionEscalation:
     clarify_tasks: set[asyncio.Task[clarify.ClarifyCall]]
 
 
-@dataclass(frozen=True, slots=True)
-class _InjectedAnswers:
-    """Answers the broker injected into a menu, awaiting verification."""
-
-    tool_input: dict[str, Any]
-    answers: dict[str, AnswerValue]
-
-
 class FatalSessionError(Exception):
     def __init__(self, error_class: str, detail: str) -> None:
         """Record the machine-readable class and human detail of the failure."""
@@ -216,15 +184,19 @@ class SessionBroker:
 
         Args:
             cfg: Session identity, socket paths, cwd, intent and budget limits.
-            llm_call: Injected tool-calling backend. When omitted, ``run()``
-                builds one from an Anthropic client — tests pass a fake.
+            llm_call: Injected tool-calling backend. When omitted, one is
+                bound to an Anthropic client — tests pass a fake.
             retrieve: Injected code retrieval. When omitted, ``run()`` binds
                 the repository index under the broker home — tests pass a fake.
             permission: Injected permission triage module. When omitted, one is
                 built from ``cfg`` — tests pass a fake or a spy.
         """
         self.cfg = cfg
-        self._llm_call = llm_call
+        self._llm_call = (
+            llm_call
+            if llm_call is not None
+            else bind_call_tool(llm_module.build_client())
+        )
         self._retrieve = retrieve
         self.state: SessionState = SessionState.SPAWNING
         self.claude_session_id: str | None = None
@@ -241,15 +213,36 @@ class SessionBroker:
         self._run_task: asyncio.Task[None] | None = None
 
         self._decision_escalation: DecisionEscalation | None = None
-        self._ask_decisions: dict[str, AskQuestionDecisionPayload] = {}
-        self._ask_expected: dict[str, _InjectedAnswers] = {}
-        self._ask_verify_tasks: dict[str, asyncio.Task[None]] = {}
         self._last_event_count = -1
 
         self._status = LiveStatusPusher(
             snapshot=self._live_status, send=self._to_master
         )
         self.pane = SessionPane(cfg.name, on_change=self._status.mark_dirty)
+        self.ask_menu = AskMenu(
+            pane=self.pane,
+            status=self._status,
+            llm_call=self._llm_call,
+            model_cfg=cfg.session_model,
+            session_id=cfg.name,
+            state=lambda: self.state,
+            intent=self._intent,
+            read_transcript=self._read_transcript,
+            log=lambda row: decision_log.append(self.decision_log_path, row),
+            send=self._to_master,
+            enqueue=self.jobs.put_nowait,
+            budget_exhausted=lambda: self.budget_count >= self.cfg.budget_max,
+            spend_budget=self._spend_budget,
+            note_developer_contact=self._note_developer_contact,
+            raise_decision_escalation=lambda disclosure, reasoning, summary: (
+                self._raise_escalation(
+                    self._new_escalation(disclosure),
+                    reasoning,
+                    None,
+                    task_summary=summary,
+                )
+            ),
+        )
 
         self._paths = BrokerPaths(cfg.broker_home)
         self.decision_log_path = self._paths.session_decisions(cfg.name)
@@ -285,8 +278,6 @@ class SessionBroker:
         """Serve the socket and drive the session until it is stopped."""
         # Bind FIRST — hooks may fire before the pane exists.
         server = await serve_unix(Path(self.cfg.socket_path), self.handle)
-        if self._llm_call is None:
-            self._llm_call = bind_call_tool(llm_module.build_client())
         if self._retrieve is None:
             self._retrieve = bind_index_retriever(self._paths, self.cfg.embedding)
         self.watchdog.start()
@@ -302,10 +293,7 @@ class SessionBroker:
                 raise
         finally:
             await self._status.aclose()
-            for task in list(self._ask_verify_tasks.values()):
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+            await self.ask_menu.aclose()
             await self.permission.aclose()
             await self.watchdog.stop()
             server.close()
@@ -433,7 +421,6 @@ class SessionBroker:
         self._set_task(intent, None)
         self.task_activity = ""
         self._set_state(SessionState.GROUNDING)
-        assert self._llm_call is not None
         assert self._retrieve is not None
         with self._status.activity(PHRASE_GROUNDING):
             try:
@@ -559,108 +546,8 @@ class SessionBroker:
             The decision reply for the hook.
         """
         self.watchdog.reset()
-        # Cached per tool_use_id: PreToolUse can fire several times per logical
-        # operation, and a duplicate must get the same reply without a second
-        # LLM call.
-        cached = self._ask_decisions.get(payload.tool_use_id)
-        if cached is None:
-            with self._status.activity(PHRASE_ASK):
-                cached = await self._decide_ask(payload)
-            self._ask_decisions[payload.tool_use_id] = cached
-        return Response(id=env.id, ok=True, payload=cached.model_dump())
-
-    async def _decide_ask(
-        self, payload: AskQuestionRequestPayload
-    ) -> AskQuestionDecisionPayload:
-        """Run the answer-or-escalate decision for one pending menu.
-
-        Every failure arm returns ``escalated`` — the safe default that hands
-        the menu to the developer rather than answering it. Every ``escalated``
-        reply claims the open picker before returning, so no pane write can
-        slip in while it renders.
-
-        Args:
-            payload: The pending question payload from the hook.
-
-        Returns:
-            The reply payload to cache and send to the hook.
-        """
-        tool_use_id = payload.tool_use_id
-        escalated = AskQuestionDecisionPayload(decision=DECISION_ESCALATED)
-        if self.state not in ACTIVE_STATES:
-            # The developer is already engaged (escalated/completed/...): do
-            # not raise a second escalation on top; let the picker render.
-            self._log(
-                DecisionLogKind.ASK_SKIPPED,
-                f"question arrived in state {self.state!r}; picker left to "
-                "the developer",
-                tool_use_id=tool_use_id,
-            )
-            self._claim_menu(OpenMenu(tool_use_id, None, None))
-            return escalated
-        try:
-            questions = ask.parse_questions(payload.tool_input)
-        except ask.AskInputError as exc:
-            self._escalate_menu(
-                tool_use_id, payload.tool_input, f"unusable question payload: {exc}"
-            )
-            return escalated
-        if self.budget_count >= self.cfg.budget_max:
-            self._escalate_menu(
-                tool_use_id,
-                payload.tool_input,
-                "autonomy budget exhausted — this question is handed over "
-                "rather than answered",
-            )
-            return escalated
-        assert self._llm_call is not None
-        try:
-            async with asyncio.timeout(ASK_DECISION_TIMEOUT_S):
-                events = self._read_transcript()
-                result = await ask.decide_questions(
-                    self._llm_call,
-                    self.cfg.session_model,
-                    intent=self._intent(),
-                    events=events,
-                    questions=questions,
-                )
-        except Exception as exc:
-            # Deliberately broad: LLMCallError, AnswerValidationError (both
-            # attempts), timeout, and transcript failure all escalate rather
-            # than narrowing to one type and dropping the rest.
-            self._escalate_menu(
-                tool_use_id, payload.tool_input, f"{type(exc).__name__}: {exc}"
-            )
-            return escalated
-        if isinstance(result, EscalateCall):
-            self._escalate_menu(
-                tool_use_id,
-                payload.tool_input,
-                result.reasoning,
-                analysis=disclosure_of(result),
-                task_summary=result.task_summary,
-            )
-            return escalated
-        call, answers = result
-        updated_input = dict(payload.tool_input)
-        updated_input["answers"] = answers
-        self._log(DecisionLogKind.ASK_ANSWERED, call.reasoning, json.dumps(answers))
-        self._ask_expected[tool_use_id] = _InjectedAnswers(
-            payload.tool_input, answers
-        )
-        self._spawn_ask_verify(tool_use_id)
-        self.budget_count += 1
-        # Queued, and captured by value: the hook is blocking on this return,
-        # so master traffic never runs on the reply path, and the job must
-        # report the count as of this answer, not whatever it is when the
-        # queue drains.
-        count = self.budget_count
-        self.jobs.put_nowait(
-            lambda: self._report_budget(count)
-        )
-        return AskQuestionDecisionPayload(
-            decision=ASK_DECISION_ANSWER, updated_input=updated_input
-        )
+        reply = await self.ask_menu.decide(payload)
+        return Response(id=env.id, ok=True, payload=reply.model_dump())
 
     async def _on_clarify_escalation(
         self, env: Envelope, req: ClarifyEscalationRequestPayload
@@ -693,7 +580,6 @@ class SessionBroker:
         resolved = nack_response(
             env, "escalation resolved in the pane", NackCode.WRONG_STATE
         )
-        assert self._llm_call is not None
         try:
             events = self._read_transcript()
         except Exception as exc:
@@ -750,48 +636,6 @@ class SessionBroker:
             ok=True,
             payload=ClarifyEscalationReplyPayload(answer=result.answer).model_dump(),
         )
-
-    def _escalate_menu(
-        self,
-        tool_use_id: str,
-        tool_input: dict[str, Any],
-        reason: str,
-        *,
-        analysis: EscalationDisclosure | None = None,
-        task_summary: str = "Handed a pending AskUserQuestion menu to the developer",
-    ) -> None:
-        """Claim the open picker now and queue its question escalation.
-
-        Args:
-            tool_use_id: The pending AskUserQuestion call.
-            tool_input: Its raw tool input.
-            reason: Why the broker did not answer the menu itself.
-            analysis: The ask LLM's disclosure when it chose to escalate.
-            task_summary: The escalation's one-line Reason in the outcome history.
-        """
-        escalation_id = uuid.uuid4().hex
-        self._claim_menu(OpenMenu(tool_use_id, escalation_id, None))
-        # Queued: the hook blocks on this reply and must never wait on master
-        # traffic.
-        self.jobs.put_nowait(
-            lambda: self._raise_question(
-                escalation_id,
-                tool_input,
-                reason,
-                analysis,
-                task_summary=task_summary,
-            )
-        )
-
-    def _claim_menu(self, menu: OpenMenu) -> None:
-        """Record ``menu`` as the picker open in the pane."""
-        previous = self.pane.claim_menu(menu)
-        # A picker opening means the earlier one closed. The master supersedes
-        # its escalation on the new raise, so only the log row is written,
-        # queued behind the earlier raise so it follows that raise's row.
-        if previous is not None and previous.escalation_id is not None:
-            replaced = previous.escalation_id
-            self.jobs.put_nowait(lambda: self._log_replaced_question(replaced))
 
     async def _on_hook_event(
         self, env: Envelope, hook: HookEventPayload
@@ -1013,11 +857,11 @@ class SessionBroker:
                     tool_name, tool_input = _raw_tool(raw)
                     self.permission.note_tool_completed(tool_name, tool_input)
                     if tool_name == ASK_USER_QUESTION:
-                        self._verify_ask(raw)
+                        self.ask_menu.verify(raw)
                 else:
                     self.permission.note_developer_input()
                 if self.pane.open_menu is not None:
-                    self.jobs.put_nowait(self._check_menu_answered)
+                    self.jobs.put_nowait(self.ask_menu.check_answered)
                 if self.state == SessionState.ESCALATED:
                     self.jobs.put_nowait(self._check_out_of_band_resolution)
             case HookEventName.NOTIFICATION:
@@ -1089,7 +933,6 @@ class SessionBroker:
         self._set_state(SessionState.DRIVING)
         events = self._read_transcript()  # context ONLY; input is the message
         self._last_event_count = len(events)
-        assert self._llm_call is not None
         with self._status.activity(PHRASE_TRIAGE):
             result = await triage(
                 self._llm_call,
@@ -1215,299 +1058,6 @@ class SessionBroker:
             task_summary="Handed over when the autonomous answer budget ran out",
         )
 
-    async def _raise_question(
-        self,
-        escalation_id: str,
-        tool_input: dict[str, Any],
-        reason: str,
-        analysis: EscalationDisclosure | None,
-        *,
-        task_summary: str,
-    ) -> None:
-        """Show the master an AskUserQuestion menu the developer answers in the pane.
-
-        Args:
-            escalation_id: The id claimed with the open picker.
-            tool_input: Raw ``AskUserQuestion`` tool input.
-            reason: Why the broker did not answer the menu itself.
-            analysis: The ask LLM's disclosure when it chose to escalate.
-            task_summary: The escalation's one-line Reason in the outcome history.
-        """
-        try:
-            questions = ask.parse_questions(tool_input)
-        except ask.AskInputError:
-            questions = []  # the reason already names the failure
-        self._log(
-            DecisionLogKind.ESCALATION_RAISED,
-            reason,
-            f"AskUserQuestion menu open in pane {self.pane.pane_id or '?'}",
-            task_summary=task_summary,
-            escalation_id=escalation_id,
-        )
-        payload = QuestionEscalationPayload(
-            escalation_id=escalation_id,
-            session_id=self.cfg.name,
-            task_context=self._intent(),
-            menu=ask.render_questions(questions),
-            first_question=questions[0].question if questions else "",
-            reason=reason,
-            analysis=analysis,
-        )
-        nack = await self._to_master(payload, tolerated=frozenset(NackCode))
-        if nack is None:
-            return
-        # The picker is still in the pane, so the claim stays; only the
-        # escalation the master refused is dropped.
-        self._log(
-            DecisionLogKind.QUESTION_REFUSED,
-            "question escalation refused",
-            describe_refusal(payload.MESSAGE_TYPE, nack),
-        )
-        menu = self.pane.open_menu
-        if menu is not None and menu.escalation_id == escalation_id:
-            menu.escalation_id = None
-
-    async def _log_replaced_question(self, escalation_id: str) -> None:
-        """Close the question escalation of a picker a newer one replaced."""
-        self._log(
-            DecisionLogKind.RETRACTED,
-            "a newer AskUserQuestion menu replaced it",
-            "",
-            task_summary="Replaced by a newer question",
-            escalation_id=escalation_id,
-        )
-
-    async def _retract_question(
-        self, escalation_id: str, reason: str, summary: str
-    ) -> None:
-        """End a question escalation without a dispatch and tell the master.
-
-        Args:
-            escalation_id: The question escalation being withdrawn.
-            reason: Why it ended; shown to the developer.
-            summary: The escalation's Solution line in the outcome history.
-        """
-        self._log(
-            DecisionLogKind.RETRACTED,
-            reason,
-            "",
-            task_summary=summary,
-            escalation_id=escalation_id,
-        )
-        await self._to_master(
-            PaneRetractPayload(escalation_id=escalation_id, reason=reason)
-        )
-
-    async def _check_menu_answered(self) -> None:
-        """Release the open picker once the transcript records its answer."""
-        # Every way the picker closes writes an answer for its tool use, so
-        # the transcript is the complete clearing signal.
-        menu = self.pane.open_menu
-        if menu is None:
-            return
-        answer = next(
-            (
-                e
-                for e in self._read_transcript()
-                if isinstance(e, AskUserAnswer) and e.id == menu.tool_use_id
-            ),
-            None,
-        )
-        if answer is None:
-            return
-        self.pane.release_menu()
-        if menu.escalation_id is None:
-            return
-        answered_by_developer = (
-            menu.injected is None or answer.answers != menu.injected
-        )
-        if answered_by_developer:
-            reason = "answered in pane"
-        else:
-            reason = "the broker's answer was recorded late"
-            self._log(
-                DecisionLogKind.ASK_VERIFIED,
-                "recorded late",
-                tool_use_id=menu.tool_use_id,
-            )
-        # A late answer matching the broker's cannot be told apart from the
-        # developer picking the same options, so both read as the developer's.
-        await self._retract_question(
-            menu.escalation_id, reason, "User answered the questions in the pane"
-        )
-        if answered_by_developer:
-            await self._note_developer_contact()
-
-    def _verify_ask(self, raw: dict[str, Any]) -> None:
-        """Compare the PostToolUse echo against the injected answers.
-
-        Args:
-            raw: Raw ``PostToolUse`` hook JSON for an AskUserQuestion.
-        """
-        tool_use_id = str(raw.get("tool_use_id", "") or "")
-        injected = self._ask_expected.pop(tool_use_id, None)
-        if injected is None:
-            return  # not broker-answered, or already verified
-        task = self._ask_verify_tasks.pop(tool_use_id, None)
-        if task is not None:
-            task.cancel()
-        response = raw.get("tool_response")
-        echoed: Any = (
-            cast(dict[str, Any], response).get("answers")
-            if isinstance(response, dict)
-            else None
-        )
-        if echoed == injected.answers:
-            self._log(
-                DecisionLogKind.ASK_VERIFIED,
-                "PostToolUse echo matches",
-                tool_use_id=tool_use_id,
-            )
-            return
-        self.jobs.put_nowait(
-            lambda: self._ask_verify_failed(
-                tool_use_id,
-                injected,
-                "the session recorded different answers than the broker "
-                "injected — it is proceeding on those answers",
-                answer_recorded=True,
-            )
-        )
-
-    def _spawn_ask_verify(self, tool_use_id: str) -> None:
-        """Arm the transcript backstop for one injected answer."""
-        task = asyncio.create_task(self._ask_verify_backstop(tool_use_id))
-        self._ask_verify_tasks[tool_use_id] = task
-        task.add_done_callback(
-            lambda _: self._ask_verify_tasks.pop(tool_use_id, None)
-        )
-
-    async def _ask_verify_backstop(self, tool_use_id: str) -> None:
-        """Check the transcript when no PostToolUse confirmed the answer.
-
-        Transcript writes are asynchronous and may lag the hooks, so this is
-        a bounded second look, not the primary signal.
-
-        Args:
-            tool_use_id: The injected answer being verified.
-        """
-        await asyncio.sleep(ASK_VERIFY_TIMEOUT_S)
-        injected = self._ask_expected.pop(tool_use_id, None)
-        if injected is None:
-            return  # verified by PostToolUse in the meantime
-        try:
-            answer = next(
-                (
-                    e
-                    for e in self._read_transcript()
-                    if isinstance(e, AskUserAnswer) and e.id == tool_use_id
-                ),
-                None,
-            )
-        except Exception as exc:
-            # A raise here would vanish into the task and drop verification
-            # silently. Whether an answer was recorded is unknown, so take
-            # the non-retracting arm. `exc` is cleared when this block
-            # exits, before the queued job runs — bind the reason now.
-            reason = (
-                f"verification itself failed ({type(exc).__name__}: {exc}) "
-                "— the broker cannot confirm its answers were delivered"
-            )
-            self.jobs.put_nowait(
-                lambda: self._ask_verify_failed(
-                    tool_use_id, injected, reason, answer_recorded=True
-                )
-            )
-            return
-        if answer is not None and answer.answers == injected.answers:
-            self._log(
-                DecisionLogKind.ASK_VERIFIED,
-                "transcript backstop",
-                tool_use_id=tool_use_id,
-            )
-            return
-        if answer is None:
-            reason = (
-                "no answer was recorded — the injected answers may never "
-                "have been delivered and the menu may still be on screen"
-            )
-        else:
-            reason = (
-                "the recorded answers differ from what the broker injected"
-            )
-        answer_recorded = answer is not None
-        self.jobs.put_nowait(
-            lambda: self._ask_verify_failed(
-                tool_use_id, injected, reason, answer_recorded=answer_recorded
-            )
-        )
-
-    async def _ask_verify_failed(
-        self,
-        tool_use_id: str,
-        injected: _InjectedAnswers,
-        reason: str,
-        *,
-        answer_recorded: bool,
-    ) -> None:
-        """Escalate a failed answer verification; the state is the message.
-
-        Args:
-            tool_use_id: The injected answer that failed verification.
-            injected: The tool input and the answers the broker injected.
-            reason: What the verification found; shown to the developer.
-            answer_recorded: Whether the session already recorded an answer
-                for this id.
-        """
-        self._log(DecisionLogKind.ASK_VERIFY_FAILED, reason, tool_use_id=tool_use_id)
-        task_summary = "Escalated an AskUserQuestion answer that failed verification"
-        # With no answer recorded the menu may still be in the pane, and its
-        # answer clears it. Otherwise the session already proceeded on
-        # something, and only a decision in the master chat resolves it.
-        if not answer_recorded:
-            escalation_id = uuid.uuid4().hex
-            self._claim_menu(OpenMenu(tool_use_id, escalation_id, injected.answers))
-            await self._raise_question(
-                escalation_id,
-                injected.tool_input,
-                reason,
-                None,
-                task_summary=task_summary,
-            )
-            return
-        disclosure = EscalationDisclosure(
-            escalation_title="AskUserQuestion answer verification failed",
-            situation=(
-                "AskUserQuestion answer verification failed — " + reason
-                + f" Check pane {self.pane.pane_id or '?'} and the session's "
-                "recent turns."
-            ),
-            what_was_asked=(
-                "Confirm what the session actually proceeded on, and correct "
-                "it in the pane if needed."
-            ),
-            what_is_at_stake=(
-                "The session may be running on answers the broker did not "
-                "choose."
-            ),
-            alternatives=[
-                Alternative(
-                    option="inspect the pane",
-                    pros="the pane and transcript are authoritative",
-                    cons="",
-                )
-            ],
-            recommendation="inspect the pane",
-            uncertainty=reason,
-            what_would_change_my_mind="Only your explicit decision resolves this.",
-        )
-        await self._raise_escalation(
-            self._new_escalation(disclosure),
-            reason,
-            None,
-            task_summary=task_summary,
-        )
-
     async def _raise_escalation(
         self,
         payload: EscalationPayload,
@@ -1559,7 +1109,7 @@ class SessionBroker:
                 payload.
         """
         if self.pane.open_menu is not None:
-            await self._check_menu_answered()
+            await self.ask_menu.check_answered()
         if self.state == SessionState.ESCALATED:
             await self._check_out_of_band_resolution()
             if self.state == SessionState.ESCALATED:
@@ -1719,6 +1269,16 @@ class SessionBroker:
         self.budget_count = 0
         await self._report_budget(0)
 
+    def _spend_budget(self) -> None:
+        """Count one autonomous hook-reply answer and queue its report to the master."""
+        self.budget_count += 1
+        # Queued, and captured by value: the hook is blocking on this return,
+        # so master traffic never runs on the reply path, and the job must
+        # report the count as of this answer, not whatever it is when the
+        # queue drains.
+        count = self.budget_count
+        self.jobs.put_nowait(lambda: self._report_budget(count))
+
     async def _report_budget(self, count: int) -> None:
         """Tell the master the autonomous answer budget stands at ``count``."""
         await self._to_master(BudgetUpdatePayload(count=count))
@@ -1750,7 +1310,7 @@ class SessionBroker:
         cannot silently strand the session.
         """
         if self.pane.open_menu is not None:
-            await self._check_menu_answered()
+            await self.ask_menu.check_answered()
         if self.state == SessionState.ESCALATED:
             await self._check_out_of_band_resolution()
         # A native prompt open means the turn is blocked on it, not over.
