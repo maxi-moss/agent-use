@@ -25,7 +25,7 @@ from broker.session.llm_stack import (
     assemble_context,
     forced_call,
 )
-from broker.transcript.schemas import Question, TranscriptEvent
+from broker.transcript.schemas import AnswerValue, Question, TranscriptEvent
 
 
 class QuestionAnswer(BaseModel):
@@ -44,10 +44,6 @@ class AnswerQuestionsCall(BaseModel):
 
 
 AskResult = AnswerQuestionsCall | EscalateCall
-
-# The wire value type: label str (single-select), list of labels
-# (multiSelect), or free text str. Matches updatedInput.answers exactly.
-AnswerValue = str | list[str]
 
 
 class AskInputError(Exception):

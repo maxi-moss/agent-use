@@ -24,6 +24,11 @@ class Question(BaseModel):
     multiSelect: bool = False
 
 
+# The wire value type: label str (single-select), list of labels
+# (multiSelect), or free text str. Matches updatedInput.answers exactly.
+AnswerValue = str | list[str]
+
+
 class UserPrompt(BaseModel):
     kind: Literal["user_prompt"]
     text: str
@@ -50,7 +55,7 @@ class AskUserAnswer(BaseModel):
     # comma-joined str when answered in the native UI. None when rejected or
     # on records that predate the field. Comparisons are structural — the
     # prose in `raw` has two templates and is never parsed.
-    answers: dict[str, str | list[str]] | None = None
+    answers: dict[str, AnswerValue] | None = None
 
 
 class ExitPlanModeUse(BaseModel):

@@ -10,7 +10,7 @@ Structure:
   never the transcript tail. The watchdog reconciliation is the
   one sanctioned pure-transcript read.
 - Every pane write is a single `agent prompt`, which submits on its own,
-  via driver.agent_prompt with an explicit timeout.
+  via `SessionPane.submit` with an explicit timeout.
 """
 
 import asyncio
@@ -37,8 +37,6 @@ from broker.config import (
     SessionBrokerConfig,
 )
 from broker.paths import BrokerPaths
-from broker.herdr import driver
-from broker.herdr.schemas import AgentStatus
 from broker.claude.paths import transcript_dir_for_cwd
 from broker.permission import PermissionModule, render_permission_log
 from broker.protocol.constants import (
@@ -120,10 +118,12 @@ from broker.session.master_link import (
     describe_refusal,
     send_to_master,
 )
+from broker.session.pane import OpenMenu, PaneOccupiedError, SessionPane
 from broker.session.triage import AnswerCall, CompleteCall, NoActionCall, triage
 from broker.session.watchdog import Watchdog
 from broker.transcript.adapter import ReadReport, read_cleaned
 from broker.transcript.schemas import (
+    AnswerValue,
     AskUserAnswer,
     AssistantText,
     TranscriptEvent,
@@ -132,7 +132,6 @@ from broker.transcript.schemas import (
 
 logger = logging.getLogger(__name__)
 
-SUBMIT_TIMEOUT_S = 15.0
 SESSION_BIND_TIMEOUT_S = 60.0
 
 # Both waits are named and bounded (global rule). The decision deadline sits
@@ -146,11 +145,6 @@ ASK_VERIFY_TIMEOUT_S = 30.0
 # Sits under the master's CLARIFY_ESCALATION_TIMEOUT_S so the broker's own deadline
 # expires first and it fails loud on its own terms.
 CLARIFY_TIMEOUT_S = 45.0
-
-# Forwarded to the claude binary at spawn. "auto" classifies each tool call and
-# still prompts on the risky ones, so the hook's escalation path survives;
-# "bypassPermissions" would silently approve every escalation.
-CLAUDE_AGENT_ARGS = ["--model", "opus", "--permission-mode", "auto"]
 
 # Dashboard activity phrases, one per LLM call site.
 PHRASE_GROUNDING = "constructing the prompt…"
@@ -193,32 +187,12 @@ class DecisionEscalation:
     clarify_tasks: set[asyncio.Task[clarify.ClarifyCall]]
 
 
-@dataclass(slots=True)
-class _OpenMenu:
-    """An AskUserQuestion picker the broker left open in the pane."""
-
-    tool_use_id: str
-    escalation_id: str | None  # None: nothing escalated for it
-    injected: dict[str, ask.AnswerValue] | None  # unverified injected answers
-
-
 @dataclass(frozen=True, slots=True)
 class _InjectedAnswers:
     """Answers the broker injected into a menu, awaiting verification."""
 
     tool_input: dict[str, Any]
-    answers: dict[str, ask.AnswerValue]
-
-
-class PaneOccupiedError(Exception):
-    def __init__(self, what: str, pane_id: str | None) -> None:
-        """Record which native prompt holds the pane."""
-        super().__init__(
-            f"{what} is open in pane {pane_id or '?'}; nothing is typed into "
-            "the pane while it is"
-        )
-        self.what = what
-        self.pane_id = pane_id
+    answers: dict[str, AnswerValue]
 
 
 class FatalSessionError(Exception):
@@ -253,7 +227,6 @@ class SessionBroker:
         self._llm_call = llm_call
         self._retrieve = retrieve
         self.state: SessionState = SessionState.SPAWNING
-        self.pane_id: str | None = None
         self.claude_session_id: str | None = None
         self.transcript_path: str | None = None
         self._logged_drift_warnings: set[str] = set()
@@ -268,16 +241,15 @@ class SessionBroker:
         self._run_task: asyncio.Task[None] | None = None
 
         self._decision_escalation: DecisionEscalation | None = None
-        self._open_menu: _OpenMenu | None = None
         self._ask_decisions: dict[str, AskQuestionDecisionPayload] = {}
         self._ask_expected: dict[str, _InjectedAnswers] = {}
         self._ask_verify_tasks: dict[str, asyncio.Task[None]] = {}
-        self._permission_prompt_pending = False
         self._last_event_count = -1
 
         self._status = LiveStatusPusher(
             snapshot=self._live_status, send=self._to_master
         )
+        self.pane = SessionPane(cfg.name, on_change=self._status.mark_dirty)
 
         self._paths = BrokerPaths(cfg.broker_home)
         self.decision_log_path = self._paths.session_decisions(cfg.name)
@@ -290,7 +262,7 @@ class SessionBroker:
             intent=self._task.authoritative,
         )
         self.watchdog = Watchdog(
-            cfg.watchdog_seconds, self._herdr_state, self._reconcile
+            cfg.watchdog_seconds, self.pane.herdr_state, self._reconcile
         )
         self._handlers: dict[str, _Handler] = {
             T_PERMISSION_REQUEST: self._on_permission_request,
@@ -381,7 +353,7 @@ class SessionBroker:
         Args:
             adopt: Pane, Claude session id and transcript path to take over.
         """
-        self.pane_id = adopt.pane_id
+        self.pane.adopt(adopt.pane_id)
         self.claude_session_id = adopt.claude_session_id
         self.transcript_path = adopt.transcript_path
         self.session_bound.set()
@@ -420,41 +392,20 @@ class SessionBroker:
         """
         cfg = self.cfg
         # Trust was seeded by the MASTER before spawn.
-        pane = await asyncio.to_thread(
-            driver.pane_split,
+        guess = await self.pane.start(
             cfg.anchor_pane,
-            direction="right",
             cwd=Path(cfg.cwd),
             env={
                 ENV_BROKER_SOCKET: cfg.socket_path,
                 ENV_BROKER_HOOK_LOG: str(self._paths.session_hook_log(cfg.name)),
             },
-            focus=False,
-            timeout_s=15.0,
+            claude_settings_path=cfg.claude_settings_path,
         )
-        self.pane_id = pane.pane_id  # the DURABLE handle
-        start = await asyncio.to_thread(
-            driver.agent_start,
-            cfg.name,
-            kind="claude",
-            pane_id=self.pane_id,
-            timeout_ms=30000,
-            agent_args=[
-                *CLAUDE_AGENT_ARGS,
-                "--settings",
-                cfg.claude_settings_path,
-            ],
-        )
-        session = start.agent_session
         # Optimistic fill-in only: the SessionStart hook may already have
         # bound the authoritative id by the time this returns, and must
-        # never be clobbered by agent_start's guess.
-        if (
-            session is not None
-            and session.kind == "id"
-            and self.claude_session_id is None
-        ):
-            self.claude_session_id = session.value
+        # never be clobbered by the start-time guess.
+        if guess is not None and self.claude_session_id is None:
+            self.claude_session_id = guess
         try:
             async with asyncio.timeout(SESSION_BIND_TIMEOUT_S):
                 # Primary binding is the SessionStart hook event.
@@ -512,7 +463,7 @@ class SessionBroker:
         # Approval is synchronous and blocking — no timeout.
         approved = await approval
         self._set_task(intent, approved.prompt)
-        await self._submit(approved.prompt)
+        await self.pane.submit(approved.prompt)
         self._pending = None
         self._set_state(SessionState.DRIVING)
 
@@ -521,9 +472,9 @@ class SessionBroker:
         return LiveStatusPayload(
             state=self.state,
             activity=self._status.current_activity,
-            permission_prompt=self._reports_permission_prompt(),
+            permission_prompt=self.pane.reports_permission_prompt(),
             task_activity=self.task_activity,
-            pane_id=self.pane_id,
+            pane_id=self.pane.pane_id,
             claude_session_id=self.claude_session_id,
             transcript_path=self.transcript_path,
         )
@@ -645,7 +596,7 @@ class SessionBroker:
                 "the developer",
                 tool_use_id=tool_use_id,
             )
-            self._claim_menu(_OpenMenu(tool_use_id, None, None))
+            self._claim_menu(OpenMenu(tool_use_id, None, None))
             return escalated
         try:
             questions = ask.parse_questions(payload.tool_input)
@@ -819,7 +770,7 @@ class SessionBroker:
             task_summary: The escalation's one-line Reason in the outcome history.
         """
         escalation_id = uuid.uuid4().hex
-        self._claim_menu(_OpenMenu(tool_use_id, escalation_id, None))
+        self._claim_menu(OpenMenu(tool_use_id, escalation_id, None))
         # Queued: the hook blocks on this reply and must never wait on master
         # traffic.
         self.jobs.put_nowait(
@@ -832,11 +783,9 @@ class SessionBroker:
             )
         )
 
-    def _claim_menu(self, menu: _OpenMenu) -> None:
+    def _claim_menu(self, menu: OpenMenu) -> None:
         """Record ``menu`` as the picker open in the pane."""
-        previous = self._open_menu
-        self._open_menu = menu
-        self._status.mark_dirty()
+        previous = self.pane.claim_menu(menu)
         # A picker opening means the earlier one closed. The master supersedes
         # its escalation on the new raise, so only the log row is written,
         # queued behind the earlier raise so it follows that raise's row.
@@ -940,11 +889,11 @@ class SessionBroker:
                 "its pane",
                 NackCode.WRONG_STATE,
             )
-        what = self._native_prompt()
+        what = self.pane.native_prompt()
         if what is not None:
             return nack_response(
                 env,
-                f"{what} is open in pane {self.pane_id or '?'} — the "
+                f"{what} is open in pane {self.pane.pane_id or '?'} — the "
                 "developer answers it there before a prompt can be typed",
                 NackCode.WRONG_STATE,
             )
@@ -1048,7 +997,7 @@ class SessionBroker:
             case HookEventName.SESSION_START:
                 self._bind_session(raw)
             case HookEventName.STOP:
-                self._set_perm_pending(False)
+                self.pane.set_permission_prompt(False)
                 message = str(raw.get("last_assistant_message", "") or "")
                 self.jobs.put_nowait(lambda: self._on_turn_end(message))
             case HookEventName.STOP_FAILURE:
@@ -1060,21 +1009,21 @@ class SessionBroker:
                 self.jobs.put_nowait(lambda: self._fatal(error_class, detail))
             case HookEventName.USER_PROMPT_SUBMIT | HookEventName.POST_TOOL_USE:
                 if event == HookEventName.POST_TOOL_USE:
-                    self._set_perm_pending(False)
+                    self.pane.set_permission_prompt(False)
                     tool_name, tool_input = _raw_tool(raw)
                     self.permission.note_tool_completed(tool_name, tool_input)
                     if tool_name == ASK_USER_QUESTION:
                         self._verify_ask(raw)
                 else:
                     self.permission.note_developer_input()
-                if self._open_menu is not None:
+                if self.pane.open_menu is not None:
                     self.jobs.put_nowait(self._check_menu_answered)
                 if self.state == SessionState.ESCALATED:
                     self.jobs.put_nowait(self._check_out_of_band_resolution)
             case HookEventName.NOTIFICATION:
                 self._log(DecisionLogKind.NOTIFICATION, "", str(raw.get("message", "")))
                 if raw.get("notification_type") == "permission_prompt":
-                    self._set_perm_pending(True)
+                    self.pane.set_permission_prompt(True)
             case HookEventName.SESSION_END:
                 self.permission.note_session_ended()
                 self._set_state(SessionState.STOPPED)
@@ -1162,7 +1111,7 @@ class SessionBroker:
                     result.answer,
                     task_summary=result.task_summary,
                 )
-                await self._submit(result.answer)
+                await self.pane.submit(result.answer)
                 self.budget_count += 1
                 await self._report_budget(self.budget_count)
         elif isinstance(result, EscalateCall):
@@ -1291,7 +1240,7 @@ class SessionBroker:
         self._log(
             DecisionLogKind.ESCALATION_RAISED,
             reason,
-            f"AskUserQuestion menu open in pane {self.pane_id or '?'}",
+            f"AskUserQuestion menu open in pane {self.pane.pane_id or '?'}",
             task_summary=task_summary,
             escalation_id=escalation_id,
         )
@@ -1314,7 +1263,7 @@ class SessionBroker:
             "question escalation refused",
             describe_refusal(payload.MESSAGE_TYPE, nack),
         )
-        menu = self._open_menu
+        menu = self.pane.open_menu
         if menu is not None and menu.escalation_id == escalation_id:
             menu.escalation_id = None
 
@@ -1353,7 +1302,7 @@ class SessionBroker:
         """Release the open picker once the transcript records its answer."""
         # Every way the picker closes writes an answer for its tool use, so
         # the transcript is the complete clearing signal.
-        menu = self._open_menu
+        menu = self.pane.open_menu
         if menu is None:
             return
         answer = next(
@@ -1366,8 +1315,7 @@ class SessionBroker:
         )
         if answer is None:
             return
-        self._open_menu = None
-        self._status.mark_dirty()
+        self.pane.release_menu()
         if menu.escalation_id is None:
             return
         answered_by_developer = (
@@ -1518,7 +1466,7 @@ class SessionBroker:
         # something, and only a decision in the master chat resolves it.
         if not answer_recorded:
             escalation_id = uuid.uuid4().hex
-            self._claim_menu(_OpenMenu(tool_use_id, escalation_id, injected.answers))
+            self._claim_menu(OpenMenu(tool_use_id, escalation_id, injected.answers))
             await self._raise_question(
                 escalation_id,
                 injected.tool_input,
@@ -1531,7 +1479,7 @@ class SessionBroker:
             escalation_title="AskUserQuestion answer verification failed",
             situation=(
                 "AskUserQuestion answer verification failed — " + reason
-                + f" Check pane {self.pane_id or '?'} and the session's "
+                + f" Check pane {self.pane.pane_id or '?'} and the session's "
                 "recent turns."
             ),
             what_was_asked=(
@@ -1610,7 +1558,7 @@ class SessionBroker:
             last_assistant_message: ``last_assistant_message`` from the Stop
                 payload.
         """
-        if self._open_menu is not None:
+        if self.pane.open_menu is not None:
             await self._check_menu_answered()
         if self.state == SessionState.ESCALATED:
             await self._check_out_of_band_resolution()
@@ -1692,7 +1640,7 @@ class SessionBroker:
             )
             return
         try:
-            await self._submit(decision.response)
+            await self.pane.submit(decision.response)
         except Exception as exc:
             # The master resolves only on confirmed delivery, so a failed pane
             # write — an occupied pane included — leaves the escalation live
@@ -1751,7 +1699,7 @@ class SessionBroker:
             prompt: The text the master relayed, submitted unmodified.
         """
         try:
-            await self._submit(prompt.text)
+            await self.pane.submit(prompt.text)
         except PaneOccupiedError as exc:
             self._log(
                 DecisionLogKind.DISPATCH_FAILED, "developer prompt not typed", str(exc)
@@ -1801,12 +1749,12 @@ class SessionBroker:
         classified as if a Stop hook had delivered it, so a dropped hook
         cannot silently strand the session.
         """
-        if self._open_menu is not None:
+        if self.pane.open_menu is not None:
             await self._check_menu_answered()
         if self.state == SessionState.ESCALATED:
             await self._check_out_of_band_resolution()
         # A native prompt open means the turn is blocked on it, not over.
-        if self._native_prompt() is not None or self.state not in ACTIVE_STATES:
+        if self.pane.native_prompt() is not None or self.state not in ACTIVE_STATES:
             return
         events = self._read_transcript()
         if len(events) == self._last_event_count:
@@ -1875,40 +1823,6 @@ class SessionBroker:
             sorted(versions),
             report.skipped_records,
             dict(report.unknown_types),
-        )
-
-    def _native_prompt(self) -> str | None:
-        """Name the native prompt open in the pane, or ``None`` when there is none."""
-        if self._open_menu is not None:
-            return "an AskUserQuestion menu"
-        if self._permission_prompt_pending:
-            return "a permission prompt"
-        return None
-
-    def _reports_permission_prompt(self) -> bool:
-        """Whether to report a permission prompt upstream."""
-        # An open picker's own permission check can raise a permission-prompt
-        # notification; the picker is the prompt the developer sees.
-        return self._permission_prompt_pending and self._open_menu is None
-
-    async def _submit(self, text: str) -> None:
-        """Type ``text`` into the session and submit it, with an explicit timeout.
-
-        Args:
-            text: Prompt text, submitted exactly as given.
-
-        Raises:
-            PaneOccupiedError: A native prompt is open in the pane; typing
-                would land in it.
-        """
-        what = self._native_prompt()
-        if what is not None:
-            raise PaneOccupiedError(what, self.pane_id)
-        await asyncio.to_thread(
-            driver.agent_prompt,
-            self.cfg.name,
-            text,
-            timeout_s=SUBMIT_TIMEOUT_S,
         )
 
     async def _to_master(
@@ -1999,22 +1913,6 @@ class SessionBroker:
         logger.info("session %s: %s -> %s", self.cfg.name, self.state, state)
         self.state = state
         self._status.mark_dirty()
-
-    def _set_perm_pending(self, pending: bool) -> None:
-        """Record whether the session sits on a native permission prompt."""
-        self._permission_prompt_pending = pending
-        self._status.mark_dirty()
-
-    def _herdr_state(self) -> AgentStatus:
-        """Report the agent's state as Herdr sees it, for the watchdog gate.
-
-        Returns:
-            Herdr's status, or ``"unknown"`` if the query fails.
-        """
-        try:
-            return driver.agent_get(self.cfg.name, timeout_s=10.0).agent_status
-        except Exception:
-            return "unknown"  # gates the watchdog read out; never classifies
 
 
 def _raw_tool(raw: dict[str, Any]) -> tuple[str, dict[str, Any]]:
