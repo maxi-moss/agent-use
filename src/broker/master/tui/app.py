@@ -29,11 +29,9 @@ from broker.master.tui.notice import AttentionNotice
 from broker.master.tui.outcome_modal import OutcomeModal
 from broker.master.tui.prompt_area import PromptArea
 from broker.master.viewmodel import (
-    Attention,
     CompletionArrived,
     EscalationArrived,
     FleetUpdated,
-    FleetView,
     Notice,
     PaneEscalationArrived,
     ProposalArrived,
@@ -84,13 +82,6 @@ class BrokerMasterApp(App[None]):
         self.master_llm = master_llm
         self.startup_warnings = startup_warnings
         self.inject = inject
-        # Disclosures are held here, off the chat, until /escalation,
-        # /permission, /question or /proposal pastes one in; FleetUpdated
-        # prunes what is no longer live.
-        self._head: EscalationArrived | None = None
-        self._panes: dict[PaneKind, dict[str, str]] = {kind: {} for kind in PaneKind}
-        self._proposals: dict[str, str] = {}
-        self._last_view: FleetView | None = None
         relay.connect(self._post_view_event)
 
     def _post_view_event(self, event: ViewEvent) -> None:
@@ -136,27 +127,31 @@ class BrokerMasterApp(App[None]):
         if text == "/escalation":
             self._show_escalation()
             return
-        if text == "/permission" or text.startswith("/permission "):
+        matched, session_id = self._parse_command(text, "/permission")
+        if matched:
             self._show_pane(
                 PaneKind.PERMISSION,
-                text[len("/permission"):].strip() or None,
+                session_id,
                 noun="permission prompt",
                 command="/permission",
             )
             return
-        if text == "/question" or text.startswith("/question "):
+        matched, session_id = self._parse_command(text, "/question")
+        if matched:
             self._show_pane(
                 PaneKind.QUESTION,
-                text[len("/question"):].strip() or None,
+                session_id,
                 noun="question",
                 command="/question",
             )
             return
-        if text == "/proposal" or text.startswith("/proposal "):
-            self._show_proposal(text[len("/proposal"):].strip() or None)
+        matched, session_id = self._parse_command(text, "/proposal")
+        if matched:
+            self._show_proposal(session_id)
             return
-        if text == "/outcome" or text.startswith("/outcome "):
-            self._show_outcome(text[len("/outcome"):].strip() or None)
+        matched, session_id = self._parse_command(text, "/outcome")
+        if matched:
+            self._show_outcome(session_id)
             return
         box.disabled = True
         self._chat_block(text, role="user", label="you")
@@ -217,24 +212,19 @@ class BrokerMasterApp(App[None]):
     def on_view_event_message(self, message: ViewEventMessage) -> None:
         event = message.event
         if isinstance(event, FleetUpdated):
-            self._last_view = event.view
-            self._prune_disclosures(event.view)
             self.query_one(FleetSidebar).update_view(event.view)
             self.query_one("#notice", AttentionNotice).update_view(event.view)
         elif isinstance(event, EscalationArrived):
-            self._head = event
             self._event_line(
                 f"{event.session_id} requested a decision: "
                 f"{event.escalation_title}"
             )
         elif isinstance(event, PaneEscalationArrived):
-            self._panes[event.kind][event.session_id] = event.rendered
             self._event_line(
                 f"{event.kind} escalation {event.escalation_id} from "
                 f"{event.session_id}"
             )
         elif isinstance(event, ProposalArrived):
-            self._proposals[event.session_id] = event.rendered
             self._event_line(
                 f"proposal {event.proposal_id} from {event.session_id} "
                 "awaiting approval"
@@ -252,46 +242,56 @@ class BrokerMasterApp(App[None]):
 
     # ── disclosures on demand (deterministic; no LLM turn) ───────────────────
 
-    def _prune_disclosures(self, view: FleetView) -> None:
-        """Drop held disclosures that ``view`` no longer lists as live."""
-        head = view.head
-        if self._head is not None and (
-            head is None or head.escalation_id != self._head.escalation_id
-        ):
-            self._head = None
-        for kind, held in self._panes.items():
-            open_ids = {p.session_id for p in view.panes if p.kind == kind}
-            self._panes[kind] = {
-                sid: text for sid, text in held.items() if sid in open_ids
-            }
-        proposing = {r.session_id for r in view.rows if Attention.PROPOSAL in r.badges}
-        self._proposals = {
-            sid: text for sid, text in self._proposals.items() if sid in proposing
-        }
+    def _parse_command(self, text: str, name: str) -> tuple[bool, str | None]:
+        """Match a slash command, with or without a trailing session id.
+
+        Args:
+            text: The developer's submitted line, already stripped.
+            name: The command's spelling, including its leading slash.
+
+        Returns:
+            ``(True, argument)`` when ``text`` is ``name`` or ``name`` plus an
+            argument (``None`` when there was none); ``(False, None)`` when
+            ``text`` does not name this command at all.
+        """
+        if text == name:
+            return True, None
+        if text.startswith(name + " "):
+            return True, text[len(name):].strip() or None
+        return False, None
 
     def _show_escalation(self) -> None:
         """Paste the head escalation's disclosure into the chat, verbatim."""
-        if self._head is None:
+        rendered = self.runtime.desk.rendered_head()
+        if rendered is None:
             self._event_line("no escalation is waiting")
             return
-        self._chat_block(self._head.rendered)
+        self._chat_block(rendered)
 
     def _show_pane(
         self, kind: PaneKind, session_id: str | None, *, noun: str, command: str
     ) -> None:
         """Paste an open pane escalation's disclosure into the chat, verbatim."""
-        self._paste_held(self._panes[kind], session_id, noun=noun, command=command)
+        self._paste_held(
+            self.runtime.desk.rendered_panes(kind),
+            session_id,
+            noun=noun,
+            command=command,
+        )
 
     def _show_proposal(self, session_id: str | None) -> None:
         """Paste a pending proposal into the chat, verbatim."""
         self._paste_held(
-            self._proposals, session_id, noun="proposal", command="/proposal"
+            self.runtime.board.rendered_proposals(),
+            session_id,
+            noun="proposal",
+            command="/proposal",
         )
 
     def _paste_held(
         self, held: dict[str, str], session_id: str | None, *, noun: str, command: str
     ) -> None:
-        """Paste ``session_id``'s held disclosure, or the only one, into the chat.
+        """Paste ``session_id``'s live disclosure, or the only one, into the chat.
 
         Args:
             held: Rendered disclosures by session id.
@@ -316,7 +316,7 @@ class BrokerMasterApp(App[None]):
         if session_id is None:
             self._event_line("usage: /outcome sN")
             return
-        rows = self._last_view.rows if self._last_view is not None else ()
+        rows = self.runtime.board.build_view().rows
         row = next((r for r in rows if r.session_id == session_id), None)
         if row is None:
             self._event_line(f"no such session {session_id}")

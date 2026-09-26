@@ -31,7 +31,7 @@ from broker.permission.classifier import (
     build_classifier_client,
     render_suggestions,
 )
-from broker.session.llm_stack import FORCED_ONE
+from broker.session.llm_stack import FORCED_ONE, SESSION_CALL_TIMEOUT_S
 from broker.session.triage import TRIAGE_TOOLS
 
 SYSTEM: list[TextBlockParam] = [
@@ -75,6 +75,7 @@ async def session_call() -> None:
         messages=MESSAGES,
         tools=TRIAGE_TOOLS,
         tool_choice=FORCED_ONE,
+        timeout_s=SESSION_CALL_TIMEOUT_S,
     )
     print(f"triage  ({cfg.model_id}): one tool_use block -> {call.name}")
     print(f"    input keys: {sorted(call.input)}")

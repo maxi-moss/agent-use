@@ -8,9 +8,10 @@ import pytest
 
 from broker.master.fleet_board import FleetBoard
 from broker.master.pane_escalations import PaneEscalations
+from broker.master.payload_render import render_proposal
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry, SessionRecord
-from broker.master.viewmodel import Attention, FleetUpdated, ProposalArrived
+from broker.master.viewmodel import Attention, FleetUpdated
 from broker.protocol.constants import SessionState
 from broker.protocol.schemas import (
     PANE_ESCALATION_ADAPTER,
@@ -203,24 +204,20 @@ def test_build_view_badges_reflect_queue_proposals_and_prompts(
     assert rows["s3"].pane_id == "w3:p2"
 
 
-def test_rendered_proposals_hold_the_latest_announced_text_per_session(
-    board: FleetBoard, posts: list[Any]
+def test_rendered_proposals_hold_the_latest_proposal_per_session(
+    board: FleetBoard,
 ) -> None:
     add_session(board, "s1")
     add_session(board, "s2")
+    payloads: dict[str, PromptProposalPayload] = {}
     for session, proposal_id in (("s1", "p1"), ("s2", "p2"), ("s1", "p3")):
-        board.register_proposal(
-            session,
-            PromptProposalPayload(
-                proposal_id=proposal_id,
-                proposed_prompt=f"prompt {proposal_id}",
-                grounding_summary="facts",
-            ),
+        payloads[proposal_id] = PromptProposalPayload(
+            proposal_id=proposal_id,
+            proposed_prompt=f"prompt {proposal_id}",
+            grounding_summary="facts",
         )
-    announced = {
-        m.proposal_id: m.rendered for m in posts if isinstance(m, ProposalArrived)
-    }
+        board.register_proposal(session, payloads[proposal_id])
     assert board.rendered_proposals() == {
-        "s1": announced["p3"],
-        "s2": announced["p2"],
+        "s1": render_proposal(payloads["p3"]),
+        "s2": render_proposal(payloads["p2"]),
     }

@@ -5,6 +5,7 @@ import hashlib
 import json
 import tempfile
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -21,11 +22,16 @@ from anthropic.types import (
 from broker.config import BrokerConfig
 from broker.llm import ToolCall, TurnResult
 from broker.master.llm import (
+    AUTO_ONE,
+    MASTER_CALL_TIMEOUT_S,
     MAX_TOOL_ROUNDS,
     MASTER_TOOLS,
     ClarifyEscalationArgs,
     MasterLLM,
+    bind_call_turn,
 )
+from broker.master.control_result import ControlResult
+from broker.master.escalation_desk import EscalationDesk
 from broker.master.pane_escalations import PaneEscalations
 from broker.master.payload_render import (
     render_escalation,
@@ -47,6 +53,26 @@ from broker.protocol.schemas import (
 )
 
 
+class RecordingDesk(EscalationDesk):
+    """Real desk object; dispatch records instead of sending."""
+
+    def __init__(
+        self, runtime: MasterRuntime, dispatched: list[tuple[str, str]]
+    ) -> None:
+        super().__init__(
+            runtime.desk.queue,
+            runtime.desk.panes,
+            runtime.registry,
+            runtime.link,
+            runtime.emit,
+        )
+        self.dispatched = dispatched
+
+    async def dispatch(self, escalation_id: str, decision: str) -> ControlResult:
+        self.dispatched.append((escalation_id, decision))
+        return ControlResult(True, "dispatched")
+
+
 class RecordingRuntime(MasterRuntime):
     """Real runtime object; session-control methods record instead of act."""
 
@@ -65,19 +91,16 @@ class RecordingRuntime(MasterRuntime):
         )
         self.spawned: list[tuple[str, str]] = []
         self.dispatched: list[tuple[str, str]] = []
+        self.desk = RecordingDesk(self, self.dispatched)
         self.sent: list[tuple[str, str]] = []
 
-    async def spawn_session(self, intent: str, cwd: str) -> str:
+    async def spawn_session(self, intent: str, cwd: str) -> ControlResult:
         self.spawned.append((intent, cwd))
-        return "spawned"
+        return ControlResult(True, "spawned")
 
-    async def dispatch(self, escalation_id: str, decision: str) -> str:
-        self.dispatched.append((escalation_id, decision))
-        return "dispatched"
-
-    async def send_prompt(self, session_id: str, text: str) -> str:
+    async def send_prompt(self, session_id: str, text: str) -> ControlResult:
         self.sent.append((session_id, text))
-        return "sent"
+        return ControlResult(True, "sent")
 
 
 class FakeLLM:
@@ -232,7 +255,7 @@ async def test_intent_passes_through_unrewritten(
 async def test_decision_dispatches_with_active_escalation(
     runtime: RecordingRuntime,
 ) -> None:
-    runtime.queue.accept(ESCALATION)
+    runtime.desk.queue.accept(ESCALATION)
     fake = FakeLLM(
         [
             TurnResult(
@@ -257,7 +280,7 @@ async def test_decision_dispatches_with_active_escalation(
 async def test_escalation_block_is_byte_identical(
     runtime: RecordingRuntime,
 ) -> None:
-    runtime.queue.accept(ESCALATION)
+    runtime.desk.queue.accept(ESCALATION)
     fake = FakeLLM([TurnResult(text="ok")])
     master = make_master(runtime, fake)
     await master.handle_developer_message("what is s1 waiting on?")
@@ -270,8 +293,8 @@ async def test_escalation_block_is_byte_identical(
 async def test_open_permission_pane_reaches_llm_context(
     runtime: RecordingRuntime,
 ) -> None:
-    runtime.queue.accept(ESCALATION)
-    runtime.panes.accept(PERMISSION_ESCALATION)
+    runtime.desk.queue.accept(ESCALATION)
+    runtime.desk.panes.accept(PERMISSION_ESCALATION)
     fake = FakeLLM([TurnResult(text="ok")])
     master = make_master(runtime, fake)
     await master.handle_developer_message("what is s1 waiting on?")
@@ -281,7 +304,7 @@ async def test_open_permission_pane_reaches_llm_context(
     assert render_escalation(ESCALATION) in texts
     assert (
         render_permission_escalation(
-            PERMISSION_ESCALATION, runtime.pane_of("s1")
+            PERMISSION_ESCALATION, runtime.desk.pane_of("s1")
         )
         in texts
     )
@@ -290,13 +313,15 @@ async def test_open_permission_pane_reaches_llm_context(
 async def test_question_escalation_is_its_own_block_never_the_active_one(
     runtime: RecordingRuntime,
 ) -> None:
-    runtime.queue.accept(ESCALATION)
-    runtime.panes.accept(QUESTION_ESCALATION)
+    runtime.desk.queue.accept(ESCALATION)
+    runtime.desk.panes.accept(QUESTION_ESCALATION)
     fake = FakeLLM([TurnResult(text="ok")])
     master = make_master(runtime, fake)
     await master.handle_developer_message("what is waiting?")
     texts = _block_texts(fake.calls[0])
-    rendered = render_question_escalation(QUESTION_ESCALATION, runtime.pane_of("s2"))
+    rendered = render_question_escalation(
+        QUESTION_ESCALATION, runtime.desk.pane_of("s2")
+    )
     header = texts.index("# Open question escalation — session s2")
     assert texts[header + 1] == rendered
     active = texts.index("# Active escalation")
@@ -307,8 +332,8 @@ async def test_question_escalation_is_its_own_block_never_the_active_one(
 async def test_llm_context_carries_only_the_surfaced_head(
     runtime: RecordingRuntime,
 ) -> None:
-    runtime.queue.accept(ESCALATION)
-    runtime.queue.accept(WAITING_ESCALATION)
+    runtime.desk.queue.accept(ESCALATION)
+    runtime.desk.queue.accept(WAITING_ESCALATION)
     fake = FakeLLM([TurnResult(text="ok")])
     master = make_master(runtime, fake)
     await master.handle_developer_message("status?")
@@ -333,6 +358,28 @@ async def test_pending_proposal_reaches_llm_context(
     texts = _block_texts(fake.calls[0])
     assert any("p1" in t for t in texts)  # the id the tool needs
     assert render_proposal(PROPOSAL) in texts  # verbatim, its own block
+
+
+async def test_refused_tool_is_an_error_result_and_the_turn_goes_on(
+    runtime: RecordingRuntime,
+) -> None:
+    fake = FakeLLM(
+        [
+            TurnResult(
+                tool_calls=[
+                    ToolCall(name="stop_session", input={"session_id": "ghost"})
+                ]
+            ),
+            TurnResult(text="there is no session ghost"),
+        ]
+    )
+    master = make_master(runtime, fake)
+    reply = await master.handle_developer_message("stop ghost")
+    assert reply == "there is no session ghost"
+    messages = cast(list[dict[str, Any]], fake.calls[1]["messages"])
+    tool_result = cast(list[dict[str, Any]], messages[-1]["content"])[0]
+    assert tool_result["is_error"] is True
+    assert "ghost" in tool_result["content"]
 
 
 async def test_tool_loop_terminates_at_cap(
@@ -458,3 +505,44 @@ def test_clarify_escalation_args_are_closed() -> None:
         ClarifyEscalationArgs.model_validate(
             {"escalation_id": "e1", "question": "q", "decision": "B"}
         )
+
+
+@dataclass
+class _FakeBlock:
+    type: str
+    text: str = ""
+
+
+class _FakeResponse:
+    def __init__(self) -> None:
+        self.stop_reason = "end_turn"
+        self.content = [_FakeBlock(type="text", text="ok")]
+        self._request_id = "req_test"
+
+
+class _FakeMessages:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any) -> _FakeResponse:
+        self.calls.append(kwargs)
+        return _FakeResponse()
+
+
+class _FakeClient:
+    def __init__(self, messages: _FakeMessages) -> None:
+        self.messages = messages
+
+
+async def test_bind_call_turn_passes_the_master_timeout() -> None:
+    messages = _FakeMessages()
+    llm_call = bind_call_turn(cast(Any, _FakeClient(messages)))
+    await llm_call(
+        model="test-model",
+        max_tokens=8192,
+        system=[],
+        messages=[],
+        tools=[],
+        tool_choice=AUTO_ONE,
+    )
+    assert messages.calls[0]["timeout"] == MASTER_CALL_TIMEOUT_S

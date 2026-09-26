@@ -15,7 +15,6 @@ MISMATCH is a prompt to look, not a failure.
 """
 
 import asyncio
-import functools
 import os
 import sys
 import textwrap
@@ -28,7 +27,7 @@ from broker.calibration.schemas import (
     QuestionSet,
 )
 from broker.config import BrokerConfig, ClassifierConfig, SessionModelConfig
-from broker.llm import LLMCallError, build_client, call_tool
+from broker.llm import LLMCallError, build_client
 from broker.permission.classifier import (
     AllowCall,
     PermissionCallError,
@@ -38,7 +37,7 @@ from broker.permission.classifier import (
     classify,
     render_suggestions,
 )
-from broker.session.llm_stack import EscalateCall
+from broker.session.llm_stack import EscalateCall, bind_call_tool
 from broker.session.triage import AnswerCall, CompleteCall, NoActionCall, triage
 
 CALIBRATION_DIR = Path(__file__).parent.parent / "calibration-cases"
@@ -70,7 +69,7 @@ async def run_questions(cases: list[QuestionCase]) -> None:
     """Run the triage leg against the pinned session model."""
     cfg = BrokerConfig()
     model_cfg = SessionModelConfig(model_id=cfg.model_id, max_tokens=cfg.max_tokens)
-    caller = functools.partial(call_tool, build_client())
+    caller = bind_call_tool(build_client())
     print(f"questions ({model_cfg.model_id}): {len(cases)} cases")
     escalations = 0
     for case in cases:

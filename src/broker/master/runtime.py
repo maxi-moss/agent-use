@@ -1,55 +1,52 @@
-"""Master runtime layer: socket server, decision-escalation queue, open
-pane escalations, session spawn/stop, and dispatch with
-liveness-at-dispatch.
+"""Master runtime layer: socket server, message routing, session spawn,
+stop and control, and the fleet view published once per routed message or
+runtime tool call. Every escalation waiting on the developer belongs to
+``broker.master.escalation_desk``.
 
 Every broker → master message is ACKED with Response(ok=True/False): session
 brokers deliver upward messages via client.request and fail loud when nothing
-answers.
+answers. Every session-control tool returns a ``ControlResult``: an expected
+refusal, an unknown session included, is ``ok=False``, never an exception.
 """
 
 import asyncio
 import contextlib
+import functools
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from pathlib import Path
-from typing import Any
+from typing import Any, Concatenate
 
 from pydantic import ValidationError
 
 from broker import decision_log
-from broker.config import BrokerConfig, ResumedTask
+from broker.config import AdoptedSession, BrokerConfig, ResumedTask
 from broker.paths import BrokerPaths
 from broker.master import notifier
 from broker.master.broker_link import (
+    LINK_FAILURES,
     REQUEST_TIMEOUT_S,
     BrokerLink,
     adoption_fields,
     broker_is_listening,
 )
+from broker.master.control_result import ControlResult, refusal
+from broker.master.escalation_desk import EscalationDesk
 from broker.master.fleet_board import FleetBoard
 from broker.master.outcome import SessionOutcome, build_outcome
 from broker.master.viewmodel import (
     CompletionArrived,
-    EscalationArrived,
     EventSink,
     Notice,
-    PaneEscalationArrived,
     SessionStateChanged,
 )
 from broker.master.pane_escalations import PaneEscalations
-from broker.master.payload_render import (
-    PANE_UNKNOWN,
-    pane_label,
-    render_escalation,
-    render_pane_escalation,
-)
-from broker.master.queue import EscalationProtocolViolation, EscalationQueue
+from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry, SessionRecord
 from broker.protocol.constants import (
     ABSORBING_STATES,
     SETTLED_STATES,
     NackCode,
-    PaneKind,
     SessionState,
     T_BUDGET_UPDATE,
     T_COMPLETION,
@@ -68,23 +65,15 @@ from broker.protocol.constants import (
 from broker.protocol.schemas import (
     MASTER_SOCKET_PAYLOADS,
     ApprovePromptPayload,
-    ClarifyEscalationReplyPayload,
-    ClarifyEscalationRequestPayload,
     BudgetUpdatePayload,
     CompletionPayload,
-    DecisionDeliveredPayload,
     DecisionLogPayload,
     DecisionLogRequestPayload,
-    DecisionUndeliveredPayload,
-    DispatchDecisionPayload,
     Envelope,
     EscalationPayload,
-    EscalationRetractPayload,
     FatalErrorPayload,
     LiveStatusPayload,
     NackPayload,
-    PaneEscalationPayload,
-    PaneRetractPayload,
     PermissionEscalationPayload,
     PermissionLogPayload,
     PermissionLogRequestPayload,
@@ -97,25 +86,44 @@ from broker.protocol.schemas import (
     SessionEndedPayload,
     StatusPayload,
     StatusRequestPayload,
+    WireMessage,
     nack_response,
-    parse_nack,
 )
 from broker.protocol.server import serve_unix
 
 logger = logging.getLogger(__name__)
 
-# The broker runs an LLM call before it can reply, so this is far longer than
-# REQUEST_TIMEOUT_S and must exceed the broker's own CLARIFY_TIMEOUT_S.
-CLARIFY_ESCALATION_TIMEOUT_S = 60.0
-
 _Handler = Callable[[str, Any], Awaitable[NackPayload | None]]
 
 # Failures the on-demand status probe absorbs into a warning line: a session
 # that cannot be reached must not fail the whole listing.
-PROBE_FAILURES = (OSError, ConnectionError, TimeoutError, ValidationError)
+PROBE_FAILURES = (*LINK_FAILURES, ValidationError)
+
+
+def _publishes[**P, R](
+    method: Callable[Concatenate["MasterRuntime", P], Coroutine[Any, Any, R]],
+) -> Callable[Concatenate["MasterRuntime", P], Coroutine[Any, Any, R]]:
+    """Publish the fleet view and surface the head once ``method`` finishes."""
+
+    @functools.wraps(method)
+    async def wrapper(self: "MasterRuntime", *args: P.args, **kwargs: P.kwargs) -> R:
+        try:
+            return await method(self, *args, **kwargs)
+        finally:
+            self.board.publish()
+            await self.desk.surface_head()
+
+    return wrapper
 
 
 class MasterRuntime:
+    """Routes broker messages and runs the developer's session-control tools.
+
+    Every connection handler runs concurrently with the LLM tool loop, so
+    state read before an ``await`` is re-read after it, and markers are set
+    before the send they guard.
+    """
+
     def __init__(
         self,
         emit: EventSink,
@@ -143,8 +151,6 @@ class MasterRuntime:
         self.registry = registry
         self.cfg = cfg
         self.anchor_pane = anchor_pane
-        self.queue = queue
-        self.panes = panes
         self.paths = BrokerPaths(cfg.broker_home)
         self.master_socket_path = self.paths.master_socket
         self.link = BrokerLink(
@@ -155,20 +161,21 @@ class MasterRuntime:
             self._on_broker_exit,
         )
         self.board = FleetBoard(registry, queue, panes, cfg.budget_max, emit)
+        self.desk = EscalationDesk(queue, panes, registry, self.link, emit)
         self._serve_task: asyncio.Task[None] | None = None
         self._handlers: dict[str, _Handler] = {
-            T_ESCALATION: self._on_escalation,
-            T_PANE_ESCALATION: self._on_pane_escalation,
+            T_ESCALATION: self.desk.accept,
+            T_PANE_ESCALATION: self.desk.accept_pane,
             T_COMPLETION: self._on_completion,
             T_SESSION_ENDED: self._on_session_ended,
             T_FATAL_ERROR: self._on_fatal_error,
-            T_ESCALATION_RETRACT: self._on_escalation_retract,
-            T_PANE_RETRACT: self._on_pane_retract,
+            T_ESCALATION_RETRACT: self.desk.retract,
+            T_PANE_RETRACT: self.desk.retract_pane,
             T_PROMPT_UNDELIVERED: self._on_prompt_undelivered,
             T_PROMPT_PROPOSAL: self._on_prompt_proposal,
             T_BUDGET_UPDATE: self._on_budget_update,
-            T_DECISION_DELIVERED: self._on_decision_delivered,
-            T_DECISION_UNDELIVERED: self._on_decision_undelivered,
+            T_DECISION_DELIVERED: self.desk.delivered,
+            T_DECISION_UNDELIVERED: self.desk.undelivered,
             T_LIVE_STATUS: self._on_live_status,
         }
 
@@ -203,14 +210,14 @@ class MasterRuntime:
         # A head or open pane escalation loaded from disk has never been
         # announced in this process, so each is announced here, exactly once.
         self.board.publish()
-        await self._surface_head()
-        for prompt in self.panes.in_session_order():
-            await self._announce_pane_escalation(prompt)
+        await self.desk.surface_head()
+        await self.desk.announce_open_panes()
         server = await serve_unix(self.master_socket_path, self.handle)
         await self._repopulate_from_brokers()
         async with server:
             await server.serve_forever()
 
+    @_publishes
     async def _repopulate_from_brokers(self) -> None:
         """Refresh state, task-activity and any pending proposal from each surviving broker."""
 
@@ -223,7 +230,6 @@ class MasterRuntime:
                 continue
             if status.pending_proposal is not None:
                 self.board.register_proposal(name, status.pending_proposal)
-        self.board.publish()
 
     async def handle(self, env: Envelope) -> Response:
         """Handle one inbound envelope, turning any failure into a NACK.
@@ -290,57 +296,26 @@ class MasterRuntime:
             )
             self.emit(Notice(msg))
             return nack_response(env, msg, NackCode.UNKNOWN_SESSION)
+        return await self._route(env, session_id, payload)
+
+    @_publishes
+    async def _route(
+        self, env: Envelope, session_id: str, payload: WireMessage
+    ) -> Response:
+        """Run an accepted message's handler.
+
+        Args:
+            env: Envelope the message arrived in.
+            session_id: Registered session that sent it.
+            payload: The validated message.
+
+        Returns:
+            The ACK once handled, otherwise the NACK carrying the refusal.
+        """
         refusal = await self._handlers[env.type](session_id, payload)
         if refusal is not None:
             return nack_response(env, refusal.error, refusal.reason_code)
         return Response(id=env.id, ok=True)
-
-    async def _on_escalation(
-        self, session_id: str, p: EscalationPayload
-    ) -> NackPayload | None:
-        """Queue one escalation and surface it if it is next.
-
-        Args:
-            session_id: Session that raised the escalation.
-            p: The escalation.
-
-        Returns:
-            ``None`` once queued, otherwise the refusal.
-        """
-        try:
-            self.queue.accept(p)
-        except EscalationProtocolViolation as exc:
-            self.emit(Notice(f"PROTOCOL VIOLATION: {exc}"))
-            return NackPayload(
-                error=str(exc), reason_code=NackCode.PROTOCOL_VIOLATION
-            )
-        self.board.publish()
-        await self._surface_head()
-        return None
-
-    async def _on_pane_escalation(
-        self, session_id: str, p: PaneEscalationPayload
-    ) -> NackPayload | None:
-        """Hold one pane escalation, superseding its predecessor, and announce it.
-
-        Args:
-            session_id: Session whose pane shows the native prompt.
-            p: The pane escalation.
-
-        Returns:
-            ``None``; a pane escalation is never refused.
-        """
-        superseded = self.panes.accept(p)
-        if superseded is not None:
-            self.emit(
-                Notice(
-                    f"{p.kind} escalation {superseded.escalation_id} from "
-                    f"session {session_id} superseded by {p.escalation_id}"
-                )
-            )
-        self.board.publish()
-        await self._announce_pane_escalation(p)
-        return None
 
     async def _on_completion(
         self, session_id: str, p: CompletionPayload
@@ -380,63 +355,14 @@ class MasterRuntime:
         )
         # An errored session can no longer answer; its escalations would
         # otherwise wedge the queue, undispatchable to a dead session.
-        await self._retract_stranded_escalation(session_id)
-        self._retract_stranded_pane_escalations(session_id)
+        await self.desk.retract_stranded(session_id)
+        self.desk.retract_stranded_panes(session_id)
         await notifier.notify_or_notice(
             self.emit,
             notifier.notify_request,
             f"Session {session_id} failed",
             f"{p.error_class}: {p.detail}",
         )
-        return None
-
-    async def _on_escalation_retract(
-        self, session_id: str, p: EscalationRetractPayload
-    ) -> NackPayload | None:
-        """Clear a decision escalation its session resolved out of band.
-
-        Args:
-            session_id: Session that withdrew the escalation.
-            p: The escalation withdrawn and why.
-
-        Returns:
-            ``None``; a retract is never refused.
-        """
-        cleared = self.queue.retract(p.escalation_id)
-        if cleared is not None and cleared.was_surfaced:
-            # It was surfaced, so the developer must learn it is no longer
-            # live; a waiting entry they never saw retracts silently.
-            self.emit(
-                Notice(
-                    f"escalation {p.escalation_id} from session {session_id} "
-                    f"retracted: {p.reason}"
-                )
-            )
-        self.board.publish()
-        await self._surface_head()
-        return None
-
-    async def _on_pane_retract(
-        self, session_id: str, p: PaneRetractPayload
-    ) -> NackPayload | None:
-        """Clear a pane escalation whose native prompt is no longer open.
-
-        Args:
-            session_id: Session whose prompt closed.
-            p: The pane escalation withdrawn and why.
-
-        Returns:
-            ``None``; a retract is never refused.
-        """
-        cleared = self.panes.retract(p.escalation_id)
-        if cleared is not None:
-            self.emit(
-                Notice(
-                    f"{cleared.kind} escalation {p.escalation_id} from session "
-                    f"{session_id} retracted: {p.reason}"
-                )
-            )
-            self.board.publish()
         return None
 
     async def _on_prompt_undelivered(
@@ -472,7 +398,6 @@ class MasterRuntime:
             ``None``; a proposal is never refused.
         """
         self.board.register_proposal(session_id, p)
-        self.board.publish()
         return None
 
     async def _on_budget_update(
@@ -490,7 +415,6 @@ class MasterRuntime:
         record = self.registry.get(session_id)
         record.budget_count = p.count
         self.registry.upsert(record)
-        self.board.publish()
         return None
 
     async def _on_live_status(
@@ -505,58 +429,14 @@ class MasterRuntime:
         Returns:
             ``None``; an absorbed session's push is ACKed and ignored.
         """
-        if not self.board.apply_live_status(session_id, p):
-            return None
-        if not self._set_state(session_id, p.state):
-            self.board.publish()  # activity/perm-only change
+        if self.board.apply_live_status(session_id, p):
+            self._set_state(session_id, p.state)
         return None
-
-    async def _surface_head(self) -> None:
-        """Render, announce and notify the queue's head, exactly once."""
-        head = self.queue.take_unsurfaced_head()
-        if head is None:
-            return
-        self.emit(
-            EscalationArrived(
-                head.session_id,
-                head.escalation_id,
-                head.disclosure.escalation_title,
-                render_escalation(head),
-            )
-        )
-        await notifier.notify_or_notice(
-            self.emit,
-            notifier.notify_request,
-            f"Escalation from session {head.session_id}",
-            head.disclosure.what_was_asked,
-        )
-
-    async def _announce_pane_escalation(self, p: PaneEscalationPayload) -> None:
-        """Render, announce and notify one open pane escalation."""
-        pane_id = self.pane_of(p.session_id)
-        self.emit(
-            PaneEscalationArrived(
-                p.kind,
-                p.session_id,
-                p.escalation_id,
-                render_pane_escalation(p, pane_id),
-            )
-        )
-        title = (
-            f"Permission prompt in session {p.session_id}"
-            if p.kind == PaneKind.PERMISSION
-            else f"Question in session {p.session_id}"
-        )
-        await notifier.notify_or_notice(
-            self.emit,
-            notifier.notify_request,
-            title,
-            f"{pane_label(p)} — answer it in pane {pane_id}",
-        )
 
     # ── session control (LLM-layer tool implementations) ─────────────────────
 
-    async def spawn_session(self, intent: str, cwd: str) -> str:
+    @_publishes
+    async def spawn_session(self, intent: str, cwd: str) -> ControlResult:
         """Spawn a session broker for ``cwd`` and register it.
 
         Args:
@@ -565,14 +445,12 @@ class MasterRuntime:
             cwd: Working directory for the session; must already exist.
 
         Returns:
-            A confirmation line naming the session, its pid and its cwd.
-
-        Raises:
-            ValueError: ``cwd`` is not an existing directory.
+            A confirmation naming the session, its pid and its cwd, or the
+            refusal when ``cwd`` is not an existing directory.
         """
         cwd_path = Path(cwd).resolve()
         if not cwd_path.is_dir():
-            raise ValueError(f"cwd does not exist: {cwd}")
+            return refusal(self.emit, f"cwd does not exist: {cwd}")
         name = self.registry.allocate_name()
         record = SessionRecord(
             name=name,
@@ -584,10 +462,12 @@ class MasterRuntime:
         pid = await self.link.spawn(record, adopt=None, resume=None)
         self.registry.upsert(record)
         self.emit(SessionStateChanged(name, record.state))
-        self.board.publish()
-        return f"spawned session {name} (pid {pid}) in {cwd_path}"
+        return ControlResult(True, f"spawned session {name} (pid {pid}) in {cwd_path}")
 
-    async def reassign_session(self, session_id: str, intent: str) -> str:
+    @_publishes
+    async def reassign_session(
+        self, session_id: str, intent: str
+    ) -> ControlResult:
         """Hand a live session to a freshly spawned broker with a new task.
 
         The Claude session, its pane and its transcript survive; only the
@@ -600,33 +480,47 @@ class MasterRuntime:
             intent: Raw developer intent for the new task.
 
         Returns:
-            A confirmation line naming the session and the new broker's pid.
-
-        Raises:
-            KeyError: The session ended while this call was in flight.
-            ValueError: The registry does not know the session's pane, Claude
-                session id or transcript path.
-            RuntimeError: A broker is still answering on the session socket.
+            A confirmation naming the session and the new broker's pid, or the
+            refusal: the session is unknown or ended while this call was in
+            flight, the registry does not know its pane, Claude session id or
+            transcript path, or a broker still answers on its socket.
         """
-        record = self.registry.get(session_id)
+        record = self._lookup(session_id)
+        if isinstance(record, ControlResult):
+            return record
         # BEFORE anything is torn down: an unreassignable session must not be
         # left with its old broker killed and no replacement.
-        adopt = adoption_fields(record)
-        await self.stop_session(session_id)
-        record = self.registry.get(session_id)  # KeyError if ended meanwhile
-        await self.link.require_socket_free(record)
-        record = self.registry.get(session_id)  # KeyError if ended meanwhile
+        adopt = self._adoption(record)
+        if isinstance(adopt, ControlResult):
+            return adopt
+        stopped = await self._stop(record)
+        if not stopped.ok:
+            return stopped
+        record = self._lookup(session_id)
+        if isinstance(record, ControlResult):
+            return record
+        busy = await self.link.require_socket_free(record)
+        if busy is not None:
+            return refusal(self.emit, busy)
+        record = self._lookup(session_id)
+        if isinstance(record, ControlResult):
+            return record
         record.intent = intent
         record.approved_prompt = None  # superseded; set again on approval
         record.title = ""
         record.budget_count = 0
         pid = await self.link.spawn(record, adopt=adopt, resume=None)
-        record = self.registry.get(session_id)  # KeyError if ended meanwhile
+        record = self._lookup(session_id)
+        if isinstance(record, ControlResult):
+            return record
         self.registry.upsert(record)
         self._set_state(session_id, SessionState.SPAWNING)
-        return f"session {session_id} reassigned to a new broker (pid {pid})"
+        return ControlResult(
+            True, f"session {session_id} reassigned to a new broker (pid {pid})"
+        )
 
-    async def attach_session(self, session_id: str) -> str:
+    @_publishes
+    async def attach_session(self, session_id: str) -> ControlResult:
         """Bind a fresh broker to a session whose own broker is gone.
 
         A pure resume: the persisted approved prompt and budget count carry
@@ -639,53 +533,64 @@ class MasterRuntime:
             session_id: Registry name of the session to reattach.
 
         Returns:
-            A confirmation line naming the session and the new broker's pid.
-
-        Raises:
-            KeyError: No such session — a session whose pane was found gone is
-                removed from the registry, so there is nothing left to attach.
-            ValueError: The registry only partly knows the session, or no
-                approved prompt was ever persisted for it.
-            RuntimeError: A broker is still answering on the session socket.
+            A confirmation naming the session and the new broker's pid, or the
+            refusal: no such session (a session whose pane was found gone is
+            removed from the registry, so there is nothing left to attach), the
+            registry only partly knows it, no approved prompt was ever
+            persisted for it, or a broker still answers on its socket.
         """
-        record = self.registry.get(session_id)  # KeyError if gone or unknown
+        record = self._lookup(session_id)
+        if isinstance(record, ControlResult):
+            return record
         # Every refusal fires before any side effect.
-        adopt = adoption_fields(record)
+        adopt = self._adoption(record)
+        if isinstance(adopt, ControlResult):
+            return adopt
         if record.approved_prompt is None:
-            raise ValueError(
+            return refusal(
+                self.emit,
                 f"session {session_id} has no persisted approved prompt to "
                 "resume — its broker died before a prompt was approved. Use "
-                "reassign_session with a new task instead."
+                "reassign_session with a new task instead.",
             )
         # One probe, never a poll: nothing was stopped, so waiting cannot
         # free the socket. Anything alive or ambiguous refuses.
         if await broker_is_listening(Path(record.socket_path)):
-            raise RuntimeError(
+            return refusal(
+                self.emit,
                 f"session {session_id}: a broker is still answering on "
-                f"{record.socket_path} — refusing to attach"
+                f"{record.socket_path} — refusing to attach",
             )
         # ``record`` stays bound to the same registry object throughout (a
-        # concurrent upsert mutates it in place); each re-`get` below is only
+        # concurrent upsert mutates it in place); each lookup below is only
         # a liveness check, so the ``approved_prompt`` narrowing above holds.
-        self.registry.get(session_id)  # KeyError if ended meanwhile
+        if isinstance(gone := self._lookup(session_id), ControlResult):
+            return gone
         # The dead broker's stranded escalations, of both kinds: a decision
         # dispatched to one would be discarded, and a live entry would refuse
         # the resumed broker's first raise. It re-raises if the situation
         # still holds.
-        await self._retract_stranded_escalation(session_id)
-        self.registry.get(session_id)  # KeyError if ended meanwhile
-        self._retract_stranded_pane_escalations(session_id)
+        await self.desk.retract_stranded(session_id)
+        if isinstance(gone := self._lookup(session_id), ControlResult):
+            return gone
+        self.desk.retract_stranded_panes(session_id)
         resume = ResumedTask(
             approved_prompt=record.approved_prompt,
             completed=record.state == SessionState.COMPLETED,
         )
         pid = await self.link.spawn(record, adopt=adopt, resume=resume)
-        self.registry.get(session_id)  # KeyError if ended meanwhile
+        if isinstance(gone := self._lookup(session_id), ControlResult):
+            return gone
         self.registry.upsert(record)
         self._set_state(session_id, SessionState.SPAWNING)
-        return f"session {session_id} reattached to a new broker (pid {pid})"
+        return ControlResult(
+            True, f"session {session_id} reattached to a new broker (pid {pid})"
+        )
 
-    async def reactivate_session(self, session_id: str, intent: str) -> str:
+    @_publishes
+    async def reactivate_session(
+        self, session_id: str, intent: str
+    ) -> ControlResult:
         """Give a completed session a new task without replacing its broker.
 
         Args:
@@ -693,28 +598,31 @@ class MasterRuntime:
             intent: Raw developer intent for the new task.
 
         Returns:
-            A confirmation line, or a rejection when the session is not
-            completed and so has a task it is still driving.
+            A confirmation, or the refusal: the session is unknown, never
+            replied, or is not completed and so has a task it is still driving.
         """
-        record = self.registry.get(session_id)
+        record = self._lookup(session_id)
+        if isinstance(record, ControlResult):
+            return record
         rejected = await self.link.deliver(
             record,
             ReactivatePayload(intent=intent),
             rejection=f"session {session_id} refused reactivation",
         )
         if rejected is not None:
-            self.emit(Notice(rejected))
-            return rejected
+            return refusal(self.emit, rejected)
         record.intent = intent
         record.approved_prompt = None  # superseded; set again on approval
         record.title = ""
         self.registry.upsert(record)
-        self.board.publish()
-        return f"session {session_id} reactivated — grounding the new task"
+        return ControlResult(
+            True, f"session {session_id} reactivated — grounding the new task"
+        )
 
+    @_publishes
     async def approve_prompt(
         self, proposal_id: str, prompt: str, title: str
-    ) -> str:
+    ) -> ControlResult:
         """Approve a pending prompt proposal and send it to its session.
 
         Args:
@@ -724,15 +632,18 @@ class MasterRuntime:
             title: Short task label shown next to the session in the fleet.
 
         Returns:
-            An outcome line: approved, unknown proposal, or rejected as stale.
+            Approved, or the refusal: an unknown proposal or session, no reply,
+            or rejected as stale.
         """
         pending = self.board.proposals.get(proposal_id)
         if pending is None:
-            msg = f"unknown proposal {proposal_id!r} — nothing approved"
-            self.emit(Notice(msg))
-            return msg
+            return refusal(
+                self.emit, f"unknown proposal {proposal_id!r} — nothing approved"
+            )
         name = pending.session_id
-        record = self.registry.get(name)
+        record = self._lookup(name)
+        if isinstance(record, ControlResult):
+            return record
         rejected = await self.link.deliver(
             record,
             ApprovePromptPayload(proposal_id=proposal_id, prompt=prompt),
@@ -742,215 +653,15 @@ class MasterRuntime:
             ),
         )
         if rejected is not None:
-            self.emit(Notice(rejected))
-            return rejected
+            return refusal(self.emit, rejected)
         del self.board.proposals[proposal_id]
         record.approved_prompt = prompt  # the AUTHORITATIVE intent
         record.title = title
         self.registry.upsert(record)
-        self.board.publish()
-        return f"prompt approved for session {name}"
+        return ControlResult(True, f"prompt approved for session {name}")
 
-    async def dispatch(self, escalation_id: str, decision: str) -> str:
-        """Dispatch a decision to the session whose escalation it answers.
-
-        Args:
-            escalation_id: The escalation the decision answers.
-            decision: The developer's decision, sent verbatim.
-
-        Returns:
-            An outcome line: dispatched to the named session, a refusal
-            naming the escalation that is no longer live, a refusal naming the
-            pane when the escalation is a pane escalation, a refusal when a
-            decision is already in flight for it, or a rejection if the session
-            NACKed delivery.
-        """
-        refused = self._pane_escalation_refusal(
-            escalation_id, "decision NOT dispatched"
-        )
-        if refused is not None:
-            return refused
-        # Liveness is checked THE INSTANT before the write, not at
-        # surface time. A stale dispatch is the worst failure this system
-        # can produce.
-        active = self.queue.active
-        if active is None or active.escalation_id != escalation_id:
-            msg = (
-                f"decision NOT dispatched — escalation {escalation_id} is "
-                "no longer live"
-            )
-            self.emit(Notice(msg))
-            return msg
-        inflight = self.queue.inflight
-        if inflight is not None:
-            # A decision is already on its way to the pane; a second would
-            # double-submit the same escalation.
-            msg = (
-                f"decision NOT dispatched — a decision for escalation "
-                f"{inflight} is already being delivered"
-            )
-            self.emit(Notice(msg))
-            return msg
-        record = self.registry.get(active.session_id)
-        # The ACK only confirms the broker accepted the decision; resolution
-        # waits for T_DECISION_DELIVERED, and until then no second decision
-        # may be dispatched. The marker is set before the send because that
-        # reply can be handled before the ACK returns.
-        self.queue.mark_inflight(escalation_id)
-        try:
-            rejected = await self.link.deliver(
-                record,
-                DispatchDecisionPayload(
-                    escalation_id=escalation_id, response=decision
-                ),
-                rejection=(
-                    f"session {record.name} rejected the dispatched decision "
-                    f"for escalation {escalation_id} (stale)"
-                ),
-            )
-        except BaseException:
-            self.queue.clear_inflight(escalation_id)
-            raise
-        if rejected is not None:
-            self.queue.clear_inflight(escalation_id)
-            self.emit(Notice(rejected))
-            return rejected
-        self.board.publish()
-        return f"decision dispatched to session {record.name}"
-
-    def _pane_escalation_refusal(self, escalation_id: str, lead: str) -> str | None:
-        """Refuse a master action aimed at a pane escalation, naming the pane.
-
-        Args:
-            escalation_id: The escalation the action targets.
-            lead: Opening words of the refusal, naming what was not sent.
-
-        Returns:
-            The refusal, already shown to the developer, or ``None`` when
-            ``escalation_id`` is not an open pane escalation.
-        """
-        prompt = self.panes.find(escalation_id)
-        if prompt is None:
-            return None
-        what = (
-            "a permission prompt"
-            if prompt.kind == PaneKind.PERMISSION
-            else "an AskUserQuestion menu"
-        )
-        msg = (
-            f"{lead} — escalation {escalation_id} is {what} in session "
-            f"{prompt.session_id}. The developer answers it in pane "
-            f"{self.pane_of(prompt.session_id)}."
-        )
-        self.emit(Notice(msg))
-        return msg
-
-    async def _on_decision_delivered(
-        self, session_id: str, p: DecisionDeliveredPayload
-    ) -> NackPayload | None:
-        """Resolve an escalation now that its decision reached the pane.
-
-        Args:
-            session_id: Session that confirmed delivery.
-            p: The escalation whose decision landed.
-
-        Returns:
-            ``None``; a delivery report is never refused.
-        """
-        if self.queue.resolve(p.escalation_id) is not None:
-            # It was the live head: surface whatever is next. DRIVING is the
-            # broker's transition to report; the master never invents it.
-            self.board.publish()
-            await self._surface_head()
-        return None
-
-    async def _on_decision_undelivered(
-        self, session_id: str, p: DecisionUndeliveredPayload
-    ) -> NackPayload | None:
-        """Handle a dispatched decision that did not reach the pane.
-
-        Resolution waits for confirmed delivery, so the escalation was never
-        resolved: a still-live miss (a failed pane write) stays surfaced for a
-        re-decide, while a stale dispatch (the broker moved past it) drops the
-        now orphaned queue entry.
-
-        Args:
-            session_id: Session that reported the miss.
-            p: The escalation the decision answered, why it did not land, and
-                whether the broker still holds it live.
-
-        Returns:
-            ``None``; a miss report is never refused.
-        """
-        if p.still_live:
-            self.queue.clear_inflight(p.escalation_id)
-            self.emit(
-                Notice(
-                    f"decision for escalation {p.escalation_id} did NOT reach "
-                    f"session {session_id}: {p.detail}"
-                )
-            )
-            return None
-        cleared = self.queue.retract(p.escalation_id)
-        if cleared is not None and cleared.was_surfaced:
-            self.emit(
-                Notice(
-                    f"escalation {p.escalation_id} from session {session_id} "
-                    f"cleared: {p.detail}"
-                )
-            )
-        self.board.publish()
-        await self._surface_head()
-        return None
-
-    async def clarify_escalation(self, escalation_id: str, question: str) -> str:
-        """Relay a read-only question about the live escalation to its broker.
-
-        The escalation stays pending. The broker's answer is shown to the
-        developer verbatim (a Notice); this returns only an acknowledgement to
-        the tool loop, so the master never rewrites developer-facing text.
-
-        Args:
-            escalation_id: The escalation the question is about.
-            question: The developer's question, sent verbatim.
-
-        Returns:
-            An acknowledgement line, or a refusal naming why no answer was
-            obtained (not the head, a pane escalation, or the broker declined).
-        """
-        refused = self._pane_escalation_refusal(escalation_id, "question NOT sent")
-        if refused is not None:
-            return refused
-        active = self.queue.active
-        if active is None or active.escalation_id != escalation_id:
-            msg = f"question NOT sent — escalation {escalation_id} is no longer live"
-            self.emit(Notice(msg))
-            return msg
-        record = self.registry.get(active.session_id)
-        resp = await self.link.request(
-            record,
-            ClarifyEscalationRequestPayload(
-                escalation_id=escalation_id, question=question
-            ),
-            timeout_s=CLARIFY_ESCALATION_TIMEOUT_S,
-        )
-        if not resp.ok:
-            reason = parse_nack(resp).error
-            msg = (
-                f"no clarification from session {record.name} for escalation "
-                f"{escalation_id}"
-            )
-            if reason:
-                msg = f"{msg}: {reason}"
-            self.emit(Notice(msg))
-            return msg
-        answer = ClarifyEscalationReplyPayload.model_validate(resp.payload).answer
-        self.emit(
-            Notice(f"Session {record.name} on escalation {escalation_id}:\n\n{answer}")
-        )
-        return f"clarification from session {record.name} shown to the developer"
-
-    async def send_prompt(self, session_id: str, text: str) -> str:
+    @_publishes
+    async def send_prompt(self, session_id: str, text: str) -> ControlResult:
         """Send a developer prompt straight to a session.
 
         Args:
@@ -958,19 +669,21 @@ class MasterRuntime:
             text: Prompt text, sent verbatim.
 
         Returns:
-            A confirmation that the session accepted the prompt, or a
-            rejection carrying the session's reason if it NACKed.
+            A confirmation that the session accepted the prompt, or the
+            refusal: an unknown session, no reply, or the session's reason if
+            it NACKed.
         """
-        record = self.registry.get(session_id)
+        record = self._lookup(session_id)
+        if isinstance(record, ControlResult):
+            return record
         rejected = await self.link.deliver(
             record,
             SendPromptPayload(text=text),
             rejection=f"session {session_id} rejected the prompt",
         )
         if rejected is not None:
-            self.emit(Notice(rejected))
-            return rejected
-        return f"prompt accepted by session {session_id}"
+            return refusal(self.emit, rejected)
+        return ControlResult(True, f"prompt accepted by session {session_id}")
 
     async def probe_status(self, session_id: str) -> StatusPayload:
         """Ask a session for its status and record the state it reports.
@@ -991,10 +704,8 @@ class MasterRuntime:
         # A push applied during the await is newer than this reply.
         if self.board.push_count(session_id) != pushes:
             return status
-        if not self.board.apply_probed_status(session_id, status):
-            return status
-        if not self._set_state(session_id, status.state):
-            self.board.publish()
+        if self.board.apply_probed_status(session_id, status):
+            self._set_state(session_id, status.state)
         return status
 
     def build_session_outcome(self, session_id: str) -> SessionOutcome:
@@ -1020,77 +731,79 @@ class MasterRuntime:
             rows=rows,
         )
 
-    async def get_decision_log(self, session_id: str) -> str:
+    @_publishes
+    async def get_decision_log(self, session_id: str) -> ControlResult:
         """Fetch a session's decision log as text.
 
         Args:
             session_id: Registry name of the session to query.
 
         Returns:
-            The log text verbatim.
+            The log text verbatim, or the refusal: an unknown session, no
+            reply, or a NACK.
 
         Raises:
             ValidationError: The session's reply was not a decision log.
         """
-        record = self.registry.get(session_id)
-        resp = await self.link.request(
-            record, DecisionLogRequestPayload(), timeout_s=REQUEST_TIMEOUT_S
+        record = self._lookup(session_id)
+        if isinstance(record, ControlResult):
+            return record
+        reply = await self.link.query(
+            record,
+            DecisionLogRequestPayload(),
+            timeout_s=REQUEST_TIMEOUT_S,
+            rejection=f"session {session_id} refused its decision log",
         )
-        return DecisionLogPayload.model_validate(resp.payload).text
+        if isinstance(reply, str):
+            return refusal(self.emit, reply)
+        return ControlResult(
+            True, DecisionLogPayload.model_validate(reply.payload).text
+        )
 
-    async def get_permission_log(self, session_id: str) -> str:
+    @_publishes
+    async def get_permission_log(self, session_id: str) -> ControlResult:
         """Fetch a session's permission log as text.
 
         Args:
             session_id: Registry name of the session to query.
 
         Returns:
-            The log text verbatim.
+            The log text verbatim, or the refusal: an unknown session, no
+            reply, or a NACK.
 
         Raises:
             ValidationError: The session's reply was not a permission log.
         """
-        record = self.registry.get(session_id)
-        resp = await self.link.request(
-            record, PermissionLogRequestPayload(), timeout_s=REQUEST_TIMEOUT_S
+        record = self._lookup(session_id)
+        if isinstance(record, ControlResult):
+            return record
+        reply = await self.link.query(
+            record,
+            PermissionLogRequestPayload(),
+            timeout_s=REQUEST_TIMEOUT_S,
+            rejection=f"session {session_id} refused its permission log",
         )
-        return PermissionLogPayload.model_validate(resp.payload).text
+        if isinstance(reply, str):
+            return refusal(self.emit, reply)
+        return ControlResult(
+            True, PermissionLogPayload.model_validate(reply.payload).text
+        )
 
-    async def stop_session(self, session_id: str) -> str:
+    @_publishes
+    async def stop_session(self, session_id: str) -> ControlResult:
         """Shut a session broker down and mark it stopped.
 
         Args:
             session_id: Registry name of the session to stop.
 
         Returns:
-            A confirmation line naming the session.
-
-        Raises:
-            RuntimeError: The broker process outlived its terminate.
+            A confirmation naming the session, or the refusal: an unknown
+            session, or a broker process that outlived its terminate.
         """
-        await self.link.stop(self.registry.get(session_id))
-        self._retract_stranded_pane_escalations(session_id)
-        # A hard stop mid-delivery leaves no delivered/undelivered reply to
-        # clear the in-flight marker. Drop it for this session's own entry
-        # (the escalation itself is intentionally kept) so a re-dispatch is
-        # not refused as still being delivered.
-        self.queue.clear_inflight_for_session(session_id)
-        self._set_state(session_id, SessionState.STOPPED)
-        return f"session {session_id} stopped"
-
-    def pane_of(self, session_id: str) -> str:
-        """Return the pane holding a session, or ``PANE_UNKNOWN``.
-
-        Args:
-            session_id: Registry name of the session.
-
-        Returns:
-            The pane id, or ``PANE_UNKNOWN`` when the registry has none.
-        """
-        try:
-            return self.registry.get(session_id).pane_id or PANE_UNKNOWN
-        except KeyError:
-            return PANE_UNKNOWN
+        record = self._lookup(session_id)
+        if isinstance(record, ControlResult):
+            return record
+        return await self._stop(record)
 
     def registry_summary(self) -> str:
         """Render the registry summary for the LLM context and ``list_sessions``.
@@ -1111,7 +824,25 @@ class MasterRuntime:
             )
         return "\n".join(lines)
 
-    async def list_sessions(self) -> str:
+    @_publishes
+    async def probe_sessions(self) -> dict[str, Exception | None]:
+        """Probe every session for its live status.
+
+        Returns:
+            Each session's probe failure, or ``None`` for a session that
+            answered, in registry order.
+        """
+        failures: dict[str, Exception | None] = {}
+        for name in self.registry.names_in_order():
+            try:
+                await self.probe_status(name)
+            except PROBE_FAILURES as exc:
+                failures[name] = exc
+            else:
+                failures[name] = None
+        return failures
+
+    async def list_sessions(self) -> ControlResult:
         """Render the registry summary, probing each session for a live prompt.
 
         The prompt flag is refreshed by the probe and never enters the
@@ -1123,60 +854,56 @@ class MasterRuntime:
             could not be reached.
         """
         lines = [self.registry_summary()]
-        for name in self.registry.names_in_order():
-            try:
-                await self.probe_status(name)
-            except PROBE_FAILURES as exc:
+        for name, failure in (await self.probe_sessions()).items():
+            if failure is not None:
                 # An unreachable session costs one line of the listing, never
                 # the whole listing.
                 lines.append(
-                    f"- {name}: unreachable ({exc!r}) — could not read "
+                    f"- {name}: unreachable ({failure!r}) — could not read "
                     "whether it is sitting on a permission prompt"
                 )
                 continue
             if self.board.permission_prompt(name):
                 lines.append(
                     f"- {name}: sitting on a permission prompt, answered in "
-                    f"pane {self.pane_of(name)}"
+                    f"pane {self.desk.pane_of(name)}"
                 )
-        return "\n".join(lines)
+        return ControlResult(True, "\n".join(lines))
 
     # ── internals ────────────────────────────────────────────────────────────
 
-    async def _retract_stranded_escalation(self, session_id: str) -> None:
-        """Clear a queued decision escalation whose broker is gone.
+    def _lookup(self, session_id: str) -> SessionRecord | ControlResult:
+        """Return a session's record, or the refusal naming it unknown."""
+        record = self.registry.records.get(session_id)
+        if record is None:
+            return refusal(
+                self.emit, f"session {session_id!r} is not in the registry"
+            )
+        return record
+
+    def _adoption(self, record: SessionRecord) -> AdoptedSession | ControlResult:
+        """Return what a replacement broker adopts, or the refusal naming the gaps."""
+        try:
+            return adoption_fields(record)
+        except ValueError as exc:
+            return refusal(self.emit, str(exc))
+
+    async def _stop(self, record: SessionRecord) -> ControlResult:
+        """Shut a session's broker down and mark the session stopped.
 
         Args:
-            session_id: Session whose broker is gone.
-        """
-        cleared = self.queue.retract_for_session(session_id)
-        if cleared is None:
-            return
-        self.emit(
-            Notice(
-                f"escalation {cleared.payload.escalation_id} from session "
-                f"{session_id} retracted: its broker is gone"
-            )
-        )
-        self.board.publish()
-        await self._surface_head()
+            record: Registry record of the session to stop.
 
-    def _retract_stranded_pane_escalations(self, session_id: str) -> None:
-        """Clear the open pane escalations of a session whose broker is gone.
-
-        Args:
-            session_id: Session whose broker is gone.
+        Returns:
+            A confirmation naming the session, or the refusal: a broker process
+            that outlived its terminate.
         """
-        cleared = self.panes.retract_for_session(session_id)
-        for prompt in cleared:
-            self.emit(
-                Notice(
-                    f"{prompt.kind} escalation {prompt.escalation_id} from "
-                    f"session {session_id} retracted: its broker is gone"
-                )
-            )
-        if cleared:
-            self.board.publish()
+        still_running = await self.link.stop(record)
+        if still_running is not None:
+            return refusal(self.emit, still_running)
+        self.desk.session_stopped(record.name)
+        self._set_state(record.name, SessionState.STOPPED)
+        return ControlResult(True, f"session {record.name} stopped")
 
     async def _on_session_ended(
         self, session_id: str, p: SessionEndedPayload
@@ -1196,12 +923,11 @@ class MasterRuntime:
         # The broker exits without withdrawing its live escalations, so
         # retract them all — a stranded head would wedge the FIFO queue,
         # undispatchable to a gone session.
-        await self._retract_stranded_escalation(session_id)
-        self._retract_stranded_pane_escalations(session_id)
+        await self.desk.retract_stranded(session_id)
+        self.desk.retract_stranded_panes(session_id)
         self.emit(
             Notice(f"session {session_id} ended (/exit) — removed from the fleet")
         )
-        self.board.publish()
         return None
 
     def _on_broker_exit(self, name: str, returncode: int) -> None:
@@ -1221,17 +947,14 @@ class MasterRuntime:
             )
         )
         self._set_state(name, SessionState.UNMANAGED)
+        self.board.publish()
 
-    def _set_state(self, name: str, state: SessionState) -> bool:
+    def _set_state(self, name: str, state: SessionState) -> None:
         """Record a session's new state and tell the TUI, once per change.
 
         Args:
             name: Registry name of the session.
             state: New state to persist.
-
-        Returns:
-            ``True`` when the state changed, ``False`` when it was already
-            ``state`` or the session is unknown.
         """
         # No ``await`` may sit between this read and the upsert below, or two
         # interleaving handlers would read-modify-write clobber each other
@@ -1240,14 +963,12 @@ class MasterRuntime:
             record = self.registry.get(name)
         except KeyError:
             self.emit(Notice(f"message from unknown session {name!r}"))
-            return False
+            return
         if record.state == state:
-            return False
+            return
         logger.info("session %s: %s -> %s", name, record.state, state)
         record.state = state
         self.registry.upsert(record)  # sync; no await before this point
         if state in SETTLED_STATES | {SessionState.UNMANAGED}:
             self.board.settle(name)
         self.emit(SessionStateChanged(name, state))
-        self.board.publish()
-        return True

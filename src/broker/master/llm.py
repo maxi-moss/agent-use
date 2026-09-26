@@ -3,7 +3,8 @@
 Structural thin-master rule: the escalation block enters the context as the
 runtime-rendered string, byte-identical — this layer never sees a payload it
 could re-summarise. tool_choice is auto (never forced): the loop exits on a
-text-only response, and forced choice would suppress that text.
+text-only response, and forced choice would suppress that text. A refused
+tool call reaches the model as an ``is_error`` tool result and the turn goes on.
 
 Class names, field names, `Field` descriptions and docstrings of these models
 are sent to the model.
@@ -37,14 +38,16 @@ from broker.llm import (
     call_turn,
     strict_tool,
 )
-from broker.master.payload_render import (
-    render_escalation,
-    render_pane_escalation,
-    render_proposal,
-)
+from broker.master.control_result import ControlResult
+from broker.master.payload_render import render_proposal
 from broker.master.runtime import MasterRuntime
+from broker.protocol.constants import PaneKind
 
 MAX_TOOL_ROUNDS = 6
+
+# Named and bounded like every other wait (global rule); master-owned, not
+# shared with the session or permission call timeouts.
+MASTER_CALL_TIMEOUT_S = 60.0
 
 
 class SpawnSessionArgs(BaseModel):
@@ -132,7 +135,7 @@ class MasterTool[M: BaseModel]:
     name: str
     description: str
     model: type[M]
-    handler: Callable[[MasterRuntime, M], Awaitable[str]]
+    handler: Callable[[MasterRuntime, M], Awaitable[ControlResult]]
     activity: str  # dashboard phrase shown while the tool runs
 
 
@@ -161,7 +164,7 @@ _REGISTRY = (
         "Relay the developer's resolution of the active escalation to the "
         "owning session broker, unchanged.",
         DispatchDecisionArgs,
-        lambda rt, a: rt.dispatch(a.escalation_id, a.decision),
+        lambda rt, a: rt.desk.dispatch(a.escalation_id, a.decision),
         "dispatching a decision…",
     ),
     MasterTool(
@@ -173,7 +176,7 @@ _REGISTRY = (
         "not a resolution — use dispatch_decision when the developer actually "
         "decides.",
         ClarifyEscalationArgs,
-        lambda rt, a: rt.clarify_escalation(a.escalation_id, a.question),
+        lambda rt, a: rt.desk.clarify(a.escalation_id, a.question),
         "asking the session about an escalation…",
     ),
     MasterTool(
@@ -354,15 +357,17 @@ class MasterLLM:
                     on_activity(tool.activity)
                 outcome = await self._execute(call)
                 self.log.append(
-                    "tool", f"{call.name}({json.dumps(call.input)}) -> {outcome}"
+                    "tool",
+                    f"{call.name}({json.dumps(call.input)}) -> {outcome.text}",
                 )
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": ids[i],
-                        "content": outcome,
-                    }
-                )
+                tool_result: dict[str, Any] = {
+                    "type": "tool_result",
+                    "tool_use_id": ids[i],
+                    "content": outcome.text,
+                }
+                if not outcome.ok:
+                    tool_result["is_error"] = True
+                tool_results.append(tool_result)
             messages.append(
                 cast(MessageParam, {"role": "user", "content": tool_results})
             )
@@ -394,28 +399,24 @@ class MasterLLM:
                 + self.runtime.registry_summary(),
             }
         ]
-        active = self.runtime.queue.active
-        if active is not None:
+        head = self.runtime.desk.rendered_head()
+        if head is not None:
             blocks.append({"type": "text", "text": "# Active escalation"})
-            # Byte-identical to the runtime rendering — its own block, so
+            # Byte-identical to the desk's rendering — its own block, so
             # nothing is prepended to or reflowed around the broker's words.
-            blocks.append({"type": "text", "text": render_escalation(active)})
-        for prompt in self.runtime.panes.in_session_order():
-            blocks.append(
-                {
-                    "type": "text",
-                    "text": f"# Open {prompt.kind} escalation — session "
-                    + prompt.session_id,
-                }
-            )
-            blocks.append(
-                {
-                    "type": "text",
-                    "text": render_pane_escalation(
-                        prompt, self.runtime.pane_of(prompt.session_id)
-                    ),
-                }
-            )
+            blocks.append({"type": "text", "text": head})
+        for kind in PaneKind:
+            for session_id, rendered in self.runtime.desk.rendered_panes(
+                kind
+            ).items():
+                blocks.append(
+                    {
+                        "type": "text",
+                        "text": f"# Open {kind} escalation — session "
+                        + session_id,
+                    }
+                )
+                blocks.append({"type": "text", "text": rendered})
         for pending in self.runtime.board.pending_proposals():
             blocks.append(
                 {
@@ -441,7 +442,7 @@ class MasterLLM:
         )
         return [cast(MessageParam, {"role": "user", "content": blocks})]
 
-    async def _execute(self, call: ToolCall) -> str:
+    async def _execute(self, call: ToolCall) -> ControlResult:
         tool = _BY_NAME.get(call.name)
         if tool is None:
             raise LLMCallError(f"unknown master tool {call.name!r}")
@@ -475,6 +476,7 @@ def bind_call_turn(client: AsyncAnthropic) -> LLMCaller[TurnResult]:
             messages=messages,
             tools=tools,
             tool_choice=tool_choice,
+            timeout_s=MASTER_CALL_TIMEOUT_S,
         )
 
     return call
