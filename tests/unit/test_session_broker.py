@@ -53,7 +53,12 @@ from broker.protocol.constants import (
     T_SHUTDOWN,
     T_STATUS,
 )
-from broker.protocol.schemas import ClarifyEscalationReplyPayload, Envelope, Response
+from broker.protocol.schemas import (
+    SESSION_SOCKET_PAYLOADS,
+    ClarifyEscalationReplyPayload,
+    Envelope,
+    Response,
+)
 from broker.protocol.server import serve_unix
 from broker.session.broker import (
     PHRASE_GROUNDING,
@@ -2300,3 +2305,42 @@ async def test_a_newer_menu_retracts_the_one_it_replaced_first(
     # Retract before raise: the master holds one question per session.
     order = [e.id for e in harness.master.received]
     assert order.index(retract[0].id) < order.index(second.id)
+
+
+async def test_every_session_socket_type_reaches_its_handler(
+    harness: Harness,
+) -> None:
+    # A mapped type with no handler would drop the connection unanswered.
+    requests: list[tuple[str, dict[str, Any]]] = [
+        (T_PERMISSION_REQUEST, permission_env("Read", {"file_path": "a"}).payload),
+        (T_ASK_QUESTION, {"tool_input": COLOR_TOOL_INPUT, "tool_use_id": "t1"}),
+        (T_CLARIFY_ESCALATION, {"escalation_id": "e1", "question": "why?"}),
+        (T_APPROVE_PROMPT, {"proposal_id": "p1", "prompt": "do it"}),
+        (T_DISPATCH_DECISION, {"escalation_id": "e1", "response": "yes"}),
+        (T_REACTIVATE, {"intent": "next task"}),
+        (T_SEND_PROMPT, {"text": "hello"}),
+        (T_STATUS, {}),
+        (T_GET_DECISION_LOG, {}),
+        (T_GET_PERMISSION_LOG, {}),
+        (T_SHUTDOWN, {}),
+    ]
+    assert {t for t, _ in requests} | {T_HOOK_EVENT} == (
+        SESSION_SOCKET_PAYLOADS.keys()
+    )
+    await _notify(harness.sock, hook_env("Notification", {"message": "hi"}))
+    async with asyncio.timeout(5.0):
+        while not any(
+            row.kind is DecisionLogKind.NOTIFICATION
+            for row in read_rows(harness.broker.decision_log_path)
+        ):
+            await asyncio.sleep(0.01)
+    await harness.classifier.script("allow", "a read is reversible")
+    for msg_type, payload in requests:
+        resp = await client.request(
+            harness.sock,
+            Envelope(
+                id=uuid.uuid4().hex, type=msg_type, session_id="s1", payload=payload
+            ),
+            timeout_s=5.0,
+        )
+        assert resp.ok or resp.payload["reason_code"] != NackCode.MALFORMED, msg_type
