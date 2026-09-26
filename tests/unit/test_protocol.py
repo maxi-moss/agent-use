@@ -121,8 +121,7 @@ def test_nack_code_survives_the_wire() -> None:
     assert nack.error == "session is 'error'"
 
 
-def test_uncoded_refusal_parses() -> None:
-    """A catch-all NACK carries no payload, and reading it must not raise."""
-    nack = parse_nack(Response(id="r1", ok=False))
-    assert nack.error == ""
-    assert nack.reason_code is None
+def test_refusal_without_error_fails_to_parse() -> None:
+    """A NACK that does not say why must fail loud, never read as a refusal."""
+    with pytest.raises(ValidationError):
+        parse_nack(Response(id="r1", ok=False))

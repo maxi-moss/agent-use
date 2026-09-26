@@ -64,8 +64,7 @@ class NackPayload(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    # A peer's catch-all refusal may carry no reason at all.
-    error: str = ""
+    error: str
     reason_code: NackCode | None = None
 
 
