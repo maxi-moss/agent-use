@@ -27,7 +27,7 @@ from broker.calibration.schemas import (
     QuestionCase,
     QuestionSet,
 )
-from broker.config import BrokerConfig, ClassifierConfig
+from broker.config import BrokerConfig, ClassifierConfig, SessionModelConfig
 from broker.llm import LLMCallError, build_client, call_tool
 from broker.permission.classifier import (
     AllowCall,
@@ -74,14 +74,15 @@ def _print_row(case_id: str, expected: str, decision: str, reasoning: str) -> No
 async def run_questions(cases: list[QuestionCase]) -> None:
     """Run the triage leg against the pinned session model."""
     cfg = BrokerConfig()
+    model_cfg = SessionModelConfig(model_id=cfg.model_id, max_tokens=cfg.max_tokens)
     caller = functools.partial(call_tool, build_client())
-    print(f"questions ({cfg.model_id}): {len(cases)} cases")
+    print(f"questions ({model_cfg.model_id}): {len(cases)} cases")
     escalations = 0
     for case in cases:
         try:
             result = await triage(
                 caller,
-                cfg,
+                model_cfg,
                 intent=case.intent,
                 events=[],
                 event_name=case.event_name,

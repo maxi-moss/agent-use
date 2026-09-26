@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from broker import llm_timing
 from broker import prompts
-from broker.config import BrokerConfig
+from broker.config import SessionModelConfig
 from broker.index.render import fit_to_budget, render_relevant_code
 from broker.index.schemas import GroundingContext
 from broker.llm import LLMCaller, LLMCallError, ToolCall, strict_tool
@@ -249,7 +249,7 @@ def assemble_context(
 @llm_timing.timed("triage")
 async def triage(
     llm_call: LLMCaller[ToolCall],
-    cfg: BrokerConfig,
+    model_cfg: SessionModelConfig,
     *,
     intent: str,
     events: list[TranscriptEvent],
@@ -264,7 +264,7 @@ async def triage(
 
     Args:
         llm_call: The injected tool-calling seam.
-        cfg: Supplies the model id and the token cap.
+        model_cfg: Supplies the model id and the token cap.
         intent: Authoritative task intent, taken from the registry.
         events: Transcript events, as surrounding context.
         event_name: The hook event that opened this turn boundary.
@@ -285,8 +285,8 @@ async def triage(
     )
     system, messages = assemble_context(_TRIAGE_PROMPT, intent, events, working)
     call: ToolCall = await llm_call(
-        model=cfg.model_id,
-        max_tokens=cfg.max_tokens,
+        model=model_cfg.model_id,
+        max_tokens=model_cfg.max_tokens,
         system=system,
         messages=messages,
         tools=TRIAGE_TOOLS,
@@ -325,7 +325,7 @@ async def _retrieve(retrieve: Retriever, intent: str, cwd: Path) -> GroundingCon
 
 @llm_timing.timed("grounding")
 async def _propose(
-    llm_call: LLMCaller[ToolCall], cfg: BrokerConfig, parts: list[str]
+    llm_call: LLMCaller[ToolCall], model_cfg: SessionModelConfig, parts: list[str]
 ) -> ProposePromptCall:
     """Make the one grounding call and validate its forced tool use.
 
@@ -336,8 +336,8 @@ async def _propose(
     system: list[TextBlockParam] = [{"type": "text", "text": _GROUNDING_PROMPT}]
     messages: list[MessageParam] = [{"role": "user", "content": "\n\n".join(parts)}]
     call: ToolCall = await llm_call(
-        model=cfg.model_id,
-        max_tokens=cfg.max_tokens,
+        model=model_cfg.model_id,
+        max_tokens=model_cfg.max_tokens,
         system=system,
         messages=messages,
         tools=GROUNDING_TOOLS,
@@ -353,7 +353,7 @@ async def _propose(
 
 async def ground_intent(
     llm_call: LLMCaller[ToolCall],
-    cfg: BrokerConfig,
+    model_cfg: SessionModelConfig,
     *,
     retrieve: Retriever,
     intent: str,
@@ -363,7 +363,7 @@ async def ground_intent(
 
     Args:
         llm_call: The injected tool-calling seam.
-        cfg: Supplies the model id and the token cap.
+        model_cfg: Supplies the model id and the token cap.
         retrieve: The injected code-retrieval seam.
         intent: The developer's intent, passed verbatim.
         cwd: Session working directory: the repository root.
@@ -387,5 +387,5 @@ async def ground_intent(
     if claude_md:
         parts.append(f"# The codebase's CLAUDE.md\n{claude_md}")
     parts.append(relevant_code)
-    proposal = await _propose(llm_call, cfg, parts)
+    proposal = await _propose(llm_call, model_cfg, parts)
     return Grounding(proposal=proposal, context=context)

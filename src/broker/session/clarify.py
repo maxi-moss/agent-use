@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from broker import llm_timing
 from broker import prompts
-from broker.config import BrokerConfig
+from broker.config import SessionModelConfig
 from broker.llm import LLMCaller, LLMCallError, ToolCall, strict_tool
 from broker.protocol.schemas import EscalationDisclosure, EscalationPayload
 from broker.session.triage import FORCED_ONE, assemble_context
@@ -83,7 +83,7 @@ def render_disclosure(p: EscalationDisclosure) -> str:
 @llm_timing.timed("clarify")
 async def clarify(
     llm_call: LLMCaller[ToolCall],
-    cfg: BrokerConfig,
+    model_cfg: SessionModelConfig,
     *,
     intent: str,
     escalation: EscalationPayload,
@@ -94,7 +94,7 @@ async def clarify(
 
     Args:
         llm_call: The broker's own injected tool-calling seam.
-        cfg: Supplies the pinned model id and token cap.
+        model_cfg: Supplies the pinned model id and token cap.
         intent: Authoritative task intent, from the registry.
         escalation: The escalation the question is about.
         question: The developer's question, verbatim.
@@ -115,8 +115,8 @@ async def clarify(
     )
     system, messages = assemble_context(_CLARIFY_PROMPT, intent, events, working)
     call: ToolCall = await llm_call(
-        model=cfg.model_id,
-        max_tokens=cfg.max_tokens,
+        model=model_cfg.model_id,
+        max_tokens=model_cfg.max_tokens,
         system=system,
         messages=messages,
         tools=CLARIFY_TOOLS,

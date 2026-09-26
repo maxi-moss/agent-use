@@ -1,9 +1,10 @@
 """Shared broker configuration (one definition, two consumers).
 
-Every `model_id` is PINNED HERE AND NOWHERE ELSE — the single most
-consequential parameter. Load fails loud on an invalid overlay file — a
-half-read config silently changing the model or budget is exactly the kind of
-partial read the global rules forbid.
+Every API `model_id` here (Anthropic and OpenAI) is PINNED HERE AND NOWHERE
+ELSE — the single most consequential parameter; the driven Claude Code CLI's
+own model is pinned separately, in `session/broker.py`. Load fails loud on an
+invalid overlay file — a half-read config silently changing the model or
+budget is exactly the kind of partial read the global rules forbid.
 """
 
 import json
@@ -141,6 +142,15 @@ class ResumedTask(BaseModel):
     completed: bool = False  # resume as completed so reactivation still works
 
 
+class SessionModelConfig(BaseModel):
+    """The model id and token cap the session stack's LLM calls use."""
+
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
+
+    model_id: str
+    max_tokens: int
+
+
 class SessionBrokerConfig(BaseModel):
     """Session broker process configuration, passed as --config-json at spawn."""
 
@@ -154,8 +164,7 @@ class SessionBrokerConfig(BaseModel):
     anchor_pane: str
     intent: str
     budget_count: int = 0  # persisted count resumes across broker death
-    model_id: str
-    max_tokens: int
+    session_model: SessionModelConfig
     classifier: ClassifierConfig
     embedding: EmbeddingConfig
     watchdog_seconds: float

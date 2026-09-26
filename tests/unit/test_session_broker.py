@@ -68,6 +68,7 @@ from broker.config import (
     EmbeddingConfig,
     ResumedTask,
     SessionBrokerConfig,
+    SessionModelConfig,
 )
 from broker.paths import BrokerPaths
 
@@ -502,8 +503,7 @@ async def _harness(
         anchor_pane="w3:p1",
         intent="the raw intent",
         budget_count=budget_count,
-        model_id="test-model",
-        max_tokens=1024,
+        session_model=SessionModelConfig(model_id="test-model", max_tokens=1024),
         classifier=ClassifierConfig(model_id="test-classifier"),
         embedding=EmbeddingConfig(),
         watchdog_seconds=300.0,

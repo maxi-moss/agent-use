@@ -41,7 +41,6 @@ from broker.index.schemas import GroundingContext
 from broker.llm import LLMCallError, LLMCaller, ToolCall
 from broker.config import (
     AdoptedSession,
-    BrokerConfig,
     EmbeddingConfig,
     ResumedTask,
     SessionBrokerConfig,
@@ -329,14 +328,6 @@ class SessionBroker:
                 built from ``cfg`` — tests pass a fake or a spy.
         """
         self.cfg = cfg
-        self.broker_cfg = BrokerConfig(
-            model_id=cfg.model_id,
-            max_tokens=cfg.max_tokens,
-            watchdog_seconds=cfg.watchdog_seconds,
-            budget_max=cfg.budget_max,
-            broker_home=cfg.broker_home,
-            embedding=cfg.embedding,
-        )
         self._llm_call = llm_call
         self._retrieve = retrieve
         self.state: SessionState = SessionState.SPAWNING
@@ -391,7 +382,7 @@ class SessionBroker:
         if self._llm_call is None:
             self._llm_call = _bind_llm(llm_module.build_client())
         if self._retrieve is None:
-            self._retrieve = _bind_retrieve(self._paths, self.broker_cfg.embedding)
+            self._retrieve = _bind_retrieve(self._paths, self.cfg.embedding)
         self.watchdog.start()
         self._status_task = asyncio.create_task(self._status_sender())
         drive = self._run_task = asyncio.create_task(self._drive())
@@ -566,7 +557,7 @@ class SessionBroker:
             try:
                 grounding = await ground_intent(
                     self._llm_call,
-                    self.broker_cfg,
+                    self.cfg.session_model,
                     retrieve=self._retrieve,
                     intent=intent,
                     cwd=Path(self.cfg.cwd),
@@ -757,7 +748,7 @@ class SessionBroker:
                 events = self._read_transcript()
                 result = await ask.decide_questions(
                     self._llm_call,
-                    self.broker_cfg,
+                    self.cfg.session_model,
                     intent=self._intent(),
                     events=events,
                     questions=questions,
@@ -842,7 +833,7 @@ class SessionBroker:
         task = asyncio.create_task(
             clarify.clarify(
                 self._llm_call,
-                self.broker_cfg,
+                self.cfg.session_model,
                 intent=self._intent(),
                 escalation=active,
                 question=req.question,
@@ -1166,7 +1157,7 @@ class SessionBroker:
         with self._activity(PHRASE_TRIAGE):
             result = await triage(
                 self._llm_call,
-                self.broker_cfg,
+                self.cfg.session_model,
                 intent=self._intent(),
                 events=events,
                 event_name=HookEventName.STOP,

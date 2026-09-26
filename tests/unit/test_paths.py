@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 
 from broker.paths import BrokerPaths
-from broker.config import ClassifierConfig, EmbeddingConfig, SessionBrokerConfig
+from broker.config import (
+    ClassifierConfig,
+    EmbeddingConfig,
+    SessionBrokerConfig,
+    SessionModelConfig,
+)
 
 
 def test_escalation_queue_path() -> None:
@@ -31,8 +36,7 @@ def test_session_paths_follow_the_configured_home_not_the_env(
         cwd=str(tmp_path),
         anchor_pane="w3:p1",
         intent="i",
-        model_id="test-model",
-        max_tokens=1024,
+        session_model=SessionModelConfig(model_id="test-model", max_tokens=1024),
         classifier=ClassifierConfig(),
         embedding=EmbeddingConfig(),
         watchdog_seconds=300.0,

@@ -1,6 +1,5 @@
 """clarify() against a fake LLM caller."""
 
-from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -11,14 +10,14 @@ from anthropic.types import (
     ToolParam,
 )
 
-from broker.config import BrokerConfig
+from broker.config import SessionModelConfig
 from broker.llm import LLMCallError, ToolCall
 from broker.protocol.schemas import EscalationPayload
 from broker.session.clarify import ClarifyCall, clarify, render_disclosure
 from broker.session.triage import FORCED_ONE
 from broker.transcript.schemas import AssistantText, UserPrompt
 
-CFG = BrokerConfig(broker_home=Path("/private/tmp/unused"))
+MODEL_CFG = SessionModelConfig(model_id="test-model", max_tokens=8192)
 
 EVENTS = [
     UserPrompt(kind="user_prompt", text="add a login page"),
@@ -80,7 +79,7 @@ class FakeLLM:
 async def run_clarify(fake: FakeLLM) -> ClarifyCall:
     return await clarify(
         fake,
-        CFG,
+        MODEL_CFG,
         intent="add a login page using the existing session store",
         escalation=ESCALATION,
         question=QUESTION,
@@ -119,7 +118,7 @@ async def test_forced_single_tool_and_model() -> None:
     await run_clarify(fake)
     call = fake.calls[0]
     assert call["tool_choice"] == FORCED_ONE
-    assert call["model"] == "claude-sonnet-5"
+    assert call["model"] == "test-model"
     assert [t["name"] for t in call["tools"]] == ["answer_clarification"]
 
 

@@ -14,7 +14,7 @@ from anthropic.types import (
 )
 
 from broker import prompts
-from broker.config import BrokerConfig
+from broker.config import SessionModelConfig
 from broker.index.retrieval import RetrievalError
 from broker.index.schemas import ContextSymbol, GroundingContext, SymbolKind
 from broker.llm import LLMCallError, ToolCall
@@ -31,7 +31,7 @@ from broker.session.triage import (
 from broker.transcript.schemas import AssistantText, UserPrompt
 from broker.transcript.adapter import render
 
-CFG = BrokerConfig(broker_home=Path("/private/tmp/unused"))
+MODEL_CFG = SessionModelConfig(model_id="test-model", max_tokens=8192)
 
 CONTEXT = GroundingContext(
     symbols=[
@@ -113,7 +113,7 @@ class FakeLLM:
 async def run_triage(fake: FakeLLM) -> Any:
     return await triage(
         fake,
-        CFG,
+        MODEL_CFG,
         intent="add a login page using the existing session store",
         events=list(EVENTS),
         event_name="Stop",
@@ -184,7 +184,7 @@ async def test_forced_single_tool_choice() -> None:
         "type": "any",
         "disable_parallel_tool_use": True,
     }
-    assert fake.calls[0]["model"] == "claude-sonnet-5"
+    assert fake.calls[0]["model"] == "test-model"
 
 
 def test_context_order_intent_transcript_working() -> None:
@@ -236,7 +236,11 @@ async def test_ground_intent_orders_intent_claude_md_relevant_code(
     )
     retriever = FakeRetriever()
     result = await ground_intent(
-        fake, CFG, retrieve=retriever, intent="add a page THE-RAW-INTENT", cwd=tmp_path
+        fake,
+        MODEL_CFG,
+        retrieve=retriever,
+        intent="add a page THE-RAW-INTENT",
+        cwd=tmp_path,
     )
     assert isinstance(result, Grounding)
     assert result.proposal.prompt == "Add the page."
@@ -258,7 +262,9 @@ async def test_ground_intent_without_claude_md_still_sends_relevant_code(
     fake = FakeLLM(
         ToolCall(name="propose_prompt", input={"reasoning": "r", "prompt": "p"})
     )
-    await ground_intent(fake, CFG, retrieve=FakeRetriever(), intent="x", cwd=tmp_path)
+    await ground_intent(
+        fake, MODEL_CFG, retrieve=FakeRetriever(), intent="x", cwd=tmp_path
+    )
     sent = cast(str, fake.calls[0]["messages"][0]["content"])
     assert "# The codebase's CLAUDE.md" not in sent
     assert "def do_it() -> None:" in sent
@@ -273,7 +279,9 @@ async def test_ground_intent_retrieval_failure_propagates(tmp_path: Path) -> Non
         ToolCall(name="propose_prompt", input={"reasoning": "r", "prompt": "p"})
     )
     with pytest.raises(RetrievalError):
-        await ground_intent(fake, CFG, retrieve=Failing(), intent="x", cwd=tmp_path)
+        await ground_intent(
+            fake, MODEL_CFG, retrieve=Failing(), intent="x", cwd=tmp_path
+        )
     assert fake.calls == []  # the LLM is never called without retrieval
 
 
@@ -281,5 +289,5 @@ async def test_ground_intent_wrong_tool_raises(tmp_path: Path) -> None:
     fake = FakeLLM(ToolCall(name="answer", input={"reasoning": "r", "answer": "a"}))
     with pytest.raises(LLMCallError):
         await ground_intent(
-            fake, CFG, retrieve=FakeRetriever(), intent="x", cwd=tmp_path
+            fake, MODEL_CFG, retrieve=FakeRetriever(), intent="x", cwd=tmp_path
         )
