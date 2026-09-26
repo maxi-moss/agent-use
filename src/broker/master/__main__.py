@@ -27,13 +27,14 @@ from broker.herdr import driver
 from broker.paths import BrokerPaths
 from broker.llm import build_client
 from broker.protocol.constants import HookEventName
-from broker.master.llm import bind_call_turn
+from broker.master.llm import MasterLLM, bind_call_turn
 from broker.master.pane_escalations import PaneEscalations, PaneStoreError
 from broker.master.queue import EscalationQueue, QueueError
 from broker.master.registry import Registry, RegistryError
-from broker.master.runtime import reconcile_registry
-from broker.master.testmode import SCENARIO_DIR, test_mode_llm_call
+from broker.master.runtime import MasterRuntime, reconcile_registry
+from broker.master.testmode import InjectCommand, test_mode_llm_call
 from broker.master.tui.app import BrokerMasterApp
+from broker.master.viewmodel import ViewEvent, ViewEventRelay
 
 TEST_MODE_ANCHOR = "%test-mode"
 TEST_MODE_WARNING = "TEST MODE — synthetic traffic only; LLM disabled"
@@ -127,16 +128,21 @@ def main() -> None:
 
         llm_call = bind_call_turn(build_client())
 
-    # 4. Runtime and app built before run; runtime.serve() starts in on_mount.
+    # 4. Runtime and app built before run; the runtime starts in on_mount.
+    relay = ViewEventRelay()
+    runtime = MasterRuntime(relay, registry, queue, panes, cfg, anchor_pane=anchor)
+    master_llm = MasterLLM(llm_call, runtime, cfg)
+    inject: InjectCommand | None = None
+    if args.test_mode:
+        posts: list[ViewEvent] = []
+        relay.connect(posts.append)
+        inject = InjectCommand(runtime, posts)
     app = BrokerMasterApp(
-        cfg,
-        registry,
-        queue,
-        panes,
-        llm_call,
-        anchor_pane=anchor,
+        runtime,
+        master_llm,
+        relay,
         startup_warnings=warnings,
-        scenarios_dir=SCENARIO_DIR if args.test_mode else None,
+        inject=inject,
     )
     app.run()
 

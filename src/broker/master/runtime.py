@@ -1,10 +1,6 @@
 """Master runtime layer: socket server, decision-escalation queue, open
-pane escalations, session spawn/stop, dispatch with
-liveness-at-dispatch, and the ONLY renderers of broker payloads.
-
-The runtime/LLM split is load-bearing: everything the developer reads is
-rendered HERE, verbatim, and handed to the TUI (and to the LLM layer as an
-opaque block). Re-summarising happens nowhere — structurally.
+pane escalations, session spawn/stop, and dispatch with
+liveness-at-dispatch.
 
 Every broker → master message is ACKED with Response(ok=True/False): session
 brokers deliver upward messages via client.request and fail loud when nothing
@@ -13,12 +9,9 @@ answers.
 
 import asyncio
 import contextlib
-import json
 import logging
-import re
 import sys
 import uuid
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -37,6 +30,7 @@ from broker.config import (
 from broker.herdr import driver
 from broker.paths import BrokerPaths
 from broker.master import notifier
+from broker.master.broker_link import adoption_fields, broker_is_listening
 from broker.master.outcome import SessionOutcome, build_outcome
 from broker.master.viewmodel import (
     Attention,
@@ -54,6 +48,13 @@ from broker.master.viewmodel import (
     SessionStateChanged,
 )
 from broker.master.pane_escalations import PaneEscalations, PaneProtocolViolation
+from broker.master.payload_render import (
+    PANE_UNKNOWN,
+    pane_label,
+    render_escalation,
+    render_pane_escalation,
+    render_proposal,
+)
 from broker.master.queue import EscalationProtocolViolation, EscalationQueue
 from broker.master.registry import Registry, SessionRecord
 from broker.protocol import client
@@ -98,22 +99,17 @@ from broker.protocol.schemas import (
     DecisionUndeliveredPayload,
     DispatchDecisionPayload,
     Envelope,
-    EscalationDisclosure,
     EscalationPayload,
     EscalationRetractPayload,
     FatalErrorPayload,
     LiveStatusPayload,
     PaneEscalationPayload,
     PaneRetractPayload,
-    PermissionEscalationPayload,
     PermissionLogPayload,
-    PermissionSuggestion,
     PromptProposalPayload,
     PromptUndeliveredPayload,
-    QuestionEscalationPayload,
     ReactivatePayload,
     Response,
-    RetrievedSymbol,
     SendPromptPayload,
     StatusPayload,
 )
@@ -121,27 +117,13 @@ from broker.protocol.server import serve_unix
 
 logger = logging.getLogger(__name__)
 
-_SESSION_NUM = re.compile(r"s(\d+)\Z")
-
-
-def session_sort_key(name: str) -> tuple[int, str]:
-    """Order sessions by numeric id (s2 before s10); any non-'sN' name last."""
-    m = _SESSION_NUM.match(name)
-    return (int(m.group(1)), "") if m else (10**9, name)
-
-
 REQUEST_TIMEOUT_S = 10.0
 # The broker runs an LLM call before it can reply, so this is far longer than
 # REQUEST_TIMEOUT_S and must exceed the broker's own CLARIFY_TIMEOUT_S.
 CLARIFY_ESCALATION_TIMEOUT_S = 60.0
 STOP_WAIT_S = 10.0
 SOCKET_POLL_S = 0.1
-SOCKET_PROBE_TIMEOUT_S = 2.0
 AGENT_PROBE_TIMEOUT_S = 5.0
-
-# Stands in for a pane the registry cannot name. A pane escalation is still
-# worth surfacing without it: the developer knows the session.
-PANE_UNKNOWN = "(pane unknown)"
 
 # Failures the on-demand status probe absorbs into a warning line: a session
 # that cannot be reached must not fail the whole listing.
@@ -160,66 +142,6 @@ _ABSORBING = frozenset(
         SessionState.UNMANAGED,
     }
 )
-
-
-async def _broker_is_listening(path: Path) -> bool:
-    """Report whether anything still accepts connections on a session socket.
-
-    Args:
-        path: Session socket to probe.
-
-    Returns:
-        ``True`` when the connection is accepted, and also when the probe
-        itself is inconclusive — an ambiguous result must never read as free.
-    """
-    try:
-        async with asyncio.timeout(SOCKET_PROBE_TIMEOUT_S):
-            _, writer = await asyncio.open_unix_connection(str(path))
-    except TimeoutError:
-        return True  # BEFORE OSError, which TimeoutError subclasses
-    except OSError:
-        return False  # nothing bound, or a stale file refusing connections
-    writer.close()
-    with contextlib.suppress(OSError, ConnectionError):
-        await writer.wait_closed()
-    return True
-
-
-def _adoption_fields(record: SessionRecord) -> AdoptedSession:
-    """Build the block a replacement broker needs to adopt a live session.
-
-    Args:
-        record: Registry record of the session a replacement broker takes over.
-
-    Returns:
-        The pane id, Claude session id and transcript path, all present.
-
-    Raises:
-        ValueError: Any of them is unknown. A broker must never adopt a
-            session it only partly knows.
-    """
-    pane_id = record.pane_id
-    claude_session_id = record.claude_session_id
-    transcript_path = record.transcript_path
-    if not (pane_id and claude_session_id and transcript_path):
-        missing = sorted(
-            field
-            for field, value in (
-                ("pane_id", pane_id),
-                ("claude_session_id", claude_session_id),
-                ("transcript_path", transcript_path),
-            )
-            if not value
-        )
-        raise ValueError(
-            f"session {record.name} cannot be adopted: the registry has no "
-            + ", ".join(missing)
-        )
-    return AdoptedSession(
-        pane_id=pane_id,
-        claude_session_id=claude_session_id,
-        transcript_path=transcript_path,
-    )
 
 
 def _drop_from_fleet(
@@ -282,9 +204,9 @@ async def reconcile_registry(
         One classification line per session, plus one line per retraction.
     """
     warnings: list[str] = []
-    for name in sorted(registry.records, key=session_sort_key):
+    for name in registry.names_in_order():
         record = registry.records[name]
-        if await _broker_is_listening(Path(record.socket_path)):
+        if await broker_is_listening(Path(record.socket_path)):
             warnings.append(
                 f"session {name}: broker still answering — left as-is"
             )
@@ -308,7 +230,7 @@ async def reconcile_registry(
             warnings.extend(_drop_from_fleet(registry, queue, panes, name))
             continue
         try:
-            _adoption_fields(record)
+            adoption_fields(record)
         except ValueError as exc:
             warnings.append(
                 f"session {name}: Claude Code still runs but no broker can "
@@ -330,200 +252,6 @@ async def reconcile_registry(
     if registry.records:
         registry.save()
     return warnings
-
-
-def _render_disclosure_sections(d: EscalationDisclosure) -> list[str]:
-    """Render a broker's disclosure as block lines, verbatim."""
-    lines = [
-        "## Title",
-        d.escalation_title,
-        "",
-        "## Situation",
-        d.situation,
-        "",
-        "## What was asked",
-        d.what_was_asked,
-        "",
-        "## What is at stake",
-        d.what_is_at_stake,
-        "",
-        "## Alternatives",
-    ]
-    for alt in d.alternatives:
-        lines += [
-            f"- {alt.option}",
-            f"  pros: {alt.pros}",
-            f"  cons: {alt.cons}",
-        ]
-    lines += [
-        "",
-        "## Recommendation",
-        d.recommendation,
-        "",
-        "## Uncertainty",
-        d.uncertainty,
-        "",
-        "## What would change my mind",
-        d.what_would_change_my_mind,
-    ]
-    return lines
-
-
-def render_escalation(p: EscalationPayload) -> str:
-    """Render the decision-escalation block, deterministic and verbatim.
-
-    Args:
-        p: Validated escalation payload from a session broker.
-
-    Returns:
-        The rendered block, to be displayed and passed on unchanged.
-    """
-    lines = [
-        f"Escalation {p.escalation_id} — session {p.session_id}",
-        "",
-        "## Task context",
-        p.task_context,
-        "",
-        *_render_disclosure_sections(p.disclosure),
-    ]
-    return "\n".join(lines)
-
-
-def _render_suggestion(suggestion: PermissionSuggestion) -> str:
-    """Render one of Claude Code's permission suggestions as its raw object."""
-    data = suggestion if isinstance(suggestion, dict) else suggestion.model_dump()
-    return json.dumps(data, sort_keys=True)
-
-
-def render_permission_escalation(
-    p: PermissionEscalationPayload, pane_id: str
-) -> str:
-    """Render the permission-escalation block, deterministic and verbatim.
-
-    Args:
-        p: Validated permission-escalation payload from a session broker.
-        pane_id: Pane holding the native prompt, or ``PANE_UNKNOWN``.
-
-    Returns:
-        The rendered block, to be displayed and passed on unchanged.
-    """
-    lines = [
-        f"Permission escalation {p.escalation_id} — session {p.session_id}",
-        "",
-        f"The developer answers this in pane {pane_id}, on the native "
-        "permission prompt already waiting there. It cannot be answered "
-        "here, and no decision sent from here reaches it.",
-        "",
-        "## Tool",
-        p.tool_name,
-        "",
-        "## Tool input",
-        json.dumps(p.tool_input, indent=2, sort_keys=True),
-        "",
-        "## Why it was escalated",
-        p.reason,
-        "",
-        "## Task intent it was judged against",
-        p.task_intent,
-        "",
-        "## Permission suggestions",
-    ]
-    if p.permission_suggestions:
-        lines += [
-            f"- {_render_suggestion(s)}" for s in p.permission_suggestions
-        ]
-    else:
-        lines.append("(none)")
-    return "\n".join(lines)
-
-
-def render_question_escalation(p: QuestionEscalationPayload, pane_id: str) -> str:
-    """Render the question-escalation block, deterministic and verbatim.
-
-    Args:
-        p: Validated question-escalation payload from a session broker.
-        pane_id: Pane holding the AskUserQuestion menu, or ``PANE_UNKNOWN``.
-
-    Returns:
-        The rendered block, to be displayed and passed on unchanged.
-    """
-    lines = [
-        f"Question escalation {p.escalation_id} — session {p.session_id}",
-        "",
-        f"The developer answers this in pane {pane_id}, on the AskUserQuestion "
-        "menu already waiting there. It cannot be answered here, and no "
-        "decision sent from here reaches it.",
-        "",
-        "## Task context",
-        p.task_context,
-        "",
-        "## Menu",
-    ]
-    lines += [
-        p.menu or "(the menu could not be read — see the pane)",
-        "",
-        "## Why the broker did not answer",
-        p.reason,
-    ]
-    if p.analysis is not None:
-        lines += ["", *_render_disclosure_sections(p.analysis)]
-    return "\n".join(lines)
-
-
-def render_pane_escalation(p: PaneEscalationPayload, pane_id: str) -> str:
-    """Render a pane-escalation block of either kind, deterministic and verbatim.
-
-    Args:
-        p: Validated pane-escalation payload.
-        pane_id: Pane holding the native prompt, or ``PANE_UNKNOWN``.
-
-    Returns:
-        The rendered block, to be displayed and passed on unchanged.
-    """
-    if isinstance(p, PermissionEscalationPayload):
-        return render_permission_escalation(p, pane_id)
-    return render_question_escalation(p, pane_id)
-
-
-def pane_label(p: PaneEscalationPayload) -> str:
-    """Name a pane escalation in one line: the tool, or the menu's first question."""
-    if isinstance(p, PermissionEscalationPayload):
-        return p.tool_name
-    return p.first_question or "(unreadable menu)"
-
-
-def render_proposal(p: PromptProposalPayload) -> str:
-    """Render the proposal block: prompt, grounding, and retrieved code, verbatim.
-
-    Args:
-        p: Validated prompt-proposal payload from a session broker.
-
-    Returns:
-        The rendered block, to be displayed and passed on unchanged.
-    """
-    lines = [
-        f"Prompt proposal {p.proposal_id}",
-        "",
-        "## Proposed prompt",
-        p.proposed_prompt,
-        "",
-        "## Grounding summary",
-        p.grounding_summary,
-        "",
-        "## Retrieved code",
-    ]
-    if p.retrieved:
-        lines += [_render_retrieved(s) for s in p.retrieved]
-    else:
-        lines.append("(none)")
-    return "\n".join(lines)
-
-
-def _render_retrieved(s: RetrievedSymbol) -> str:
-    """Render one retrieved symbol as a bullet line."""
-    if s.score is None:
-        return f"- {s.name}"
-    return f"- {s.name} (seed {s.score:.2f})"
 
 
 @dataclass(frozen=True, slots=True)
@@ -576,16 +304,40 @@ class MasterRuntime:
         self._task_activity: dict[str, str] = {}
         self._permission_prompt_pending: set[str] = set()
         self._master_activity: str | None = None
+        self._serve_task: asyncio.Task[None] | None = None
+
+    # ── lifecycle ────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        """Start serving the master socket in a background task.
+
+        Raises:
+            RuntimeError: The runtime is already serving.
+        """
+        if self._serve_task is not None:
+            raise RuntimeError("MasterRuntime.start called while already serving")
+        self._serve_task = asyncio.create_task(self._serve())
+
+    async def aclose(self) -> None:
+        """Stop serving and persist the registry."""
+        task, self._serve_task = self._serve_task, None
+        try:
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        finally:
+            self.registry.save()
 
     # ── socket server ────────────────────────────────────────────────────────
 
-    async def serve(self) -> None:
+    async def _serve(self) -> None:
         """Bind the master socket and serve until cancelled."""
         # A head or open pane escalation loaded from disk has never been
         # announced in this process, so each is announced here, exactly once.
         self._publish_fleet()
         await self._surface_head()
-        for prompt in self.open_pane_escalations():
+        for prompt in self.panes.in_session_order():
             await self._announce_pane_escalation(prompt)
         server = await serve_unix(self.master_socket_path, self.handle)
         await self._repopulate_from_brokers()
@@ -595,7 +347,7 @@ class MasterRuntime:
     async def _repopulate_from_brokers(self) -> None:
         """Refresh state, task-activity and any pending proposal from each surviving broker."""
 
-        for name in sorted(self.registry.records, key=session_sort_key):
+        for name in self.registry.names_in_order():
             if self.registry.records[name].state in _ABSORBING:
                 continue
             try:
@@ -641,8 +393,11 @@ class MasterRuntime:
             p = CompletionPayload.model_validate(env.payload)
             self._set_state(name, SessionState.COMPLETED)
             self.emit(CompletionArrived(name, p.headline, p.supporting))
-            await self._notify(
-                notifier.notify_done, f"Session {name} complete", p.headline
+            await notifier.notify_or_notice(
+                self.emit,
+                notifier.notify_done,
+                f"Session {name} complete",
+                p.headline,
             )
             return self._ack(env, ok=True)
         if env.type == T_SESSION_ENDED:
@@ -657,7 +412,8 @@ class MasterRuntime:
             # otherwise wedge the queue, undispatchable to a dead session.
             await self._retract_stranded_escalation(name)
             self._retract_stranded_pane_escalations(name)
-            await self._notify(
+            await notifier.notify_or_notice(
+                self.emit,
                 notifier.notify_request,
                 f"Session {name} failed",
                 f"{p.error_class}: {p.detail}",
@@ -889,7 +645,8 @@ class MasterRuntime:
                 render_escalation(head),
             )
         )
-        await self._notify(
+        await notifier.notify_or_notice(
+            self.emit,
             notifier.notify_request,
             f"Escalation from session {head.session_id}",
             head.disclosure.what_was_asked,
@@ -911,7 +668,8 @@ class MasterRuntime:
             if p.kind == PaneKind.PERMISSION
             else f"Question in session {p.session_id}"
         )
-        await self._notify(
+        await notifier.notify_or_notice(
+            self.emit,
             notifier.notify_request,
             title,
             f"{pane_label(p)} — answer it in pane {pane_id}",
@@ -977,7 +735,7 @@ class MasterRuntime:
         record = self.registry.get(session_id)
         # BEFORE anything is torn down: an unreassignable session must not be
         # left with its old broker killed and no replacement.
-        adopt = _adoption_fields(record)
+        adopt = adoption_fields(record)
         await self.stop_session(session_id)
         record = self.registry.get(session_id)  # KeyError if ended meanwhile
         await self._require_socket_free(record)
@@ -1020,7 +778,7 @@ class MasterRuntime:
         """
         record = self.registry.get(session_id)  # KeyError if gone or unknown
         # Every refusal fires before any side effect.
-        adopt = _adoption_fields(record)
+        adopt = adoption_fields(record)
         if record.approved_prompt is None:
             raise ValueError(
                 f"session {session_id} has no persisted approved prompt to "
@@ -1029,7 +787,7 @@ class MasterRuntime:
             )
         # One probe, never a poll: nothing was stopped, so waiting cannot
         # free the socket. Anything alive or ambiguous refuses.
-        if await _broker_is_listening(Path(record.socket_path)):
+        if await broker_is_listening(Path(record.socket_path)):
             raise RuntimeError(
                 f"session {session_id}: a broker is still answering on "
                 f"{record.socket_path} — refusing to attach"
@@ -1497,8 +1255,8 @@ class MasterRuntime:
         """Return every proposal awaiting approval, oldest first."""
         return list(self.proposals.values())
 
-    def render_registry_summary(self) -> str:
-        """Render the registry summary for the LLM context and list_sessions.
+    def registry_summary(self) -> str:
+        """Render the registry summary for the LLM context and ``list_sessions``.
 
         Returns:
             One line per session, or ``"(no sessions)"``.
@@ -1506,7 +1264,7 @@ class MasterRuntime:
         if not self.registry.records:
             return "(no sessions)"
         lines: list[str] = []
-        for name in sorted(self.registry.records, key=session_sort_key):
+        for name in self.registry.names_in_order():
             r = self.registry.records[name]
             intent = r.approved_prompt or r.intent
             lines.append(
@@ -1516,7 +1274,7 @@ class MasterRuntime:
             )
         return "\n".join(lines)
 
-    async def render_sessions_with_permission_prompts(self) -> str:
+    async def list_sessions(self) -> str:
         """Render the registry summary, probing each session for a live prompt.
 
         The prompt flag lives in broker memory and is read on demand, so it
@@ -1527,8 +1285,8 @@ class MasterRuntime:
             waiting on a native permission prompt and for each session that
             could not be reached.
         """
-        lines = [self.render_registry_summary()]
-        for name in sorted(self.registry.records, key=session_sort_key):
+        lines = [self.registry_summary()]
+        for name in self.registry.names_in_order():
             try:
                 status = await self.probe_status(name)
             except PROBE_FAILURES as exc:
@@ -1621,7 +1379,7 @@ class MasterRuntime:
         """
         path = Path(record.socket_path)
         deadline = asyncio.get_running_loop().time() + STOP_WAIT_S
-        while await _broker_is_listening(path):
+        while await broker_is_listening(path):
             if asyncio.get_running_loop().time() >= deadline:
                 raise RuntimeError(
                     f"session {record.name}: a broker is still serving "
@@ -1758,7 +1516,7 @@ class MasterRuntime:
         """Assemble the structured sidebar view from current runtime state."""
         badges = self._badges_by_session()
         rows: list[SessionRow] = []
-        for name in sorted(self.registry.records, key=session_sort_key):
+        for name in self.registry.names_in_order():
             r = self.registry.records[name]
             rows.append(
                 SessionRow(
@@ -1781,7 +1539,7 @@ class MasterRuntime:
             head=self._head_request(),
             panes=tuple(
                 PaneRequest(p.kind, p.session_id, p.escalation_id, pane_label(p))
-                for p in self.open_pane_escalations()
+                for p in self.panes.in_session_order()
             ),
         )
 
@@ -1791,13 +1549,6 @@ class MasterRuntime:
             return None
         return HeadRequest(
             head.session_id, head.escalation_id, head.disclosure.what_was_asked
-        )
-
-    def open_pane_escalations(self) -> list[PaneEscalationPayload]:
-        """Return every open pane escalation, in numeric session order, then kind."""
-        return sorted(
-            self.panes.entries,
-            key=lambda p: (session_sort_key(p.session_id), p.kind.value),
         )
 
     def _badges_by_session(self) -> dict[str, tuple[Attention, ...]]:
@@ -1849,25 +1600,6 @@ class MasterRuntime:
         """Return the dashboard header to idle."""
         self._master_activity = None
         self._publish_fleet()
-
-    async def _notify(
-        self,
-        fn: Callable[[str, str], Awaitable[None]],
-        title: str,
-        body: str,
-    ) -> None:
-        """Send one notification, downgrading a notifier failure to a notice.
-
-        Args:
-            fn: Notifier coroutine from ``broker.master.notifier``.
-            title: Notification title.
-            body: Notification body, passed through verbatim.
-        """
-        try:
-            await fn(title, body)
-        except Exception as exc:
-            # A dead notifier must not lose the escalation it announces.
-            self.emit(Notice(f"notification failed: {exc}"))
 
     async def _deliver(
         self, socket_path: str, env: Envelope, *, rejection: str

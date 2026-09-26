@@ -25,9 +25,12 @@ from broker import decision_log
 from broker.decision_log import DecisionKind
 from broker.config import BrokerConfig
 from broker.llm import TurnResult
+from broker.master.llm import MasterLLM
 from broker.master.pane_escalations import PaneEscalations
 from broker.master.queue import EscalationQueue
 from broker.master.registry import Registry, SessionRecord
+from broker.master.runtime import MasterRuntime
+from broker.master.testmode import InjectCommand
 from broker.master.tui.app import BrokerMasterApp
 from broker.master.tui.fleet import FleetSidebar, SessionRowWidget
 from broker.master.tui.notice import AttentionNotice
@@ -43,6 +46,8 @@ from broker.master.viewmodel import (
     PaneRequest,
     ProposalArrived,
     SessionRow,
+    ViewEvent,
+    ViewEventRelay,
 )
 from broker.protocol import client
 from broker.protocol.constants import PaneKind, SessionState
@@ -84,12 +89,26 @@ def home(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
         yield Path(td)
 
 
-def make_app(home: Path, llm: GatedLLM) -> BrokerMasterApp:
+def make_runtime(home: Path) -> tuple[MasterRuntime, BrokerConfig, ViewEventRelay]:
     cfg = BrokerConfig(model_id="test-model", broker_home=home)
     registry = Registry.load(home / "registry.json")
     queue = EscalationQueue.load(home / "escalation-queue.json")
     panes = PaneEscalations.load(home / "pane-escalations.json")
-    return BrokerMasterApp(cfg, registry, queue, panes, llm, anchor_pane="%1")
+    relay = ViewEventRelay()
+    runtime = MasterRuntime(relay, registry, queue, panes, cfg, anchor_pane="%1")
+    return runtime, cfg, relay
+
+
+def make_app(home: Path, llm: GatedLLM) -> tuple[BrokerMasterApp, ViewEventRelay]:
+    runtime, cfg, relay = make_runtime(home)
+    app = BrokerMasterApp(
+        runtime,
+        MasterLLM(llm, runtime, cfg),
+        relay,
+        startup_warnings=[],
+        inject=None,
+    )
+    return app, relay
 
 
 def chat_texts(app: BrokerMasterApp) -> list[str]:
@@ -170,7 +189,7 @@ def _fleet_view(
 
 async def test_submit_disables_input_and_worker_reenables(home: Path) -> None:
     llm = GatedLLM(reply="routing done", gated=True)
-    app = make_app(home, llm)
+    app, _ = make_app(home, llm)
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
         await pilot.click("#box")
@@ -190,7 +209,7 @@ async def test_submit_disables_input_and_worker_reenables(home: Path) -> None:
 
 async def test_paste_preserves_all_lines_and_submits_together(home: Path) -> None:
     llm = GatedLLM(reply="ok")
-    app = make_app(home, llm)
+    app, _ = make_app(home, llm)
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
         box = app.query_one("#box", PromptArea)
@@ -206,7 +225,7 @@ async def test_paste_preserves_all_lines_and_submits_together(home: Path) -> Non
 
 async def test_ctrl_j_inserts_newline_without_submitting(home: Path) -> None:
     llm = GatedLLM(reply="ok")
-    app = make_app(home, llm)
+    app, _ = make_app(home, llm)
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
         await pilot.click("#box")
@@ -223,10 +242,10 @@ async def test_slash_escalation_pastes_the_head_disclosure_verbatim(
     home: Path,
 ) -> None:
     rendered = "Escalation e1 — session s1\n\n## Situation\nverbatim [text]"
-    app = make_app(home, GatedLLM())
+    app, relay = make_app(home, GatedLLM())
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
-        app._emit(  # pyright: ignore[reportPrivateUsage]
+        relay(
             EscalationArrived("s1", "e1", "Queue policy", rendered)
         )
         await pilot.pause()
@@ -245,13 +264,13 @@ async def test_slash_escalation_forgets_a_head_the_fleet_no_longer_names(
     home: Path,
 ) -> None:
     rendered = "Escalation e1 — session s1\n\nverbatim [text]"
-    app = make_app(home, GatedLLM())
+    app, relay = make_app(home, GatedLLM())
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
-        app._emit(  # pyright: ignore[reportPrivateUsage]
+        relay(
             EscalationArrived("s1", "e1", "Queue policy", rendered)
         )
-        app._emit(  # pyright: ignore[reportPrivateUsage]
+        relay(
             FleetUpdated(_fleet_view((_session_row("s1", ()),)))
         )
         await pilot.pause()
@@ -268,10 +287,10 @@ async def test_slash_permission_pastes_one_prompt_and_disambiguates(
 ) -> None:
     s1_rendered = "Permission escalation p1 — session s1\n\nanswer it in pane [w3:p2]"
     s2_rendered = "Permission escalation p2 — session s2\n\nanswer it in pane [w3:p4]"
-    app = make_app(home, GatedLLM())
+    app, relay = make_app(home, GatedLLM())
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
-        app._emit(  # pyright: ignore[reportPrivateUsage]
+        relay(
             PaneEscalationArrived(PaneKind.PERMISSION, "s1", "p1", s1_rendered)
         )
         await pilot.pause()
@@ -288,7 +307,7 @@ async def test_slash_permission_pastes_one_prompt_and_disambiguates(
         await pilot.press("enter")
         await pilot.pause()
         assert s1_rendered in _chat_only_texts(app)  # the only one: no sN needed
-        app._emit(  # pyright: ignore[reportPrivateUsage]
+        relay(
             PaneEscalationArrived(PaneKind.PERMISSION, "s2", "p2", s2_rendered)
         )
         await pilot.pause()
@@ -308,13 +327,13 @@ async def test_slash_permission_forgets_a_prompt_the_fleet_no_longer_names(
     home: Path,
 ) -> None:
     rendered = "Permission escalation p1 — session s1\n\nanswer it in pane [w3:p2]"
-    app = make_app(home, GatedLLM())
+    app, relay = make_app(home, GatedLLM())
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
-        app._emit(  # pyright: ignore[reportPrivateUsage]
+        relay(
             PaneEscalationArrived(PaneKind.PERMISSION, "s1", "p1", rendered)
         )
-        app._emit(  # pyright: ignore[reportPrivateUsage]
+        relay(
             FleetUpdated(_fleet_view((_session_row("s1", ()),)))
         )
         await pilot.pause()
@@ -328,10 +347,10 @@ async def test_slash_permission_forgets_a_prompt_the_fleet_no_longer_names(
 
 async def test_slash_question_pastes_the_only_menu_verbatim(home: Path) -> None:
     rendered = "Question escalation q1 — session s1\n\n## Menu\nWhich layout? [Layout]"
-    app = make_app(home, GatedLLM())
+    app, relay = make_app(home, GatedLLM())
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
-        app._emit(  # pyright: ignore[reportPrivateUsage]
+        relay(
             PaneEscalationArrived(PaneKind.QUESTION, "s1", "q1", rendered)
         )
         await pilot.pause()
@@ -351,11 +370,11 @@ async def test_slash_question_pastes_the_only_menu_verbatim(home: Path) -> None:
 
 
 async def test_question_notice_line_and_badge_name_the_pane(home: Path) -> None:
-    app = make_app(home, GatedLLM())
+    app, relay = make_app(home, GatedLLM())
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
         rows = (_session_row("s1", (Attention.QUESTION,), pane_id="w3:p2"),)
-        app._emit(  # pyright: ignore[reportPrivateUsage]
+        relay(
             FleetUpdated(
                 _fleet_view(
                     rows,
@@ -378,13 +397,13 @@ async def test_slash_proposal_pastes_one_proposal_and_disambiguates(
 ) -> None:
     s1_rendered = "Prompt proposal p1 — session s1\nverbatim [text one]"
     s2_rendered = "Prompt proposal p2 — session s2\nverbatim [text two]"
-    app = make_app(home, GatedLLM())
+    app, relay = make_app(home, GatedLLM())
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
-        app._emit(  # pyright: ignore[reportPrivateUsage]
+        relay(
             ProposalArrived("s1", "p1", s1_rendered)
         )
-        app._emit(  # pyright: ignore[reportPrivateUsage]
+        relay(
             ProposalArrived("s2", "p2", s2_rendered)
         )
         await pilot.pause()
@@ -408,7 +427,7 @@ async def test_llm_worker_error_reenables_input_and_surfaces(
 ) -> None:
     llm = GatedLLM(gated=True)
     llm.fail = True
-    app = make_app(home, llm)
+    app, _ = make_app(home, llm)
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
         await pilot.click("#box")
@@ -423,7 +442,7 @@ async def test_llm_worker_error_reenables_input_and_surfaces(
 
 
 async def test_fleet_sidebar_renders_badges_and_waiting_count(home: Path) -> None:
-    app = make_app(home, GatedLLM())
+    app, relay = make_app(home, GatedLLM())
     view = FleetView(
         master_activity=None,
         rows=(
@@ -457,7 +476,7 @@ async def test_fleet_sidebar_renders_badges_and_waiting_count(home: Path) -> Non
     )
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
-        app._emit(FleetUpdated(view))  # pyright: ignore[reportPrivateUsage]
+        relay(FleetUpdated(view))
         await pilot.pause()
         text = _fleet_text(app)
         assert "s1" in text
@@ -465,7 +484,7 @@ async def test_fleet_sidebar_renders_badges_and_waiting_count(home: Path) -> Non
         assert "needs decision" in text
         assert "permission · w3:p2" in text
         assert "1 request waiting" in text
-        app._emit(  # pyright: ignore[reportPrivateUsage]
+        relay(
             FleetUpdated(FleetView(None, (), 0, (), None, ()))
         )
         await pilot.pause()
@@ -475,13 +494,13 @@ async def test_fleet_sidebar_renders_badges_and_waiting_count(home: Path) -> Non
 async def test_notice_names_the_head_and_each_pending_proposal(
     home: Path,
 ) -> None:
-    app = make_app(home, GatedLLM())
+    app, relay = make_app(home, GatedLLM())
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
         assert app.query_one("#notice", AttentionNotice).display is False
         # s2 is the announced head; s4 is queued behind it with no disclosure
         # of its own; s3 awaits prompt approval outside the queue.
-        app._emit(  # pyright: ignore[reportPrivateUsage]
+        relay(
             FleetUpdated(
                 _fleet_view(
                     (
@@ -500,7 +519,7 @@ async def test_notice_names_the_head_and_each_pending_proposal(
         assert "2 requests waiting · s2 needs a decision: retry or fail loud?" in text
         assert "s3 waiting for opening-prompt approval" in text
         assert "s4" not in text  # only the head is asked about
-        app._emit(  # pyright: ignore[reportPrivateUsage]
+        relay(
             FleetUpdated(_fleet_view((_session_row("s2", ()),)))
         )
         await pilot.pause()
@@ -510,7 +529,7 @@ async def test_notice_names_the_head_and_each_pending_proposal(
 async def test_notice_lists_every_open_prompt_apart_from_the_count(
     home: Path,
 ) -> None:
-    app = make_app(home, GatedLLM())
+    app, relay = make_app(home, GatedLLM())
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
         rows = (
@@ -522,7 +541,7 @@ async def test_notice_lists_every_open_prompt_apart_from_the_count(
             PaneRequest(PaneKind.PERMISSION, "s1", "p1", "Bash"),
             PaneRequest(PaneKind.PERMISSION, "s5", "p5", "Edit"),
         )
-        app._emit(  # pyright: ignore[reportPrivateUsage]
+        relay(
             FleetUpdated(
                 _fleet_view(
                     rows,
@@ -544,7 +563,7 @@ async def test_notice_lists_every_open_prompt_apart_from_the_count(
         assert "1 request waiting" in _fleet_text(app)
         # With no decision waiting the prompts still show, and nothing counts
         # them as waiting requests.
-        app._emit(  # pyright: ignore[reportPrivateUsage]
+        relay(
             FleetUpdated(_fleet_view(rows, panes=prompts))
         )
         await pilot.pause()
@@ -577,18 +596,15 @@ async def test_inject_runs_a_scenario_end_to_end(home: Path) -> None:
         ),
         encoding="utf-8",
     )
-    cfg = BrokerConfig(model_id="test-model", broker_home=home)
-    registry = Registry.load(home / "registry.json")
-    queue = EscalationQueue.load(home / "escalation-queue.json")
-    panes = PaneEscalations.load(home / "pane-escalations.json")
+    runtime, cfg, relay = make_runtime(home)
+    posts: list[ViewEvent] = []
+    relay.connect(posts.append)
     app = BrokerMasterApp(
-        cfg,
-        registry,
-        queue,
-        panes,
-        GatedLLM(),
-        anchor_pane="%1",
-        scenarios_dir=scenarios_dir,
+        runtime,
+        MasterLLM(GatedLLM(), runtime, cfg),
+        relay,
+        startup_warnings=[],
+        inject=InjectCommand(runtime, posts, scenario_dir=scenarios_dir),
     )
     async with app.run_test() as pilot:
         await pilot.pause(0.1)  # let the master socket bind
@@ -618,9 +634,9 @@ async def test_fleet_panel_updates_and_worker_clears_master_activity(
     home: Path,
 ) -> None:
     llm = GatedLLM(reply="ok", gated=True)
-    app = make_app(home, llm)
+    app, _ = make_app(home, llm)
     async with app.run_test() as pilot:
-        # serve() publishes the initial snapshot once the socket is up.
+        # start() publishes the initial snapshot once the socket is up.
         for _ in range(100):
             await pilot.pause(0.05)
             if "Master — idle" in _fleet_text(app):
@@ -648,7 +664,7 @@ async def test_fleet_panel_updates_and_worker_clears_master_activity(
 
 
 async def test_app_mounts_serves_and_unmounts_cleanly(home: Path) -> None:
-    app = make_app(home, GatedLLM())
+    app, _ = make_app(home, GatedLLM())
     async with app.run_test() as pilot:
         await pilot.pause(0.1)
         socket_path = app.runtime.master_socket_path
@@ -664,8 +680,8 @@ async def test_app_mounts_serves_and_unmounts_cleanly(home: Path) -> None:
 
 
 async def test_slash_outcome_opens_modal_from_the_decision_log(home: Path) -> None:
-    app = make_app(home, GatedLLM())
-    app.registry.upsert(
+    app, relay = make_app(home, GatedLLM())
+    app.runtime.registry.upsert(
         SessionRecord(
             name="s1",
             socket_path=str(home / "s" / "s1.sock"),
@@ -728,7 +744,7 @@ async def test_slash_outcome_opens_modal_from_the_decision_log(home: Path) -> No
     )
     async with app.run_test() as pilot:
         await pilot.pause(0.05)
-        app._emit(  # pyright: ignore[reportPrivateUsage]
+        relay(
             FleetUpdated(_fleet_view((completed, _session_row("s2", ()))))
         )
         await pilot.pause()

@@ -520,7 +520,7 @@ async def _run_step(
 
     if isinstance(step, AssertUnreachable):
         ctx.require_seeded(index, step.session)
-        rendered = await runtime.render_sessions_with_permission_prompts()
+        rendered = await runtime.list_sessions()
         passed = f"- {step.session}: unreachable" in rendered
         others = [
             other

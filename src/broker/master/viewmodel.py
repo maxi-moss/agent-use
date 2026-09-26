@@ -140,3 +140,28 @@ ViewEvent = (
 )
 
 EventSink = Callable[[ViewEvent], None]
+
+
+class ViewEventRelay:
+    """Fans each view event out to every connected sink, in connect order."""
+
+    def __init__(self) -> None:
+        self._sinks: list[EventSink] = []
+
+    def connect(self, sink: EventSink) -> None:
+        """Add a sink that receives every later event."""
+        self._sinks.append(sink)
+
+    def __call__(self, event: ViewEvent) -> None:
+        """Deliver ``event`` to every connected sink.
+
+        Args:
+            event: The view event to deliver.
+
+        Raises:
+            RuntimeError: No sink is connected.
+        """
+        if not self._sinks:
+            raise RuntimeError("ViewEventRelay has no connected sink")
+        for sink in self._sinks:
+            sink(event)

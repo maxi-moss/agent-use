@@ -125,6 +125,19 @@ def test_every_mutation_is_persisted_with_its_kind(store_path: Path) -> None:
     assert PaneEscalations.load(store_path).entries == (q1,)
 
 
+def test_in_session_order_is_numeric_then_kind(store_path: Path) -> None:
+    store = PaneEscalations.load(store_path)
+    q10 = question_escalation("q10", "s10")
+    p10 = permission_pane("p10", "s10")
+    p2 = permission_pane("p2", "s2")
+    store.accept(q10)
+    store.accept(p2)
+    store.accept(p10)
+    # Numeric session order (s2 before s10), not arrival order; within a
+    # session, permission before question.
+    assert store.in_session_order() == [p2, p10, q10]
+
+
 def test_load_missing_file_starts_empty(store_path: Path) -> None:
     assert PaneEscalations.load(store_path).entries == ()
 

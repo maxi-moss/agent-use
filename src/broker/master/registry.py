@@ -13,9 +13,16 @@ from typing import Any, cast
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from broker.atomic_json import atomic_update_json
+from broker.herdr.driver import AGENT_NAME_RE
 from broker.protocol.constants import SessionState
 
-NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
+_SESSION_NUM = re.compile(r"s(\d+)\Z")
+
+
+def session_sort_key(name: str) -> tuple[int, str]:
+    """Order sessions by numeric id (s2 before s10); any non-'sN' name last."""
+    m = _SESSION_NUM.match(name)
+    return (int(m.group(1)), "") if m else (10**9, name)
 
 
 class SessionRecord(BaseModel):
@@ -107,15 +114,19 @@ class Registry:
         """Allocate the next session name, never reusing a freed one.
 
         Returns:
-            The allocated name, guaranteed to match ``NAME_RE``.
+            The allocated name, guaranteed to match ``AGENT_NAME_RE``.
         """
         # Monotonic, never a scan of `records`: a finished session is removed,
         # so a free-slot scan would rehand its name while its socket and logs
         # still exist on disk.
         self._name_seq += 1
         name = f"s{self._name_seq}"
-        assert NAME_RE.fullmatch(name)
+        assert AGENT_NAME_RE.fullmatch(name)
         return name
+
+    def names_in_order(self) -> list[str]:
+        """Return every session name, in numeric order (s2 before s10)."""
+        return sorted(self.records, key=session_sort_key)
 
     def get(self, name: str) -> SessionRecord:
         """Return the record stored under ``name``.
@@ -142,9 +153,9 @@ class Registry:
                 under the same name.
 
         Raises:
-            ValueError: ``record.name`` does not match ``NAME_RE``.
+            ValueError: ``record.name`` does not match ``AGENT_NAME_RE``.
         """
-        if not NAME_RE.fullmatch(record.name):
+        if not AGENT_NAME_RE.fullmatch(record.name):
             raise ValueError(f"invalid session name {record.name!r}")
         self.records[record.name] = record
         self.save()

@@ -14,6 +14,7 @@ from typing import Any, cast
 from pydantic import ValidationError
 
 from broker.atomic_json import atomic_update_json
+from broker.master.registry import session_sort_key
 from broker.protocol.schemas import PANE_ESCALATION_ADAPTER, PaneEscalationPayload
 
 
@@ -76,6 +77,13 @@ class PaneEscalations:
     def entries(self) -> tuple[PaneEscalationPayload, ...]:
         """Return every open pane escalation, in arrival order."""
         return tuple(self._entries)
+
+    def in_session_order(self) -> list[PaneEscalationPayload]:
+        """Return every open pane escalation, in numeric session order, then kind."""
+        return sorted(
+            self._entries,
+            key=lambda p: (session_sort_key(p.session_id), p.kind.value),
+        )
 
     def find(self, escalation_id: str) -> PaneEscalationPayload | None:
         """Return the open pane escalation ``escalation_id``, or ``None``."""

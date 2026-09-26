@@ -12,12 +12,8 @@ from anthropic.types import (
 )
 
 from broker.llm import TurnResult
-from broker.master.testmode.runner import (
-    SCENARIO_DIR,
-    load_scenario,
-    run_scenario,
-    scenario_names,
-)
+from broker.master.testmode.inject_command import InjectCommand
+from broker.master.testmode.runner import SCENARIO_DIR, load_scenario, run_scenario
 
 _TEST_MODE_REPLY = "test mode — LLM disabled; type /inject <scenario>"
 
@@ -37,8 +33,8 @@ async def test_mode_llm_call(
 
 __all__ = [
     "SCENARIO_DIR",
+    "InjectCommand",
     "load_scenario",
     "run_scenario",
-    "scenario_names",
     "test_mode_llm_call",
 ]

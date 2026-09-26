@@ -2,7 +2,6 @@
 runtime server; driver.subprocess.run monkeypatched; emit = recording list."""
 
 import asyncio
-import contextlib
 import json
 import subprocess
 import tempfile
@@ -19,15 +18,14 @@ from broker.decision_log import DecisionKind
 from broker.config import BrokerConfig
 from broker.herdr import driver
 from broker.master.pane_escalations import PaneEscalations
-from broker.master.queue import EscalationQueue
-from broker.master.registry import Registry, SessionRecord
-from broker.master.runtime import (
+from broker.master.payload_render import (
     PANE_UNKNOWN,
-    MasterRuntime,
     render_escalation,
-    render_permission_escalation,
     render_question_escalation,
 )
+from broker.master.queue import EscalationQueue
+from broker.master.registry import Registry, SessionRecord
+from broker.master.runtime import MasterRuntime
 from broker.master.viewmodel import (
     Attention,
     CompletionArrived,
@@ -336,7 +334,7 @@ async def rt(
     runtime = MasterRuntime(
         posts.append, registry, queue, panes, cfg, anchor_pane="%1"
     )
-    task = asyncio.create_task(runtime.serve())
+    runtime.start()
     for _ in range(200):
         if runtime.master_socket_path.exists():
             break
@@ -344,9 +342,7 @@ async def rt(
     else:
         raise TimeoutError("master socket never bound")
     yield runtime, posts
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
+    await runtime.aclose()
 
 
 async def send(
@@ -386,27 +382,6 @@ def _leaf_values(value: Any) -> Iterator[str]:
             yield from _leaf_values(item)
 
 
-async def test_escalation_rendered_verbatim(
-    rt: tuple[MasterRuntime, list[Any]]
-) -> None:
-    runtime, posts = rt
-    payload = escalation_dict()
-    resp = await send(runtime, T_ESCALATION, payload)
-    assert resp.ok
-    arrived = [m for m in posts if isinstance(m, EscalationArrived)]
-    assert len(arrived) == 1
-    rendered = arrived[0].rendered
-    # Every value the developer decides on appears byte-for-byte — no
-    # paraphrase.
-    for value in _leaf_values(payload):
-        assert value in rendered
-    assert rendered == render_escalation(
-        EscalationPayload.model_validate(payload)
-    )
-    assert runtime.queue.active is not None
-    assert runtime.queue.active.escalation_id == "e1"
-
-
 async def test_second_escalation_while_active_is_protocol_violation(
     rt: tuple[MasterRuntime, list[Any]]
 ) -> None:
@@ -424,38 +399,6 @@ async def test_second_escalation_while_active_is_protocol_violation(
     assert (
         len([m for m in posts if isinstance(m, EscalationArrived)]) == 1
     )
-
-
-async def test_permission_pane_rendered_names_pane_and_offers_no_dispatch(
-    rt: tuple[MasterRuntime, list[Any]]
-) -> None:
-    runtime, posts = rt
-    record = runtime.registry.get("s1")
-    record.pane_id = "w3:p2"
-    runtime.registry.upsert(record)
-    payload = permission_pane_dict()
-    resp = await send(runtime, T_PANE_ESCALATION, payload)
-    assert resp.ok
-    arrived = [m for m in posts if isinstance(m, PaneEscalationArrived)]
-    assert len(arrived) == 1
-    rendered = arrived[0].rendered
-    assert rendered == render_permission_escalation(
-        PermissionEscalationPayload.model_validate(payload), "w3:p2"
-    )
-    # Every field the developer judges the prompt on appears byte-for-byte.
-    # raised_at is the resolution baseline, not something they read.
-    judged = {k: v for k, v in payload.items() if k != "raised_at"}
-    for value in _leaf_values(judged):
-        assert value in rendered
-    # No timestamp reaches the block: it is carried into the master's LLM
-    # context, where a clock reading is only ever something to reason from.
-    assert payload["raised_at"] not in rendered
-    assert "w3:p2" in rendered  # the pane the native prompt is waiting in
-    assert "cannot be answered here" in rendered
-    assert "dispatch" not in rendered.lower()  # no affordance to answer it here
-    # Held apart from the decision queue, never in it.
-    assert runtime.queue.active is None
-    assert [p.escalation_id for p in runtime.panes.entries] == ["p1"]
 
 
 async def test_second_permission_pane_from_a_session_is_protocol_violation(
@@ -751,13 +694,13 @@ async def test_list_sessions_reports_permission_prompt_flag(
     stub = StatusSession(permission_prompt=True)
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
-        listing = await runtime.render_sessions_with_permission_prompts()
+        listing = await runtime.list_sessions()
         assert "s1" in listing
         assert "sitting on a permission prompt" in listing
         assert "w3:p2" in listing
         # The flag is read on demand and must NOT reach the summary the master
         # carries into every turn.
-        assert "permission prompt" not in runtime.render_registry_summary()
+        assert "permission prompt" not in runtime.registry_summary()
     finally:
         server.close()
         await server.wait_closed()
@@ -768,7 +711,7 @@ async def test_list_sessions_degrades_when_a_session_is_unreachable(
 ) -> None:
     """One dead session costs a line of the listing, never the whole listing."""
     runtime, _ = rt
-    listing = await runtime.render_sessions_with_permission_prompts()
+    listing = await runtime.list_sessions()
     assert "s1" in listing
     assert "unreachable" in listing
 
@@ -976,16 +919,14 @@ async def test_startup_resurfaces_the_persisted_head_and_open_prompts(
         cfg,
         anchor_pane="%1",
     )
-    task = asyncio.create_task(runtime.serve())
+    runtime.start()
     for _ in range(200):
         if runtime.master_socket_path.exists():
             break
         await asyncio.sleep(0.01)
     else:
         raise TimeoutError("master socket never bound")
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
+    await runtime.aclose()
     arrived = [m for m in posts if isinstance(m, EscalationArrived)]
     assert len(arrived) == 1
     assert arrived[0].escalation_id == "e1"
@@ -1070,7 +1011,7 @@ async def test_repopulate_from_brokers_fills_task_activity_at_startup(
         anchor_pane="%1",
     )
     try:
-        task = asyncio.create_task(runtime.serve())
+        runtime.start()
 
         def repopulated() -> bool:
             fleets = [m for m in posts if isinstance(m, FleetUpdated)]
@@ -1087,9 +1028,7 @@ async def test_repopulate_from_brokers_fills_task_activity_at_startup(
             raise AssertionError(
                 "startup never repopulated task_activity from the broker"
             )
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        await runtime.aclose()
     finally:
         server.close()
         await server.wait_closed()
@@ -1129,16 +1068,14 @@ async def test_repopulate_from_brokers_recovers_pending_proposal(
         anchor_pane="%1",
     )
     try:
-        task = asyncio.create_task(runtime.serve())
+        runtime.start()
         for _ in range(200):
             if "pr1" in runtime.proposals:
                 break
             await asyncio.sleep(0.01)
         else:
             raise AssertionError("startup never recovered the pending proposal")
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        await runtime.aclose()
     finally:
         server.close()
         await server.wait_closed()
@@ -1177,7 +1114,7 @@ async def test_repopulate_from_brokers_registers_nothing_when_no_proposal(
         anchor_pane="%1",
     )
     try:
-        task = asyncio.create_task(runtime.serve())
+        runtime.start()
         for _ in range(200):
             if any(
                 isinstance(m, FleetUpdated)
@@ -1188,9 +1125,7 @@ async def test_repopulate_from_brokers_registers_nothing_when_no_proposal(
             await asyncio.sleep(0.01)
         else:
             raise AssertionError("startup never probed the broker")
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        await runtime.aclose()
     finally:
         server.close()
         await server.wait_closed()
@@ -1212,7 +1147,7 @@ async def test_fleet_view_tracks_the_queue_and_open_prompts_separately(
         return (view.queue_depth, view.waiting, prompts)
 
     try:
-        assert state() == (0, (), ())  # serve() announces the loaded stores
+        assert state() == (0, (), ())  # start() announces the loaded stores
         assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
         assert state() == (1, (), ())
         assert (
@@ -1604,13 +1539,13 @@ async def test_session_ended_removes_from_fleet(
 ) -> None:
     runtime, posts = rt
     # s1 is seeded driving and visible in the summary the master carries.
-    assert "s1" in runtime.render_registry_summary()
+    assert "s1" in runtime.registry_summary()
     resp = await send(runtime, T_SESSION_ENDED, {})
     assert resp.ok
     # Removed everywhere a router looks: the summary, the fleet, and the
     # registry itself — so it can never be handed a new task or a decision.
     assert "s1" not in runtime.registry.records
-    assert runtime.render_registry_summary() == "(no sessions)"
+    assert runtime.registry_summary() == "(no sessions)"
     last_view = [m for m in posts if isinstance(m, FleetUpdated)][-1].view
     assert not any(row.session_id == "s1" for row in last_view.rows)
     # The removal is durable, and a late live-status push cannot resurrect it.
@@ -1723,7 +1658,7 @@ async def test_every_broker_message_type_is_acked(
     ).ok
 
 
-async def test_proposal_rendered_verbatim_and_tracked(
+async def test_proposal_awaits_approval_and_badges_on_arrival(
     rt: tuple[MasterRuntime, list[Any]]
 ) -> None:
     runtime, posts = rt
@@ -1734,19 +1669,12 @@ async def test_proposal_rendered_verbatim_and_tracked(
             "proposal_id": "p1",
             "proposed_prompt": "the exact proposed prompt",
             "grounding_summary": "the exact grounding summary",
-            "retrieved": [
-                {"name": "a.py::f", "score": 0.81},
-                {"name": "a.py::g", "score": None},
-            ],
         },
     )
     assert resp.ok
-    arrived = [m for m in posts if isinstance(m, ProposalArrived)]
-    assert len(arrived) == 1
-    assert "the exact proposed prompt" in arrived[0].rendered
-    assert "the exact grounding summary" in arrived[0].rendered
-    assert "## Retrieved code\n- a.py::f (seed 0.81)\n- a.py::g" in arrived[0].rendered
-    assert runtime.registry.get("s1").state == "awaiting_approval"
+    assert len([m for m in posts if isinstance(m, ProposalArrived)]) == 1
+    assert list(runtime.proposals) == ["p1"]
+    assert runtime.registry.get("s1").state == SessionState.AWAITING_APPROVAL
     # The badge reaches the sidebar on this push, not on some later unrelated
     # one — the developer needs to see it the moment it arrives.
     row = [m for m in posts if isinstance(m, FleetUpdated)][-1].view.rows[0]
@@ -2532,7 +2460,7 @@ async def test_list_sessions_probes_rather_than_reading_the_pushed_map(
     stub = StatusSession(permission_prompt=True)
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
-        listing = await runtime.render_sessions_with_permission_prompts()
+        listing = await runtime.list_sessions()
         # The tool's authoritative probe wins over the stale pushed state.
         assert "sitting on a permission prompt" in listing
     finally:
