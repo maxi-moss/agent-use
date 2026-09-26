@@ -22,7 +22,6 @@ from broker.herdr import driver
 from broker.master.__main__ import log_notice
 from broker.master.pane_escalations import PaneEscalations
 from broker.master.payload_render import (
-    PANE_UNKNOWN,
     render_escalation,
     render_question_escalation,
 )
@@ -46,7 +45,6 @@ from broker.protocol.constants import (
     PaneKind,
     SessionState,
     T_APPROVE_PROMPT,
-    T_CLARIFY_ESCALATION,
     T_BUDGET_UPDATE,
     T_COMPLETION,
     T_DECISION_DELIVERED,
@@ -119,19 +117,6 @@ class ReasoningNackSession:
 
     async def handler(self, env: Envelope) -> Response:
         return Response(id=env.id, ok=False, payload={"error": self.reason})
-
-
-class ClarifyingSession:
-    """Session-socket handler answering clarify_escalation with a fixed answer."""
-
-    answer = "it tried A"
-
-    def __init__(self) -> None:
-        self.envelopes: list[Envelope] = []
-
-    async def handler(self, env: Envelope) -> Response:
-        self.envelopes.append(env)
-        return Response(id=env.id, ok=True, payload={"answer": self.answer})
 
 
 class FakeProcess:
@@ -463,8 +448,8 @@ async def test_second_escalation_while_active_is_protocol_violation(
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("PROTOCOL VIOLATION" in t for t in notices)
     # The first escalation stays active; the second is never surfaced.
-    assert runtime.queue.active is not None
-    assert runtime.queue.active.escalation_id == "e1"
+    assert runtime.desk.queue.active is not None
+    assert runtime.desk.queue.active.escalation_id == "e1"
     assert (
         len([m for m in posts if isinstance(m, EscalationArrived)]) == 1
     )
@@ -481,7 +466,7 @@ async def test_second_permission_pane_from_a_session_supersedes_the_first(
     assert (
         await send(runtime, T_PANE_ESCALATION, permission_pane_dict("p2"))
     ).ok
-    assert [p.escalation_id for p in runtime.panes.entries] == ["p2"]
+    assert [p.escalation_id for p in runtime.desk.panes.entries] == ["p2"]
     arrived = [m for m in posts if isinstance(m, PaneEscalationArrived)]
     assert [m.escalation_id for m in arrived] == ["p1", "p2"]
     notices = [m.text for m in posts if isinstance(m, Notice)]
@@ -499,8 +484,8 @@ async def test_permission_pane_never_waits_behind_a_decision(
     # The native prompt is already blocking the session, so the developer is
     # told about it now — it takes no place in the decision queue.
     assert resp.ok
-    assert runtime.queue.active is not None
-    assert runtime.queue.active.escalation_id == "e1"
+    assert runtime.desk.queue.active is not None
+    assert runtime.desk.queue.active.escalation_id == "e1"
     arrived = [m for m in posts if isinstance(m, PaneEscalationArrived)]
     assert [m.escalation_id for m in arrived] == ["p1"]
     notify_calls = [
@@ -528,9 +513,9 @@ async def test_question_escalation_never_queued_and_announced_at_once(
     assert (await send(runtime, T_PANE_ESCALATION, payload, session="s2")).ok
     # The menu is already blocking s2, so the developer hears of it now; it
     # never takes a place in the decision queue or moves its head.
-    assert runtime.queue.depth == 1
-    assert runtime.queue.active is not None
-    assert runtime.queue.active.escalation_id == "e1"
+    assert runtime.desk.queue.depth == 1
+    assert runtime.desk.queue.active is not None
+    assert runtime.desk.queue.active.escalation_id == "e1"
     assert runtime.registry.get("s2").state == SessionState.DRIVING
     arrived = [m for m in posts if isinstance(m, PaneEscalationArrived)]
     assert [(m.kind, m.escalation_id) for m in arrived] == [
@@ -571,33 +556,6 @@ async def test_unreadable_menu_still_surfaces(
     assert "reason-value" in arrived[0].rendered
 
 
-async def test_dispatch_and_clarify_refuse_a_question_naming_the_pane(
-    rt: tuple[MasterRuntime, list[Any]], home: Path
-) -> None:
-    runtime, _ = rt
-    record = runtime.registry.get("s1")
-    record.pane_id = "w3:p2"
-    runtime.registry.upsert(record)
-    stub = StubSession()
-    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
-    try:
-        assert (
-            await send(runtime, T_PANE_ESCALATION, question_escalation_dict("q1"))
-        ).ok
-        dispatched = await runtime.dispatch("q1", "label-a")
-        clarified = await runtime.clarify_escalation("q1", "why?")
-        for result in (dispatched, clarified):
-            assert "an AskUserQuestion menu" in result
-            assert "pane w3:p2" in result
-        assert dispatched.startswith("decision NOT dispatched")
-        assert clarified.startswith("question NOT sent")
-        assert stub.envelopes == []
-        assert runtime.panes.find("q1") is not None
-    finally:
-        server.close()
-        await server.wait_closed()
-
-
 async def test_prompt_undelivered_becomes_a_notice(
     rt: tuple[MasterRuntime, list[Any]]
 ) -> None:
@@ -628,7 +586,7 @@ async def test_malformed_permission_pane_nacked_never_surfaced(
     assert [m for m in posts if isinstance(m, PaneEscalationArrived)] == []
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("MALFORMED" in t for t in notices)
-    assert runtime.panes.entries == ()
+    assert runtime.desk.panes.entries == ()
 
 
 async def test_escalation_from_an_unknown_session_never_enters_the_queue(
@@ -650,43 +608,10 @@ async def test_escalation_from_an_unknown_session_never_enters_the_queue(
     )
     assert not resp.ok
     assert resp.payload["reason_code"] == NackCode.UNKNOWN_SESSION
-    assert runtime.queue.active is None
-    assert runtime.panes.entries == ()
+    assert runtime.desk.queue.active is None
+    assert runtime.desk.panes.entries == ()
     assert [m for m in posts if isinstance(m, EscalationArrived)] == []
     assert [m for m in posts if isinstance(m, PaneEscalationArrived)] == []
-
-
-async def test_dispatch_refuses_permission_pane(
-    rt: tuple[MasterRuntime, list[Any]], home: Path
-) -> None:
-    runtime, posts = rt
-    stub = StubSession()
-    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
-    try:
-        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-        assert (
-            await send(
-                runtime, T_PANE_ESCALATION, permission_pane_dict("p1")
-            )
-        ).ok
-        result = await runtime.dispatch("p1", "yes, go ahead")
-        # Refused as a permission prompt, not as a stale decision: the
-        # developer is told where the answer belongs.
-        assert "NOT dispatched" in result
-        assert "permission prompt" in result
-        # The registry has no pane for s1 here; the refusal still has to say
-        # where the answer belongs rather than go silent.
-        assert PANE_UNKNOWN in result
-        assert stub.envelopes == []  # nothing reached the session
-        # Nothing was resolved either.
-        assert runtime.panes.find("p1") is not None
-        assert runtime.queue.active is not None
-        assert runtime.queue.active.escalation_id == "e1"
-        notices = [m.text for m in posts if isinstance(m, Notice)]
-        assert any("NOT dispatched" in t for t in notices)
-    finally:
-        server.close()
-        await server.wait_closed()
 
 
 async def test_reassign_retracts_that_sessions_permission_pane(
@@ -699,7 +624,7 @@ async def test_reassign_retracts_that_sessions_permission_pane(
     other = PermissionEscalationPayload.model_validate(
         permission_pane_dict("p9", "s9")
     )
-    runtime.panes.accept(other)
+    runtime.desk.panes.accept(other)
     assert (
         await send(
             runtime, T_PANE_ESCALATION, permission_pane_dict("p1")
@@ -708,7 +633,7 @@ async def test_reassign_retracts_that_sessions_permission_pane(
     await runtime.reassign_session("s1", "take it from here")
     # Its permission module died with the broker, so nothing else would ever
     # clear it.
-    assert runtime.panes.entries == (other,)
+    assert runtime.desk.panes.entries == (other,)
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("p1" in t and "retracted" in t for t in notices)
 
@@ -729,13 +654,13 @@ async def test_stop_session_retracts_that_sessions_permission_pane(
     await runtime.stop_session("s1")
     # Both raisers died with the broker and the native prompts are still on
     # screen, so no retraction is ever coming.
-    assert runtime.panes.entries == ()
+    assert runtime.desk.panes.entries == ()
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("p1" in t and "retracted" in t for t in notices)
     assert any("q1" in t and "retracted" in t for t in notices)
     # The decision escalation from the same session is kept on purpose.
-    assert runtime.queue.active is not None
-    assert runtime.queue.active.escalation_id == "e1"
+    assert runtime.desk.queue.active is not None
+    assert runtime.desk.queue.active.escalation_id == "e1"
 
 
 async def test_get_permission_log_round_trip(
@@ -796,7 +721,7 @@ async def test_retract_clears_head_and_informs(
         {"escalation_id": "e1", "reason": "resolved in pane"},
     )
     assert resp.ok
-    assert runtime.queue.active is None
+    assert runtime.desk.queue.active is None
     # The broker pushes its own way out of ESCALATED; the master never
     # invents the state it moved to.
     assert runtime.registry.get("s1").state == SessionState.ESCALATED
@@ -827,131 +752,9 @@ async def test_permission_retract_leaves_session_state_alone(
         )
     ).ok
     assert runtime.registry.get("s1").state == SessionState.ESCALATED
-    assert runtime.panes.entries == ()
+    assert runtime.desk.panes.entries == ()
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("p1" in t and "retracted: answered" in t for t in notices)
-
-
-async def test_queued_escalation_surfaces_after_resolve(
-    rt: tuple[MasterRuntime, list[Any]],
-    home: Path,
-    recording_run: RecordingRun,
-) -> None:
-    runtime, posts = rt
-    _add_session(runtime, "s2")
-    stub = StubSession()
-    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
-
-    def surfaced() -> list[str]:
-        return [m.escalation_id for m in posts if isinstance(m, EscalationArrived)]
-
-    try:
-        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-        assert (
-            await send(runtime, T_ESCALATION, escalation_dict("e2", "s2"), "s2")
-        ).ok
-        assert surfaced() == ["e1"]
-        result = await runtime.dispatch("e1", "use option B")
-        assert "dispatched" in result
-        # Resolution waits for confirmed delivery: e1 is still the head and
-        # nothing new surfaces until the broker confirms it reached the pane.
-        assert surfaced() == ["e1"]
-        assert runtime.queue.active is not None
-        assert runtime.queue.active.escalation_id == "e1"
-        assert (await send(runtime, T_DECISION_DELIVERED, {"escalation_id": "e1"})).ok
-        assert surfaced() == ["e1", "e2"]
-        assert runtime.queue.active is not None
-        assert runtime.queue.active.escalation_id == "e2"
-        notify_calls = [
-            c for c in recording_run.calls if c[1:3] == ["notification", "show"]
-        ]
-        assert len(notify_calls) == 2  # one per surfacing, none at accept
-    finally:
-        server.close()
-        await server.wait_closed()
-
-
-async def test_queued_escalation_surfaces_after_retract(
-    rt: tuple[MasterRuntime, list[Any]]
-) -> None:
-    runtime, posts = rt
-    _add_session(runtime, "s2")
-    assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-    assert (await send(runtime, T_ESCALATION, escalation_dict("e2", "s2"), "s2")).ok
-    assert (
-        await send(
-            runtime,
-            T_ESCALATION_RETRACT,
-            {"escalation_id": "e1", "reason": "answered"},
-        )
-    ).ok
-    arrived = [m.escalation_id for m in posts if isinstance(m, EscalationArrived)]
-    assert arrived == ["e1", "e2"]
-    assert runtime.queue.active is not None
-    assert runtime.queue.active.escalation_id == "e2"
-
-
-async def test_retracted_queued_escalation_is_never_surfaced(
-    rt: tuple[MasterRuntime, list[Any]]
-) -> None:
-    runtime, posts = rt
-    _add_session(runtime, "s2")
-    assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-    assert (await send(runtime, T_ESCALATION, escalation_dict("e2", "s2"), "s2")).ok
-    assert (
-        await send(
-            runtime,
-            T_ESCALATION_RETRACT,
-            {"escalation_id": "e2", "reason": "resolved in pane"},
-            "s2",
-        )
-    ).ok
-    assert (
-        await send(
-            runtime,
-            T_ESCALATION_RETRACT,
-            {"escalation_id": "e1", "reason": "answered"},
-        )
-    ).ok
-    # The queued escalation was withdrawn before its turn; announcing it would
-    # hand the developer a decision nobody is waiting on.
-    arrived = [m.escalation_id for m in posts if isinstance(m, EscalationArrived)]
-    assert arrived == ["e1"]
-    assert runtime.queue.active is None
-
-
-async def test_notification_fires_at_surface_time_not_accept(
-    rt: tuple[MasterRuntime, list[Any]],
-    home: Path,
-    recording_run: RecordingRun,
-) -> None:
-    runtime, _ = rt
-    _add_session(runtime, "s2")
-    stub = StubSession()
-    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
-
-    def notify_count() -> int:
-        return len(
-            [
-                c
-                for c in recording_run.calls
-                if c[1:3] == ["notification", "show"]
-            ]
-        )
-
-    try:
-        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-        assert (
-            await send(runtime, T_ESCALATION, escalation_dict("e2", "s2"), "s2")
-        ).ok
-        assert notify_count() == 1  # only the surfaced head is announced
-        await runtime.dispatch("e1", "use option B")
-        assert notify_count() == 1  # nothing new surfaces before delivery lands
-        assert (await send(runtime, T_DECISION_DELIVERED, {"escalation_id": "e1"})).ok
-        assert notify_count() == 2  # the next head announces when it surfaces
-    finally:
-        server.close()
-        await server.wait_closed()
 
 
 async def test_startup_resurfaces_the_persisted_head_and_open_prompts(
@@ -1250,7 +1053,7 @@ async def test_fleet_view_tracks_the_queue_and_open_prompts_separately(
             )
         ).ok
         assert state() == (1, (), ("p1",))  # counted apart from the queue
-        await runtime.dispatch("e1", "use option B")
+        await runtime.desk.dispatch("e1", "use option B")
         assert state() == (1, (), ("p1",))  # unresolved until delivery lands
         assert (await send(runtime, T_DECISION_DELIVERED, {"escalation_id": "e1"})).ok
         assert state() == (0, (), ("p1",))
@@ -1267,28 +1070,6 @@ async def test_fleet_view_tracks_the_queue_and_open_prompts_separately(
         await server.wait_closed()
 
 
-async def test_dispatch_aborts_on_stale_escalation(
-    rt: tuple[MasterRuntime, list[Any]], home: Path
-) -> None:
-    runtime, posts = rt
-    stub = StubSession()
-    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
-    try:
-        # No active escalation at all.
-        result = await runtime.dispatch("ghost", "option B")
-        assert "NOT dispatched" in result
-        # Mismatched id while another escalation is active.
-        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-        result = await runtime.dispatch("e2", "option B")
-        assert "NOT dispatched" in result
-        assert stub.envelopes == []  # nothing ever reached the session
-        notices = [m.text for m in posts if isinstance(m, Notice)]
-        assert any("NOT dispatched" in t for t in notices)
-    finally:
-        server.close()
-        await server.wait_closed()
-
-
 async def test_dispatch_delivers_decision_when_live(
     rt: tuple[MasterRuntime, list[Any]], home: Path
 ) -> None:
@@ -1298,7 +1079,7 @@ async def test_dispatch_delivers_decision_when_live(
     try:
         assert (await send(runtime, T_LIVE_STATUS, {"state": "escalated"})).ok
         assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-        result = await runtime.dispatch("e1", "use option B")
+        result = await runtime.desk.dispatch("e1", "use option B")
         assert "dispatched" in result
         assert len(stub.envelopes) == 1
         env = stub.envelopes[0]
@@ -1307,10 +1088,10 @@ async def test_dispatch_delivers_decision_when_live(
         assert env.payload["response"] == "use option B"
         # The ACK only accepts it for processing: e1 stays the live head until
         # the broker confirms delivery, then it resolves.
-        assert runtime.queue.active is not None
-        assert runtime.queue.active.escalation_id == "e1"
+        assert runtime.desk.queue.active is not None
+        assert runtime.desk.queue.active.escalation_id == "e1"
         assert (await send(runtime, T_DECISION_DELIVERED, {"escalation_id": "e1"})).ok
-        assert runtime.queue.active is None
+        assert runtime.desk.queue.active is None
         # Single authority: the master never invents DRIVING — the state stays
         # until the broker reports its own transition.
         assert runtime.registry.get("s1").state == "escalated"
@@ -1318,73 +1099,6 @@ async def test_dispatch_delivers_decision_when_live(
             await send(runtime, T_LIVE_STATUS, {"state": "driving"})
         ).ok
         assert runtime.registry.get("s1").state == "driving"
-    finally:
-        server.close()
-        await server.wait_closed()
-
-
-async def test_undelivered_still_live_keeps_escalation_for_redecide(
-    rt: tuple[MasterRuntime, list[Any]], home: Path
-) -> None:
-    runtime, posts = rt
-    stub = StubSession()
-    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
-    try:
-        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-        assert "dispatched" in await runtime.dispatch("e1", "use option B")
-        assert (
-            await send(
-                runtime,
-                T_DECISION_UNDELIVERED,
-                {
-                    "escalation_id": "e1",
-                    "detail": "SubmitTimeout: pane wedged",
-                    "still_live": True,
-                },
-            )
-        ).ok
-        # A failed pane write never resolved e1: it is reported loudly and
-        # stays the live head so the developer can dispatch again.
-        notices = [m.text for m in posts if isinstance(m, Notice)]
-        assert any("did NOT reach" in t and "e1" in t for t in notices)
-        assert runtime.queue.active is not None
-        assert runtime.queue.active.escalation_id == "e1"
-        # The in-flight lock cleared, so a re-decide dispatches rather than
-        # bouncing off a decision that is supposedly still being delivered.
-        assert "dispatched" in await runtime.dispatch("e1", "retry")
-    finally:
-        server.close()
-        await server.wait_closed()
-
-
-async def test_undelivered_stale_retracts_orphaned_entry(
-    rt: tuple[MasterRuntime, list[Any]], home: Path
-) -> None:
-    runtime, posts = rt
-    stub = StubSession()
-    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
-    try:
-        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-        assert "dispatched" in await runtime.dispatch("e1", "use option B")
-        assert (
-            await send(
-                runtime,
-                T_DECISION_UNDELIVERED,
-                {
-                    "escalation_id": "e1",
-                    "detail": "session had already moved past this escalation",
-                    "still_live": False,
-                },
-            )
-        ).ok
-        # The broker no longer holds e1 (e.g. answered before a master
-        # restart): the orphaned entry is dropped so the queue cannot wedge.
-        assert runtime.queue.active is None
-        notices = [m.text for m in posts if isinstance(m, Notice)]
-        assert any("cleared" in t and "e1" in t for t in notices)
-        # The in-flight lock cleared with it: a fresh escalation dispatches.
-        assert (await send(runtime, T_ESCALATION, escalation_dict("e2"))).ok
-        assert "dispatched" in await runtime.dispatch("e2", "go")
     finally:
         server.close()
         await server.wait_closed()
@@ -1398,59 +1112,14 @@ async def test_stop_session_clears_inflight_for_its_own_head(
     server = await serve_unix(home / "s" / "s1.sock", stub.handler)
     try:
         assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-        assert "dispatched" in await runtime.dispatch("e1", "go")
+        assert "dispatched" in await runtime.desk.dispatch("e1", "go")
         # Stopped mid-delivery: no delivered/undelivered reply ever clears the
         # marker, so the stop must, or a re-dispatch is wrongly refused.
         await runtime.stop_session("s1")
         assert (
             "already being delivered"
-            not in await runtime.dispatch("e1", "retry")
+            not in await runtime.desk.dispatch("e1", "retry")
         )
-    finally:
-        server.close()
-        await server.wait_closed()
-
-
-async def test_second_dispatch_refused_while_inflight(
-    rt: tuple[MasterRuntime, list[Any]], home: Path
-) -> None:
-    runtime, _ = rt
-    stub = StubSession()
-    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
-    try:
-        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-        assert "dispatched" in await runtime.dispatch("e1", "first")
-        # A decision is already on its way to the pane; a second would
-        # double-submit the same escalation.
-        result = await runtime.dispatch("e1", "second")
-        assert "already being delivered" in result
-        assert len(stub.envelopes) == 1  # the second never reached the session
-    finally:
-        server.close()
-        await server.wait_closed()
-
-
-async def test_delivery_reply_before_dispatch_ack_leaves_no_inflight_marker(
-    rt: tuple[MasterRuntime, list[Any]], home: Path
-) -> None:
-    runtime, _ = rt
-
-    async def deliver_then_ack(env: Envelope) -> Response:
-        reply = await send(runtime, T_DECISION_DELIVERED, {"escalation_id": "e1"})
-        assert reply.ok
-        return Response(id=env.id, ok=True)
-
-    server = await serve_unix(home / "s" / "s1.sock", deliver_then_ack)
-    try:
-        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-        first = await runtime.dispatch("e1", "go")
-        assert first.startswith("decision dispatched"), first
-        assert runtime.queue.active is None
-        # A marker set after the ACK would name the resolved e1 and refuse
-        # every later dispatch as already being delivered.
-        assert (await send(runtime, T_ESCALATION, escalation_dict("e2"))).ok
-        second = await runtime.dispatch("e2", "go")
-        assert second.startswith("decision dispatched"), second
     finally:
         server.close()
         await server.wait_closed()
@@ -1484,105 +1153,12 @@ async def test_fatal_error_retracts_a_live_escalation(
             )
         ).ok
         assert runtime.registry.get("s1").state == "error"
-        assert runtime.queue.active is None
-        assert runtime.panes.entries == ()
+        assert runtime.desk.queue.active is None
+        assert runtime.desk.panes.entries == ()
         notices = [m.text for m in posts if isinstance(m, Notice)]
         assert any("e1" in t and "retracted" in t for t in notices)
         assert any("p1" in t and "retracted" in t for t in notices)
         assert any("q1" in t and "retracted" in t for t in notices)
-    finally:
-        server.close()
-        await server.wait_closed()
-
-
-async def test_clarify_escalation_relays_answer(
-    rt: tuple[MasterRuntime, list[Any]], home: Path
-) -> None:
-    runtime, posts = rt
-    stub = ClarifyingSession()
-    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
-    try:
-        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-        result = await runtime.clarify_escalation("e1", "what did it try?")
-        assert len(stub.envelopes) == 1
-        env = stub.envelopes[0]
-        assert env.type == T_CLARIFY_ESCALATION
-        assert env.payload == {"escalation_id": "e1", "question": "what did it try?"}
-        # The answer reaches the developer verbatim; the tool loop gets only
-        # an acknowledgement it cannot paraphrase from.
-        notices = [m.text for m in posts if isinstance(m, Notice)]
-        assert any("it tried A" in t and "e1" in t for t in notices)
-        assert "it tried A" not in result
-        assert "shown to the developer" in result
-        active = runtime.queue.active
-        assert active is not None and active.escalation_id == "e1"
-    finally:
-        server.close()
-        await server.wait_closed()
-
-
-async def test_clarify_escalation_wrong_id(
-    rt: tuple[MasterRuntime, list[Any]], home: Path
-) -> None:
-    runtime, posts = rt
-    stub = ClarifyingSession()
-    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
-    try:
-        result = await runtime.clarify_escalation("ghost", "q")
-        assert "NOT sent" in result
-        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-        result = await runtime.clarify_escalation("e2", "q")
-        assert "NOT sent" in result
-        assert stub.envelopes == []
-        notices = [m.text for m in posts if isinstance(m, Notice)]
-        assert any("NOT sent" in t for t in notices)
-    finally:
-        server.close()
-        await server.wait_closed()
-
-
-async def test_clarify_escalation_permission_refused(
-    rt: tuple[MasterRuntime, list[Any]], home: Path
-) -> None:
-    runtime, posts = rt
-    stub = ClarifyingSession()
-    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
-    try:
-        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-        assert (
-            await send(
-                runtime, T_PANE_ESCALATION, permission_pane_dict("p1")
-            )
-        ).ok
-        result = await runtime.clarify_escalation("p1", "q")
-        assert "NOT sent" in result
-        assert "permission prompt" in result
-        assert PANE_UNKNOWN in result
-        assert stub.envelopes == []
-        assert runtime.panes.find("p1") is not None
-        notices = [m.text for m in posts if isinstance(m, Notice)]
-        assert any("NOT sent" in t for t in notices)
-    finally:
-        server.close()
-        await server.wait_closed()
-
-
-async def test_clarify_escalation_broker_nack(
-    rt: tuple[MasterRuntime, list[Any]], home: Path
-) -> None:
-    runtime, posts = rt
-    stub = ReasoningNackSession()
-    stub.reason = "escalation resolved in the pane"
-    server = await serve_unix(home / "s" / "s1.sock", stub.handler)
-    try:
-        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-        result = await runtime.clarify_escalation("e1", "q")
-        assert result.startswith("no clarification from session s1")
-        assert result.endswith(": escalation resolved in the pane")
-        notices = [m.text for m in posts if isinstance(m, Notice)]
-        assert result in notices
-        # The master never resolves on the broker's behalf.
-        assert runtime.queue.active is not None
     finally:
         server.close()
         await server.wait_closed()
@@ -1703,16 +1279,16 @@ async def test_session_ended_retracts_its_stranded_escalation(
         await send(runtime, T_PANE_ESCALATION, question_escalation_dict("q1"))
     ).ok
     other = EscalationPayload.model_validate(escalation_dict("e9", "s9"))
-    runtime.queue.accept(other)
-    assert runtime.queue.active is not other
+    runtime.desk.queue.accept(other)
+    assert runtime.desk.queue.active is not other
     resp = await send(runtime, T_SESSION_ENDED, {})
     assert resp.ok
     # The broker exits without withdrawing either, so ending must retract
     # both — otherwise the head wedges the queue forever, undispatchable to a
     # gone session, and the open prompt stays shown for a session that is gone.
-    assert runtime.queue.depth == 1
-    assert runtime.queue.active is other
-    assert runtime.panes.entries == ()
+    assert runtime.desk.queue.depth == 1
+    assert runtime.desk.queue.active is other
+    assert runtime.desk.panes.entries == ()
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("e1" in t and "retracted" in t for t in notices)
     assert any("p1" in t and "retracted" in t for t in notices)
@@ -1731,7 +1307,7 @@ async def test_thin_escalation_rejected(
     assert [m for m in posts if isinstance(m, EscalationArrived)] == []
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("MALFORMED" in t for t in notices)
-    assert runtime.queue.active is None
+    assert runtime.desk.queue.active is None
 
 
 async def test_every_broker_message_type_is_acked(
@@ -1850,10 +1426,10 @@ async def test_dispatch_reports_rejection_when_session_nacks(
     try:
         assert (await send(runtime, T_LIVE_STATUS, {"state": "escalated"})).ok
         assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
-        result = await runtime.dispatch("e1", "use option B")
+        result = await runtime.desk.dispatch("e1", "use option B")
         assert "rejected" in result
         # A NACKed dispatch must not be treated as delivered.
-        assert runtime.queue.active is not None
+        assert runtime.desk.queue.active is not None
         assert runtime.registry.get("s1").state != "driving"
         notices = [m.text for m in posts if isinstance(m, Notice)]
         assert any("rejected" in t for t in notices)
@@ -2207,6 +1783,9 @@ async def test_broker_exit_no_stop_asked_for_leaves_the_session_unmanaged(
     assert len(notices) == 1
     assert "exit code 1" in notices[0]
     assert str(stderr_path) in notices[0]
+    # No message or tool call brackets the exit, so the watcher publishes.
+    row = [m for m in posts if isinstance(m, FleetUpdated)][-1].view.rows[0]
+    assert row.state == SessionState.UNMANAGED
 
 
 async def test_attach_refuses_while_a_broker_still_answers(
@@ -2295,25 +1874,25 @@ async def test_attach_retracts_stranded_escalations(
     other_prompt = PermissionEscalationPayload.model_validate(
         permission_pane_dict("p9", "s9")
     )
-    runtime.queue.accept(other_decision)
-    runtime.panes.accept(other_prompt)
-    runtime.queue.accept(
+    runtime.desk.queue.accept(other_decision)
+    runtime.desk.panes.accept(other_prompt)
+    runtime.desk.queue.accept(
         EscalationPayload.model_validate(escalation_dict("e1", "s1"))
     )
-    runtime.panes.accept(
+    runtime.desk.panes.accept(
         PermissionEscalationPayload.model_validate(
             permission_pane_dict("p1", "s1")
         )
     )
-    runtime.panes.accept(
+    runtime.desk.panes.accept(
         QuestionEscalationPayload.model_validate(question_escalation_dict("q1"))
     )
     await runtime.attach_session("s1")
     assert spawn.argvs != []  # the refusals all passed and a broker spawned
     # Both kinds retracted: a live entry would refuse the resumed broker's
     # first raise, and a dispatched decision would be discarded to its log.
-    assert runtime.queue.entries == (other_decision,)
-    assert runtime.panes.entries == (other_prompt,)
+    assert runtime.desk.queue.entries == (other_decision,)
+    assert runtime.desk.panes.entries == (other_prompt,)
     notices = [m.text for m in posts if isinstance(m, Notice)]
     assert any("e1" in t and "retracted" in t for t in notices)
     assert any("p1" in t and "retracted" in t for t in notices)
@@ -2606,8 +2185,8 @@ async def test_every_message_from_an_unknown_session_is_refused(
         resp = await send(runtime, msg_type, payload, session="ghost")
         assert resp.payload["reason_code"] == NackCode.UNKNOWN_SESSION, msg_type
     assert list(runtime.registry.records) == ["s1"]
-    assert runtime.queue.active is None
-    assert runtime.panes.entries == ()
+    assert runtime.desk.queue.active is None
+    assert runtime.desk.panes.entries == ()
     assert runtime.board.proposals == {}
     assert all(isinstance(m, Notice) for m in posts[before:])
 
@@ -2623,8 +2202,8 @@ async def test_escalation_naming_another_session_is_refused(
         runtime, T_PANE_ESCALATION, permission_pane_dict("p1", "s2")
     )
     assert resp.payload["reason_code"] == NackCode.UNKNOWN_SESSION
-    assert runtime.queue.active is None
-    assert runtime.panes.entries == ()
+    assert runtime.desk.queue.active is None
+    assert runtime.desk.panes.entries == ()
     assert runtime.registry.get("s2").state == SessionState.DRIVING
 
 

@@ -30,6 +30,7 @@ from broker.master.llm import (
     MasterLLM,
     bind_call_turn,
 )
+from broker.master.escalation_desk import EscalationDesk
 from broker.master.pane_escalations import PaneEscalations
 from broker.master.payload_render import (
     render_escalation,
@@ -51,6 +52,26 @@ from broker.protocol.schemas import (
 )
 
 
+class RecordingDesk(EscalationDesk):
+    """Real desk object; dispatch records instead of sending."""
+
+    def __init__(
+        self, runtime: MasterRuntime, dispatched: list[tuple[str, str]]
+    ) -> None:
+        super().__init__(
+            runtime.desk.queue,
+            runtime.desk.panes,
+            runtime.registry,
+            runtime.link,
+            runtime.emit,
+        )
+        self.dispatched = dispatched
+
+    async def dispatch(self, escalation_id: str, decision: str) -> str:
+        self.dispatched.append((escalation_id, decision))
+        return "dispatched"
+
+
 class RecordingRuntime(MasterRuntime):
     """Real runtime object; session-control methods record instead of act."""
 
@@ -69,15 +90,12 @@ class RecordingRuntime(MasterRuntime):
         )
         self.spawned: list[tuple[str, str]] = []
         self.dispatched: list[tuple[str, str]] = []
+        self.desk = RecordingDesk(self, self.dispatched)
         self.sent: list[tuple[str, str]] = []
 
     async def spawn_session(self, intent: str, cwd: str) -> str:
         self.spawned.append((intent, cwd))
         return "spawned"
-
-    async def dispatch(self, escalation_id: str, decision: str) -> str:
-        self.dispatched.append((escalation_id, decision))
-        return "dispatched"
 
     async def send_prompt(self, session_id: str, text: str) -> str:
         self.sent.append((session_id, text))
@@ -236,7 +254,7 @@ async def test_intent_passes_through_unrewritten(
 async def test_decision_dispatches_with_active_escalation(
     runtime: RecordingRuntime,
 ) -> None:
-    runtime.queue.accept(ESCALATION)
+    runtime.desk.queue.accept(ESCALATION)
     fake = FakeLLM(
         [
             TurnResult(
@@ -261,7 +279,7 @@ async def test_decision_dispatches_with_active_escalation(
 async def test_escalation_block_is_byte_identical(
     runtime: RecordingRuntime,
 ) -> None:
-    runtime.queue.accept(ESCALATION)
+    runtime.desk.queue.accept(ESCALATION)
     fake = FakeLLM([TurnResult(text="ok")])
     master = make_master(runtime, fake)
     await master.handle_developer_message("what is s1 waiting on?")
@@ -274,8 +292,8 @@ async def test_escalation_block_is_byte_identical(
 async def test_open_permission_pane_reaches_llm_context(
     runtime: RecordingRuntime,
 ) -> None:
-    runtime.queue.accept(ESCALATION)
-    runtime.panes.accept(PERMISSION_ESCALATION)
+    runtime.desk.queue.accept(ESCALATION)
+    runtime.desk.panes.accept(PERMISSION_ESCALATION)
     fake = FakeLLM([TurnResult(text="ok")])
     master = make_master(runtime, fake)
     await master.handle_developer_message("what is s1 waiting on?")
@@ -285,7 +303,7 @@ async def test_open_permission_pane_reaches_llm_context(
     assert render_escalation(ESCALATION) in texts
     assert (
         render_permission_escalation(
-            PERMISSION_ESCALATION, runtime.pane_of("s1")
+            PERMISSION_ESCALATION, runtime.desk.pane_of("s1")
         )
         in texts
     )
@@ -294,13 +312,15 @@ async def test_open_permission_pane_reaches_llm_context(
 async def test_question_escalation_is_its_own_block_never_the_active_one(
     runtime: RecordingRuntime,
 ) -> None:
-    runtime.queue.accept(ESCALATION)
-    runtime.panes.accept(QUESTION_ESCALATION)
+    runtime.desk.queue.accept(ESCALATION)
+    runtime.desk.panes.accept(QUESTION_ESCALATION)
     fake = FakeLLM([TurnResult(text="ok")])
     master = make_master(runtime, fake)
     await master.handle_developer_message("what is waiting?")
     texts = _block_texts(fake.calls[0])
-    rendered = render_question_escalation(QUESTION_ESCALATION, runtime.pane_of("s2"))
+    rendered = render_question_escalation(
+        QUESTION_ESCALATION, runtime.desk.pane_of("s2")
+    )
     header = texts.index("# Open question escalation — session s2")
     assert texts[header + 1] == rendered
     active = texts.index("# Active escalation")
@@ -311,8 +331,8 @@ async def test_question_escalation_is_its_own_block_never_the_active_one(
 async def test_llm_context_carries_only_the_surfaced_head(
     runtime: RecordingRuntime,
 ) -> None:
-    runtime.queue.accept(ESCALATION)
-    runtime.queue.accept(WAITING_ESCALATION)
+    runtime.desk.queue.accept(ESCALATION)
+    runtime.desk.queue.accept(WAITING_ESCALATION)
     fake = FakeLLM([TurnResult(text="ok")])
     master = make_master(runtime, fake)
     await master.handle_developer_message("status?")

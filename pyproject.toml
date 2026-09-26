@@ -147,5 +147,5 @@ exhaustive = true
 layers = [
     "__main__",
     "tui",
-    "testmode : llm : runtime : fleet_board : queue : registry : pane_escalations : payload_render : broker_link : registry_reconcile : outcome : notifier : viewmodel",
+    "testmode : llm : runtime : escalation_desk : fleet_board : queue : registry : pane_escalations : payload_render : broker_link : registry_reconcile : outcome : notifier : viewmodel",
 ]

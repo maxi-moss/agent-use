@@ -419,7 +419,7 @@ async def _run_pane_retract(
 
 async def _run_dispatch(index: int, step: DispatchStep, ctx: _Context) -> StepResult:
     """Dispatch a decision and check whether it was expected to land."""
-    outcome = await ctx.runtime.dispatch(step.escalation_id, step.decision)
+    outcome = await ctx.runtime.desk.dispatch(step.escalation_id, step.decision)
     if step.expect == "dispatched":
         passed = outcome.startswith("decision dispatched")
     else:

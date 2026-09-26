@@ -5,7 +5,7 @@ import line each, so a later move of any of them fails loud here instead of
 going stale.
 """
 
-from broker.master.runtime import CLARIFY_ESCALATION_TIMEOUT_S
+from broker.master.escalation_desk import CLARIFY_ESCALATION_TIMEOUT_S
 from broker.permission.module import PERMISSION_DECISION_TIMEOUT_S
 from broker.protocol.constants import HOOK_SETTINGS_TIMEOUT
 from broker.protocol.constants import HOOK_WAIT_SECONDS

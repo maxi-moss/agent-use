@@ -37,12 +37,9 @@ from broker.llm import (
     call_turn,
     strict_tool,
 )
-from broker.master.payload_render import (
-    render_escalation,
-    render_pane_escalation,
-    render_proposal,
-)
+from broker.master.payload_render import render_proposal
 from broker.master.runtime import MasterRuntime
+from broker.protocol.constants import PaneKind
 
 MAX_TOOL_ROUNDS = 6
 
@@ -165,7 +162,7 @@ _REGISTRY = (
         "Relay the developer's resolution of the active escalation to the "
         "owning session broker, unchanged.",
         DispatchDecisionArgs,
-        lambda rt, a: rt.dispatch(a.escalation_id, a.decision),
+        lambda rt, a: rt.desk.dispatch(a.escalation_id, a.decision),
         "dispatching a decision…",
     ),
     MasterTool(
@@ -177,7 +174,7 @@ _REGISTRY = (
         "not a resolution — use dispatch_decision when the developer actually "
         "decides.",
         ClarifyEscalationArgs,
-        lambda rt, a: rt.clarify_escalation(a.escalation_id, a.question),
+        lambda rt, a: rt.desk.clarify(a.escalation_id, a.question),
         "asking the session about an escalation…",
     ),
     MasterTool(
@@ -398,28 +395,24 @@ class MasterLLM:
                 + self.runtime.registry_summary(),
             }
         ]
-        active = self.runtime.queue.active
-        if active is not None:
+        head = self.runtime.desk.rendered_head()
+        if head is not None:
             blocks.append({"type": "text", "text": "# Active escalation"})
-            # Byte-identical to the runtime rendering — its own block, so
+            # Byte-identical to the desk's rendering — its own block, so
             # nothing is prepended to or reflowed around the broker's words.
-            blocks.append({"type": "text", "text": render_escalation(active)})
-        for prompt in self.runtime.panes.in_session_order():
-            blocks.append(
-                {
-                    "type": "text",
-                    "text": f"# Open {prompt.kind} escalation — session "
-                    + prompt.session_id,
-                }
-            )
-            blocks.append(
-                {
-                    "type": "text",
-                    "text": render_pane_escalation(
-                        prompt, self.runtime.pane_of(prompt.session_id)
-                    ),
-                }
-            )
+            blocks.append({"type": "text", "text": head})
+        for kind in PaneKind:
+            for session_id, rendered in self.runtime.desk.rendered_panes(
+                kind
+            ).items():
+                blocks.append(
+                    {
+                        "type": "text",
+                        "text": f"# Open {kind} escalation — session "
+                        + session_id,
+                    }
+                )
+                blocks.append({"type": "text", "text": rendered})
         for pending in self.runtime.board.pending_proposals():
             blocks.append(
                 {
