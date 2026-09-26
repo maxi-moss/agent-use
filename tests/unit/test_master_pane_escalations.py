@@ -7,11 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from broker.master.pane_escalations import (
-    PaneEscalations,
-    PaneProtocolViolation,
-    PaneStoreError,
-)
+from broker.master.pane_escalations import PaneEscalations, PaneStoreError
 from broker.protocol.schemas import (
     PermissionEscalationPayload,
     QuestionEscalationPayload,
@@ -58,19 +54,29 @@ def store_path(home: Path) -> Path:
     return home / "pane-escalations.json"
 
 
-def test_one_live_pane_escalation_per_session_and_kind(store_path: Path) -> None:
+def test_a_newer_raise_supersedes_only_its_own_session_and_kind(
+    store_path: Path,
+) -> None:
     store = PaneEscalations.load(store_path)
     p1 = permission_pane("p1", "s1")
     p2 = permission_pane("p2", "s2")
-    store.accept(p1)
-    store.accept(p2)
-    with pytest.raises(PaneProtocolViolation):
-        store.accept(permission_pane("p3", "s1"))
     q1 = question_escalation("q1", "s1")
-    store.accept(q1)
-    with pytest.raises(PaneProtocolViolation):
-        store.accept(question_escalation("q2", "s1"))
-    assert store.entries == (p1, p2, q1)
+    assert store.accept(p1) is None
+    assert store.accept(p2) is None
+    assert store.accept(q1) is None
+    p3 = permission_pane("p3", "s1")
+    assert store.accept(p3) is p1
+    q2 = question_escalation("q2", "s1")
+    assert store.accept(q2) is q1
+    assert store.entries == (p2, p3, q2)
+
+
+def test_a_superseded_entry_is_gone_from_the_store_file(store_path: Path) -> None:
+    store = PaneEscalations.load(store_path)
+    store.accept(permission_pane("p1", "s1"))
+    store.accept(permission_pane("p2", "s1"))
+    reloaded = PaneEscalations.load(store_path)
+    assert [p.escalation_id for p in reloaded.entries] == ["p2"]
 
 
 def test_find_names_only_a_live_entry(store_path: Path) -> None:

@@ -27,7 +27,6 @@ from broker.protocol.constants import (
     ASK_USER_QUESTION,
     DECISION_ALLOW,
     DECISION_ESCALATED,
-    NackCode,
 )
 from broker.protocol.schemas import (
     PaneRetractPayload,
@@ -292,10 +291,6 @@ class PermissionModule:
     ) -> None:
         """Retract the escalation this one replaces, then raise this one.
 
-        The two sends are sequential because the master holds one slot per
-        session: overlapping them would let the raise arrive first and be
-        refused for capacity by the very escalation it supersedes.
-
         Args:
             superseded: Escalation being replaced, or ``None`` on a first raise.
             payload: The escalation to raise.
@@ -333,10 +328,6 @@ class PermissionModule:
     ) -> None:
         """Send one permission escalation and release the slot if it is refused.
 
-        A capacity refusal is routine rather than a failure: the session's
-        prompt is already in the pane, so the developer sees the decision
-        either way.
-
         Args:
             payload: The escalation to raise.
         """
@@ -346,18 +337,12 @@ class PermissionModule:
         try:
             if response is not None:
                 nack = parse_nack(response)
-                if nack.reason_code == NackCode.SLOT_OCCUPIED:
-                    logger.info(
-                        "permission escalation %s refused for capacity",
-                        payload.escalation_id,
-                    )
-                else:
-                    logger.error(
-                        "permission escalation %s refused: %s (%s)",
-                        payload.escalation_id,
-                        nack.error,
-                        nack.reason_code,
-                    )
+                logger.error(
+                    "permission escalation %s refused: %s (%s)",
+                    payload.escalation_id,
+                    nack.error,
+                    nack.reason_code,
+                )
         finally:
             # Nothing is waiting with the developer, so the slot must not stay
             # claimed — a later call has to be free to raise.
