@@ -30,6 +30,7 @@ from broker.config import (
 from broker.herdr import driver
 from broker.paths import BrokerPaths
 from broker.master import notifier
+from broker.master.broker_link import adoption_fields, broker_is_listening
 from broker.master.outcome import SessionOutcome, build_outcome
 from broker.master.viewmodel import (
     Attention,
@@ -122,7 +123,6 @@ REQUEST_TIMEOUT_S = 10.0
 CLARIFY_ESCALATION_TIMEOUT_S = 60.0
 STOP_WAIT_S = 10.0
 SOCKET_POLL_S = 0.1
-SOCKET_PROBE_TIMEOUT_S = 2.0
 AGENT_PROBE_TIMEOUT_S = 5.0
 
 # Failures the on-demand status probe absorbs into a warning line: a session
@@ -142,66 +142,6 @@ _ABSORBING = frozenset(
         SessionState.UNMANAGED,
     }
 )
-
-
-async def _broker_is_listening(path: Path) -> bool:
-    """Report whether anything still accepts connections on a session socket.
-
-    Args:
-        path: Session socket to probe.
-
-    Returns:
-        ``True`` when the connection is accepted, and also when the probe
-        itself is inconclusive — an ambiguous result must never read as free.
-    """
-    try:
-        async with asyncio.timeout(SOCKET_PROBE_TIMEOUT_S):
-            _, writer = await asyncio.open_unix_connection(str(path))
-    except TimeoutError:
-        return True  # BEFORE OSError, which TimeoutError subclasses
-    except OSError:
-        return False  # nothing bound, or a stale file refusing connections
-    writer.close()
-    with contextlib.suppress(OSError, ConnectionError):
-        await writer.wait_closed()
-    return True
-
-
-def _adoption_fields(record: SessionRecord) -> AdoptedSession:
-    """Build the block a replacement broker needs to adopt a live session.
-
-    Args:
-        record: Registry record of the session a replacement broker takes over.
-
-    Returns:
-        The pane id, Claude session id and transcript path, all present.
-
-    Raises:
-        ValueError: Any of them is unknown. A broker must never adopt a
-            session it only partly knows.
-    """
-    pane_id = record.pane_id
-    claude_session_id = record.claude_session_id
-    transcript_path = record.transcript_path
-    if not (pane_id and claude_session_id and transcript_path):
-        missing = sorted(
-            field
-            for field, value in (
-                ("pane_id", pane_id),
-                ("claude_session_id", claude_session_id),
-                ("transcript_path", transcript_path),
-            )
-            if not value
-        )
-        raise ValueError(
-            f"session {record.name} cannot be adopted: the registry has no "
-            + ", ".join(missing)
-        )
-    return AdoptedSession(
-        pane_id=pane_id,
-        claude_session_id=claude_session_id,
-        transcript_path=transcript_path,
-    )
 
 
 def _drop_from_fleet(
@@ -266,7 +206,7 @@ async def reconcile_registry(
     warnings: list[str] = []
     for name in registry.names_in_order():
         record = registry.records[name]
-        if await _broker_is_listening(Path(record.socket_path)):
+        if await broker_is_listening(Path(record.socket_path)):
             warnings.append(
                 f"session {name}: broker still answering — left as-is"
             )
@@ -290,7 +230,7 @@ async def reconcile_registry(
             warnings.extend(_drop_from_fleet(registry, queue, panes, name))
             continue
         try:
-            _adoption_fields(record)
+            adoption_fields(record)
         except ValueError as exc:
             warnings.append(
                 f"session {name}: Claude Code still runs but no broker can "
@@ -795,7 +735,7 @@ class MasterRuntime:
         record = self.registry.get(session_id)
         # BEFORE anything is torn down: an unreassignable session must not be
         # left with its old broker killed and no replacement.
-        adopt = _adoption_fields(record)
+        adopt = adoption_fields(record)
         await self.stop_session(session_id)
         record = self.registry.get(session_id)  # KeyError if ended meanwhile
         await self._require_socket_free(record)
@@ -838,7 +778,7 @@ class MasterRuntime:
         """
         record = self.registry.get(session_id)  # KeyError if gone or unknown
         # Every refusal fires before any side effect.
-        adopt = _adoption_fields(record)
+        adopt = adoption_fields(record)
         if record.approved_prompt is None:
             raise ValueError(
                 f"session {session_id} has no persisted approved prompt to "
@@ -847,7 +787,7 @@ class MasterRuntime:
             )
         # One probe, never a poll: nothing was stopped, so waiting cannot
         # free the socket. Anything alive or ambiguous refuses.
-        if await _broker_is_listening(Path(record.socket_path)):
+        if await broker_is_listening(Path(record.socket_path)):
             raise RuntimeError(
                 f"session {session_id}: a broker is still answering on "
                 f"{record.socket_path} — refusing to attach"
@@ -1439,7 +1379,7 @@ class MasterRuntime:
         """
         path = Path(record.socket_path)
         deadline = asyncio.get_running_loop().time() + STOP_WAIT_S
-        while await _broker_is_listening(path):
+        while await broker_is_listening(path):
             if asyncio.get_running_loop().time() >= deadline:
                 raise RuntimeError(
                     f"session {record.name}: a broker is still serving "
