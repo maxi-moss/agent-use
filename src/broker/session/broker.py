@@ -1147,7 +1147,6 @@ class SessionBroker:
                 self.cfg.session_model,
                 intent=self._intent(),
                 events=events,
-                event_name=HookEventName.STOP,
                 last_assistant_message=last_assistant_message,
             )
         if not isinstance(result, EscalateCall):

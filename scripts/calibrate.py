@@ -80,7 +80,6 @@ async def run_questions(cases: list[QuestionCase]) -> None:
                 model_cfg,
                 intent=case.intent,
                 events=[],
-                event_name=case.event_name,
                 last_assistant_message=case.last_message,
             )
             decision = _QUESTION_DECISION.get(type(result), type(result).__name__)

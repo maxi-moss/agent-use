@@ -32,14 +32,10 @@ from broker.permission.classifier import (
     render_suggestions,
 )
 from broker.session.llm_stack import FORCED_ONE, assemble_context
-from broker.session.triage import TRIAGE_TOOLS
+from broker.session.triage import TRIAGE_TOOLS, triage_working_text
 
 _INTENT = "Add OAuth login to the app."
-_WORKING = (
-    "# What just happened\nhook event: Stop\n\n"
-    "# The coding agent's last message (triage THIS)\n"
-    "Where should the token store live?"
-)
+_WORKING = triage_working_text("Where should the token store live?")
 
 
 async def probe_triage() -> None:

@@ -8,17 +8,17 @@ are sent to the model.
 """
 
 from anthropic.types import ToolParam
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
 
 from broker import llm_timing
 from broker import prompts
 from broker.config import SessionModelConfig
-from broker.llm import LLMCaller, LLMCallError, ToolCall, strict_tool
+from broker.llm import LLMCaller, ToolCall, strict_tool
 from broker.session.llm_stack import (
-    FORCED_ONE,
     EscalateCall,
     HasTaskSummary,
     assemble_context,
+    forced_call,
 )
 from broker.transcript.schemas import TranscriptEvent
 
@@ -58,31 +58,28 @@ class NoActionCall(_HasTaskActivity):
 TriageResult = AnswerCall | EscalateCall | CompleteCall | NoActionCall
 
 
-_tool = strict_tool  # derivation lives in broker.llm (neutral module)
-
-
 TRIAGE_TOOLS: list[ToolParam] = [
-    _tool(
+    strict_tool(
         "answer",
         "Answer the coding agent yourself. The `answer` text is typed into the"
         " session verbatim as an instruction. Use when a well-supported answer"
         " follows from the stated intent and the conversation.",
         AnswerCall,
     ),
-    _tool(
+    strict_tool(
         "escalate",
         "Raise the decision to the developer. Use when the situation is"
         " irreversible or high blast-radius, architecturally significant, or"
         " you cannot ground an answer. Every field must carry real analysis.",
         EscalateCall,
     ),
-    _tool(
+    strict_tool(
         "complete",
         "The task is finished. `headline` and `supporting` are shown to the"
         " developer as the outcome; `task_summary` is its final history line.",
         CompleteCall,
     ),
-    _tool(
+    strict_tool(
         "no_action",
         "Nothing needs doing at this turn boundary.",
         NoActionCall,
@@ -99,6 +96,15 @@ _TOOL_MODELS: dict[str, type[TriageResult]] = {
 _TRIAGE_PROMPT = prompts.load("triage")
 
 
+def triage_working_text(last_assistant_message: str) -> str:
+    """Build the working block for a triage call: the message classified THIS turn."""
+    return (
+        "# What just happened\nhook event: Stop\n\n"
+        "# The coding agent's last message (triage THIS)\n"
+        + last_assistant_message
+    )
+
+
 @llm_timing.timed("triage")
 async def triage(
     llm_call: LLMCaller[ToolCall],
@@ -106,7 +112,6 @@ async def triage(
     *,
     intent: str,
     events: list[TranscriptEvent],
-    event_name: str,
     last_assistant_message: str,
 ) -> TriageResult:
     """Classify one turn boundary into exactly one triage tool call.
@@ -120,7 +125,6 @@ async def triage(
         model_cfg: Supplies the model id and the token cap.
         intent: Authoritative task intent, taken from the registry.
         events: Transcript events, as surrounding context.
-        event_name: The hook event that opened this turn boundary.
         last_assistant_message: The coding agent's last message — the text
             being classified.
 
@@ -129,26 +133,17 @@ async def triage(
 
     Raises:
         LLMCallError: The LLM called an unknown tool, or the tool input
-            failed validation.
+            failed validation. Uncaught here; the caller treats this turn
+            boundary as a fatal session error.
     """
-    working = (
-        f"# What just happened\nhook event: {event_name}\n\n"
-        "# The coding agent's last message (triage THIS)\n"
-        + last_assistant_message
-    )
+    working = triage_working_text(last_assistant_message)
     system, messages = assemble_context(_TRIAGE_PROMPT, intent, events, working)
-    call: ToolCall = await llm_call(
-        model=model_cfg.model_id,
-        max_tokens=model_cfg.max_tokens,
+    return await forced_call(
+        llm_call,
+        model_cfg,
         system=system,
         messages=messages,
         tools=TRIAGE_TOOLS,
-        tool_choice=FORCED_ONE,
+        models=_TOOL_MODELS,
+        label="triage",
     )
-    model = _TOOL_MODELS.get(call.name)
-    if model is None:
-        raise LLMCallError(f"unknown triage tool {call.name!r}")
-    try:
-        return model.model_validate(call.input)
-    except ValidationError as exc:
-        raise LLMCallError(f"invalid {call.name} input: {exc}") from exc

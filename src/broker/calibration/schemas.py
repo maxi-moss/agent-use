@@ -19,7 +19,6 @@ class QuestionCase(BaseModel):
     id: str
     intent: str
     last_message: str
-    event_name: str = "Stop"
     expected: Literal["answer", "escalate"]
     rationale: str
 

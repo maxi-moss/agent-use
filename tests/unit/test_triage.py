@@ -76,7 +76,6 @@ async def run_triage(fake: FakeLLM) -> Any:
         MODEL_CFG,
         intent="add a login page using the existing session store",
         events=list(EVENTS),
-        event_name="Stop",
         last_assistant_message="Which auth provider should I use?",
     )
 

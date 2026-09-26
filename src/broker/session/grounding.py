@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Protocol
 
 from anthropic.types import MessageParam, TextBlockParam, ToolParam
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict
 
 from broker import llm_timing
 from broker import prompts
@@ -19,9 +19,9 @@ from broker.index.embedding import OpenAIEmbedder
 from broker.index.render import fit_to_budget, render_relevant_code
 from broker.index.retrieval import retrieve as retrieve_code
 from broker.index.schemas import GroundingContext
-from broker.llm import LLMCaller, LLMCallError, ToolCall, strict_tool
+from broker.llm import LLMCaller, ToolCall, strict_tool
 from broker.paths import BrokerPaths
-from broker.session.llm_stack import FORCED_ONE
+from broker.session.llm_stack import forced_call
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,8 @@ GROUNDING_TOOLS: list[ToolParam] = [
         ProposePromptCall,
     ),
 ]
+
+_TOOL_MODELS: dict[str, type[ProposePromptCall]] = {"propose_prompt": ProposePromptCall}
 
 _GROUNDING_PROMPT = prompts.load("grounding")
 
@@ -101,24 +103,20 @@ async def _propose(
 
     Raises:
         LLMCallError: The LLM called a tool other than ``propose_prompt``, or
-            the tool input failed validation.
+            the tool input failed validation. Uncaught here; the caller
+            aborts the spawn as a fatal session error.
     """
     system: list[TextBlockParam] = [{"type": "text", "text": _GROUNDING_PROMPT}]
     messages: list[MessageParam] = [{"role": "user", "content": "\n\n".join(parts)}]
-    call: ToolCall = await llm_call(
-        model=model_cfg.model_id,
-        max_tokens=model_cfg.max_tokens,
+    return await forced_call(
+        llm_call,
+        model_cfg,
         system=system,
         messages=messages,
         tools=GROUNDING_TOOLS,
-        tool_choice=FORCED_ONE,
+        models=_TOOL_MODELS,
+        label="grounding",
     )
-    if call.name != "propose_prompt":
-        raise LLMCallError(f"unknown grounding tool {call.name!r}")
-    try:
-        return ProposePromptCall.model_validate(call.input)
-    except ValidationError as exc:
-        raise LLMCallError(f"invalid propose_prompt input: {exc}") from exc
 
 
 async def ground_intent(
@@ -144,7 +142,8 @@ async def ground_intent(
     Raises:
         LLMCallError: The grounding call failed or returned the wrong tool.
         Exception: Whatever ``retrieve`` raises — retrieval failures abort
-            grounding; there is no degraded path.
+            grounding; there is no degraded path. Neither is caught here;
+            the caller aborts the spawn as a fatal session error.
     """
     context = await _retrieve(retrieve, intent, cwd)
     relevant_code = render_relevant_code(context)

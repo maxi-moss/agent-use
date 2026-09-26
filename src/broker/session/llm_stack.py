@@ -9,15 +9,20 @@ are sent to the model.
 """
 
 import functools
+from collections.abc import Mapping
+from typing import TypeVar
 
 from anthropic import AsyncAnthropic
-from anthropic.types import MessageParam, TextBlockParam, ToolChoiceParam
-from pydantic import BaseModel, ConfigDict, Field
+from anthropic.types import MessageParam, TextBlockParam, ToolChoiceParam, ToolParam
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from broker.llm import LLMCaller, ToolCall, call_tool
+from broker.config import SessionModelConfig
+from broker.llm import LLMCaller, LLMCallError, ToolCall, call_tool
 from broker.protocol.schemas import Alternative, EscalationDisclosure
 from broker.transcript.adapter import render
 from broker.transcript.schemas import TranscriptEvent
+
+M = TypeVar("M", bound=BaseModel)
 
 
 class HasTaskSummary(BaseModel):
@@ -137,6 +142,52 @@ def assemble_context(
         }
     ]
     return system, messages
+
+
+async def forced_call(
+    llm_call: LLMCaller[ToolCall],
+    model_cfg: SessionModelConfig,
+    *,
+    system: list[TextBlockParam],
+    messages: list[MessageParam],
+    tools: list[ToolParam],
+    models: Mapping[str, type[M]],
+    label: str,
+) -> M:
+    """Make one forced-tool call and validate its input against the chosen tool.
+
+    Args:
+        llm_call: The injected tool-calling seam.
+        model_cfg: Supplies the model id and the token cap.
+        system: Assembled system blocks.
+        messages: Assembled messages.
+        tools: The tool definitions offered; exactly one is forced.
+        models: Maps each offered tool's name to the pydantic model that
+            validates its input.
+        label: Names the call site in the unknown-tool error, e.g. "triage".
+
+    Returns:
+        The validated call model for the tool the LLM chose.
+
+    Raises:
+        LLMCallError: The LLM called a tool absent from ``models``, or the
+            tool input failed validation.
+    """
+    call: ToolCall = await llm_call(
+        model=model_cfg.model_id,
+        max_tokens=model_cfg.max_tokens,
+        system=system,
+        messages=messages,
+        tools=tools,
+        tool_choice=FORCED_ONE,
+    )
+    model = models.get(call.name)
+    if model is None:
+        raise LLMCallError(f"unknown {label} tool {call.name!r}")
+    try:
+        return model.model_validate(call.input)
+    except ValidationError as exc:
+        raise LLMCallError(f"invalid {call.name} input: {exc}") from exc
 
 
 def bind_call_tool(client: AsyncAnthropic) -> LLMCaller[ToolCall]:

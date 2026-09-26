@@ -19,11 +19,11 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from broker import llm_timing
 from broker import prompts
 from broker.config import SessionModelConfig
-from broker.llm import LLMCaller, LLMCallError, ToolCall, strict_tool
+from broker.llm import LLMCaller, ToolCall, strict_tool
 from broker.session.llm_stack import (
-    FORCED_ONE,
     EscalateCall,
     assemble_context,
+    forced_call,
 )
 from broker.transcript.schemas import Question, TranscriptEvent
 
@@ -216,7 +216,8 @@ async def ask_once(
 
     Raises:
         LLMCallError: The LLM called an unknown tool, or the tool input
-            failed validation.
+            failed validation. Uncaught here; ``decide_questions`` escalates
+            the menu to the developer rather than guessing.
     """
     working = (
         "# The coding agent is asking questions via AskUserQuestion "
@@ -228,21 +229,15 @@ async def ask_once(
             "correct this\n" + prior_error
         )
     system, messages = assemble_context(_ASK_PROMPT, intent, events, working)
-    call: ToolCall = await llm_call(
-        model=model_cfg.model_id,
-        max_tokens=model_cfg.max_tokens,
+    return await forced_call(
+        llm_call,
+        model_cfg,
         system=system,
         messages=messages,
         tools=ASK_TOOLS,
-        tool_choice=FORCED_ONE,
+        models=_TOOL_MODELS,
+        label="ask",
     )
-    model = _TOOL_MODELS.get(call.name)
-    if model is None:
-        raise LLMCallError(f"unknown ask tool {call.name!r}")
-    try:
-        return model.model_validate(call.input)
-    except ValidationError as exc:
-        raise LLMCallError(f"invalid {call.name} input: {exc}") from exc
 
 
 async def decide_questions(
@@ -268,6 +263,8 @@ async def decide_questions(
     Raises:
         LLMCallError: An underlying call failed.
         AnswerValidationError: Both attempts produced invalid answers.
+            Neither is caught here; the broker escalates the menu to the
+            developer rather than deliver an unverified answer.
     """
     result = await ask_once(
         llm_call, model_cfg, intent=intent, events=events, questions=questions,
