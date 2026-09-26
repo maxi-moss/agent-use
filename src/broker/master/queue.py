@@ -2,12 +2,15 @@
 
 One escalation is live per session; the head is the one surfaced to the
 developer. Order is the file's list order — every mutation persists before it
-returns, so a pending escalation survives a master restart. Pane
+returns, so a pending escalation survives a master restart. The surfaced and
+in-flight head markers are memory-only: after a restart the head surfaces
+again and the developer re-decides. Pane
 escalations are never queued here: they live in
 ``broker.master.pane_escalations``.
 """
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -25,9 +28,17 @@ class EscalationProtocolViolation(Exception):
     """A session broke the one-outstanding-escalation invariant."""
 
 
+@dataclass(frozen=True, slots=True)
+class ClearedEscalation:
+    """A live entry removed from the queue, and whether the developer saw it."""
+
+    payload: EscalationPayload
+    was_surfaced: bool
+
+
 class EscalationQueue:
     """Persisted strict-FIFO decision-escalation store (accept / retract /
-    resolve / active)."""
+    resolve / active) with the head's surfaced and in-flight markers."""
 
     def __init__(
         self, path: Path, entries: list[EscalationPayload] | None = None
@@ -35,6 +46,8 @@ class EscalationQueue:
         """Hold the queue file path and the payloads loaded from it."""
         self._path = path
         self._entries: list[EscalationPayload] = list(entries or [])
+        self._surfaced_id: str | None = None
+        self._inflight_id: str | None = None
 
     @classmethod
     def load(cls, path: Path) -> "EscalationQueue":
@@ -93,6 +106,39 @@ class EscalationQueue:
         """Return every live entry, head first, as a read-only snapshot."""
         return tuple(self._entries)
 
+    @property
+    def inflight(self) -> str | None:
+        """Return the escalation whose decision is being delivered, or ``None``."""
+        return self._inflight_id
+
+    def take_unsurfaced_head(self) -> EscalationPayload | None:
+        """Mark the head surfaced and return it, unless it already was.
+
+        Returns:
+            The head the developer has not been shown yet, or ``None`` when
+            the queue is empty or its head is already surfaced.
+        """
+        head = self.active
+        if head is None or head.escalation_id == self._surfaced_id:
+            return None
+        self._surfaced_id = head.escalation_id
+        return head
+
+    def mark_inflight(self, escalation_id: str) -> None:
+        """Record that a decision for ``escalation_id`` is being delivered."""
+        self._inflight_id = escalation_id
+
+    def clear_inflight(self, escalation_id: str) -> None:
+        """Drop the in-flight marker if it names ``escalation_id``."""
+        if self._inflight_id == escalation_id:
+            self._inflight_id = None
+
+    def clear_inflight_for_session(self, session_id: str) -> None:
+        """Drop the in-flight marker if it names ``session_id``'s live entry."""
+        for entry in self._entries:
+            if entry.session_id == session_id:
+                self.clear_inflight(entry.escalation_id)
+
     def accept(self, payload: EscalationPayload) -> None:
         """Append ``payload`` to the queue and persist it.
 
@@ -113,23 +159,21 @@ class EscalationQueue:
         self._entries.append(payload)
         self.save()
 
-    def retract(self, escalation_id: str) -> EscalationPayload | None:
+    def retract(self, escalation_id: str) -> ClearedEscalation | None:
         """Clear an escalation its session has withdrawn, wherever it waits.
 
         Args:
             escalation_id: The escalation being withdrawn.
 
         Returns:
-            The cleared payload, or ``None`` when no live entry matched.
+            The cleared entry, or ``None`` when no live entry matched.
         """
         for i, entry in enumerate(self._entries):
             if entry.escalation_id == escalation_id:
-                cleared = self._entries.pop(i)
-                self.save()
-                return cleared
+                return self._pop(i)
         return None
 
-    def resolve(self, escalation_id: str) -> EscalationPayload | None:
+    def resolve(self, escalation_id: str) -> ClearedEscalation | None:
         """Clear an escalation the developer has decided.
 
         Only a matching head is cleared: a stale resolve must be a no-op so a
@@ -139,15 +183,13 @@ class EscalationQueue:
             escalation_id: The escalation that was answered.
 
         Returns:
-            The cleared payload, or ``None`` when it was not the head.
+            The cleared entry, or ``None`` when it was not the head.
         """
         if self._entries and self._entries[0].escalation_id == escalation_id:
-            cleared = self._entries.pop(0)
-            self.save()
-            return cleared
+            return self._pop(0)
         return None
 
-    def retract_for_session(self, session_id: str) -> EscalationPayload | None:
+    def retract_for_session(self, session_id: str) -> ClearedEscalation | None:
         """Clear the live escalation raised by ``session_id``, if any.
 
         Args:
@@ -155,14 +197,22 @@ class EscalationQueue:
                 to be withdrawn.
 
         Returns:
-            The cleared payload, or ``None`` when the session had none live.
+            The cleared entry, or ``None`` when the session had none live.
         """
         for i, entry in enumerate(self._entries):
             if entry.session_id == session_id:
-                cleared = self._entries.pop(i)
-                self.save()
-                return cleared
+                return self._pop(i)
         return None
+
+    def _pop(self, index: int) -> ClearedEscalation:
+        """Remove and persist the entry at ``index``, dropping its markers."""
+        payload = self._entries.pop(index)
+        was_surfaced = payload.escalation_id == self._surfaced_id
+        if was_surfaced:
+            self._surfaced_id = None
+        self.clear_inflight(payload.escalation_id)
+        self.save()
+        return ClearedEscalation(payload, was_surfaced)
 
     def save(self) -> None:
         """Write the in-memory entries back to the queue file."""

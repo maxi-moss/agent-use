@@ -168,7 +168,7 @@ def _drop_from_fleet(
     queued = queue.retract_for_session(name)
     if queued is not None:
         lines.append(
-            f"session {name}: queued escalation {queued.escalation_id} "
+            f"session {name}: queued escalation {queued.payload.escalation_id} "
             "retracted — no decision can reach it"
         )
     for prompt in panes.retract_for_session(name):
@@ -296,11 +296,6 @@ class MasterRuntime:
         self._claude_json = claude_json
         self.queue = queue
         self.panes = panes
-        self._surfaced_id: str | None = None
-        # Escalation whose decision has been dispatched but not yet confirmed
-        # delivered to the pane. Memory-only: an unconfirmed dispatch simply
-        # re-surfaces on restart, and the developer re-decides.
-        self._inflight: str | None = None
         self.paths = BrokerPaths(cfg.broker_home)
         self.master_socket_path = self.paths.master_socket
         self.proposals: dict[str, PendingProposal] = {}
@@ -560,16 +555,14 @@ class MasterRuntime:
         Returns:
             ``None``; a retract is never refused.
         """
-        self._clear_inflight(p.escalation_id)
         cleared = self.queue.retract(p.escalation_id)
         if cleared is not None:
             # Raising it set ESCALATED here; withdrawing it must undo that
             # or the registry outlives the escalation it describes.
             self._set_state(session_id, SessionState.DRIVING)
-        if cleared is not None and cleared.escalation_id == self._surfaced_id:
+        if cleared is not None and cleared.was_surfaced:
             # It was surfaced, so the developer must learn it is no longer
             # live; a waiting entry they never saw retracts silently.
-            self._surfaced_id = None
             self.emit(
                 Notice(
                     f"escalation {p.escalation_id} from session {session_id} "
@@ -695,10 +688,9 @@ class MasterRuntime:
 
     async def _surface_head(self) -> None:
         """Render, announce and notify the queue's head, exactly once."""
-        head = self.queue.active
-        if head is None or head.escalation_id == self._surfaced_id:
+        head = self.queue.take_unsurfaced_head()
+        if head is None:
             return
-        self._surfaced_id = head.escalation_id
         self.emit(
             EscalationArrived(
                 head.session_id,
@@ -976,32 +968,40 @@ class MasterRuntime:
             )
             self.emit(Notice(msg))
             return msg
-        if self._inflight is not None:
+        inflight = self.queue.inflight
+        if inflight is not None:
             # A decision is already on its way to the pane; a second would
             # double-submit the same escalation.
             msg = (
                 f"decision NOT dispatched — a decision for escalation "
-                f"{self._inflight} is already being delivered"
+                f"{inflight} is already being delivered"
             )
             self.emit(Notice(msg))
             return msg
         record = self.registry.get(active.session_id)
-        rejected = await self._deliver(
-            record.socket_path,
-            DispatchDecisionPayload(escalation_id=escalation_id, response=decision),
-            rejection=(
-                f"session {record.name} rejected the dispatched decision "
-                f"for escalation {escalation_id} (stale)"
-            ),
-        )
+        # The ACK only confirms the broker accepted the decision; resolution
+        # waits for T_DECISION_DELIVERED, and until then no second decision
+        # may be dispatched. The marker is set before the send because that
+        # reply can be handled before the ACK returns.
+        self.queue.mark_inflight(escalation_id)
+        try:
+            rejected = await self._deliver(
+                record.socket_path,
+                DispatchDecisionPayload(
+                    escalation_id=escalation_id, response=decision
+                ),
+                rejection=(
+                    f"session {record.name} rejected the dispatched decision "
+                    f"for escalation {escalation_id} (stale)"
+                ),
+            )
+        except BaseException:
+            self.queue.clear_inflight(escalation_id)
+            raise
         if rejected is not None:
+            self.queue.clear_inflight(escalation_id)
             self.emit(Notice(rejected))
             return rejected
-        # The ACK only confirms the broker accepted the decision for
-        # processing. Resolution waits for T_DECISION_DELIVERED confirming it
-        # reached the pane; until then the escalation stays surfaced and no
-        # second decision may be dispatched for it.
-        self._inflight = escalation_id
         self._publish_fleet()
         return f"decision dispatched to session {record.name}"
 
@@ -1032,11 +1032,6 @@ class MasterRuntime:
         self.emit(Notice(msg))
         return msg
 
-    def _clear_inflight(self, escalation_id: str) -> None:
-        """Drop the in-flight dispatch marker if it names ``escalation_id``."""
-        if self._inflight == escalation_id:
-            self._inflight = None
-
     async def _on_decision_delivered(
         self, session_id: str, p: DecisionDeliveredPayload
     ) -> NackPayload | None:
@@ -1049,11 +1044,9 @@ class MasterRuntime:
         Returns:
             ``None``; a delivery report is never refused.
         """
-        self._clear_inflight(p.escalation_id)
         if self.queue.resolve(p.escalation_id) is not None:
             # It was the live head: surface whatever is next. DRIVING is the
             # broker's transition to report; the master never invents it.
-            self._surfaced_id = None
             self._publish_fleet()
             await self._surface_head()
         return None
@@ -1076,8 +1069,8 @@ class MasterRuntime:
         Returns:
             ``None``; a miss report is never refused.
         """
-        self._clear_inflight(p.escalation_id)
         if p.still_live:
+            self.queue.clear_inflight(p.escalation_id)
             self.emit(
                 Notice(
                     f"decision for escalation {p.escalation_id} did NOT reach "
@@ -1086,8 +1079,7 @@ class MasterRuntime:
             )
             return None
         cleared = self.queue.retract(p.escalation_id)
-        if cleared is not None and cleared.escalation_id == self._surfaced_id:
-            self._surfaced_id = None
+        if cleared is not None and cleared.was_surfaced:
             self.emit(
                 Notice(
                     f"escalation {p.escalation_id} from session {session_id} "
@@ -1281,12 +1273,10 @@ class MasterRuntime:
                 await proc.wait()
         self._retract_stranded_pane_escalations(session_id)
         # A hard stop mid-delivery leaves no delivered/undelivered reply to
-        # clear the in-flight marker. Drop it for this session's own head (the
-        # broker escalation is intentionally kept) so a re-dispatch is not
-        # refused as still being delivered.
-        active = self.queue.active
-        if active is not None and active.session_id == session_id:
-            self._clear_inflight(active.escalation_id)
+        # clear the in-flight marker. Drop it for this session's own entry
+        # (the escalation itself is intentionally kept) so a re-dispatch is
+        # not refused as still being delivered.
+        self.queue.clear_inflight_for_session(session_id)
         self._set_state(session_id, SessionState.STOPPED)
         return f"session {session_id} stopped"
 
@@ -1450,12 +1440,9 @@ class MasterRuntime:
         cleared = self.queue.retract_for_session(session_id)
         if cleared is None:
             return
-        self._clear_inflight(cleared.escalation_id)
-        if cleared.escalation_id == self._surfaced_id:
-            self._surfaced_id = None
         self.emit(
             Notice(
-                f"escalation {cleared.escalation_id} from session "
+                f"escalation {cleared.payload.escalation_id} from session "
                 f"{session_id} retracted: its broker is gone"
             )
         )

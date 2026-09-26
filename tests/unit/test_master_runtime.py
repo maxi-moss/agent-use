@@ -1377,6 +1377,32 @@ async def test_second_dispatch_refused_while_inflight(
         await server.wait_closed()
 
 
+async def test_delivery_reply_before_dispatch_ack_leaves_no_inflight_marker(
+    rt: tuple[MasterRuntime, list[Any]], home: Path
+) -> None:
+    runtime, _ = rt
+
+    async def deliver_then_ack(env: Envelope) -> Response:
+        reply = await send(runtime, T_DECISION_DELIVERED, {"escalation_id": "e1"})
+        assert reply.ok
+        return Response(id=env.id, ok=True)
+
+    server = await serve_unix(home / "s" / "s1.sock", deliver_then_ack)
+    try:
+        assert (await send(runtime, T_ESCALATION, escalation_dict("e1"))).ok
+        first = await runtime.dispatch("e1", "go")
+        assert first.startswith("decision dispatched"), first
+        assert runtime.queue.active is None
+        # A marker set after the ACK would name the resolved e1 and refuse
+        # every later dispatch as already being delivered.
+        assert (await send(runtime, T_ESCALATION, escalation_dict("e2"))).ok
+        second = await runtime.dispatch("e2", "go")
+        assert second.startswith("decision dispatched"), second
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
 async def test_fatal_error_retracts_a_live_escalation(
     rt: tuple[MasterRuntime, list[Any]], home: Path
 ) -> None:
