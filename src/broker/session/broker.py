@@ -184,6 +184,15 @@ class _PendingApproval:
 
 
 @dataclass(slots=True)
+class DecisionEscalation:
+    """The one live decision escalation, from its raise until it ends."""
+
+    payload: EscalationPayload
+    user_prompt_baseline: int | None  # None: only a dispatched decision resolves it
+    clarify_tasks: set[asyncio.Task[clarify.ClarifyCall]]
+
+
+@dataclass(slots=True)
 class _OpenMenu:
     """An AskUserQuestion picker the broker left open in the pane."""
 
@@ -271,14 +280,12 @@ class SessionBroker:
         self.jobs: asyncio.Queue[Job] = asyncio.Queue()
         self._run_task: asyncio.Task[None] | None = None
 
-        self._active_escalation: EscalationPayload | None = None
-        self._clarify_tasks: set[asyncio.Task[clarify.ClarifyCall]] = set()
+        self._decision_escalation: DecisionEscalation | None = None
         self._open_menu: _OpenMenu | None = None
         self._ask_decisions: dict[str, AskQuestionDecisionPayload] = {}
         self._ask_expected: dict[str, _InjectedAnswers] = {}
         self._ask_verify_tasks: dict[str, asyncio.Task[None]] = {}
         self._permission_prompt_pending = False
-        self._user_prompt_baseline = 0
         self._last_event_count = -1
 
         self._status_dirty = asyncio.Event()
@@ -765,11 +772,11 @@ class SessionBroker:
             The answer reply, or an ``ok=False`` reply naming why no answer is
             given (escalation not live, resolved under the call, or LLM error).
         """
-        active = self._active_escalation
+        escalation = self._decision_escalation
         if (
             self.state != SessionState.ESCALATED
-            or active is None
-            or active.escalation_id != req.escalation_id
+            or escalation is None
+            or escalation.payload.escalation_id != req.escalation_id
         ):
             return nack_response(
                 env, "escalation no longer live", NackCode.WRONG_STATE
@@ -792,12 +799,12 @@ class SessionBroker:
                 self._llm_call,
                 self.cfg.session_model,
                 intent=self._intent(),
-                escalation=active,
+                escalation=escalation.payload,
                 question=req.question,
                 events=events,
             )
         )
-        self._clarify_tasks.add(task)
+        escalation.clarify_tasks.add(task)
         try:
             with self._activity(PHRASE_CLARIFY):
                 async with asyncio.timeout(CLARIFY_TIMEOUT_S):
@@ -820,14 +827,12 @@ class SessionBroker:
             # Discard only: awaiting `task` forwards this connection task's
             # cancellation — the timeout's included — into it, so it is
             # always finished by the time control reaches here.
-            self._clarify_tasks.discard(task)
-        # Backstop: a fatal error leaves ESCALATED without clearing
-        # _active_escalation, so it would not have cancelled the task.
-        live = self._active_escalation
+            escalation.clarify_tasks.discard(task)
+        # Cancelling a task that already finished is a no-op, so an escalation
+        # ending between the answer and this line still has to drop it.
         if (
             self.state != SessionState.ESCALATED
-            or live is None
-            or live.escalation_id != req.escalation_id
+            or self._decision_escalation is not escalation
         ):
             return resolved
         self._log(DecisionLogKind.CLARIFIED, result.reasoning, result.answer)
@@ -1626,9 +1631,11 @@ class SessionBroker:
             task_summary=task_summary,
             escalation_id=payload.escalation_id,
         )
-        self._active_escalation = payload
-        self._user_prompt_baseline = (
-            _count_user_prompts(events) if events is not None else -1
+        self._end_decision_escalation()
+        self._decision_escalation = DecisionEscalation(
+            payload,
+            _count_user_prompts(events) if events is not None else None,
+            set(),
         )
         self._set_state(SessionState.ESCALATED)  # QUIESCENT until dispatch or retract
         await self._to_master(payload)
@@ -1659,13 +1666,15 @@ class SessionBroker:
         A user prompt beyond the recorded baseline counts as resolution.
         Resolving returns the session to driving.
         """
+        escalation = self._decision_escalation
         if (
             self.state != SessionState.ESCALATED
-            or self._active_escalation is None
-            or self._user_prompt_baseline < 0
+            or escalation is None
+            or escalation.user_prompt_baseline is None
         ):
             return
-        if _count_user_prompts(self._read_transcript()) <= self._user_prompt_baseline:
+        baseline = escalation.user_prompt_baseline
+        if _count_user_prompts(self._read_transcript()) <= baseline:
             return
         await self._retract_decision("resolved in pane", "User answered in the pane")
         await self._note_developer_contact()
@@ -1677,8 +1686,8 @@ class SessionBroker:
             reason: Why it ended; shown to the developer.
             summary: The escalation's Solution line in the outcome history.
         """
-        assert self._active_escalation is not None
-        escalation_id = self._active_escalation.escalation_id
+        assert self._decision_escalation is not None
+        escalation_id = self._decision_escalation.payload.escalation_id
         self._log(
             DecisionLogKind.RETRACTED,
             reason,
@@ -1686,7 +1695,7 @@ class SessionBroker:
             task_summary=summary,
             escalation_id=escalation_id,
         )
-        self._end_active_escalation()
+        self._end_decision_escalation()
         self._set_state(SessionState.DRIVING)
         await self._to_master(
             EscalationRetractPayload(escalation_id=escalation_id, reason=reason)
@@ -1706,8 +1715,8 @@ class SessionBroker:
             decision: The dispatched decision, carrying the escalation id it
                 answers and the response text to submit.
         """
-        active = self._active_escalation
-        if active is None or decision.escalation_id != active.escalation_id:
+        active = self._decision_escalation
+        if active is None or decision.escalation_id != active.payload.escalation_id:
             # The broker has moved past this escalation, so the master should
             # drop its queue entry (still_live=False). Reachable when a master
             # restart re-surfaces an escalation this broker already answered.
@@ -1746,7 +1755,7 @@ class SessionBroker:
                 )
             )
             return
-        self._end_active_escalation()
+        self._end_decision_escalation()
         await self._note_developer_contact()
         self._set_state(SessionState.DRIVING)
         self._log(
@@ -1773,7 +1782,7 @@ class SessionBroker:
         self._log(
             DecisionLogKind.REACTIVATED, "new task in the same session", payload.intent
         )
-        self._end_active_escalation()
+        self._end_decision_escalation()
         await self._note_developer_contact()
         await self._ground_and_submit(payload.intent)
 
@@ -1791,7 +1800,7 @@ class SessionBroker:
             )
             await self._to_master(PromptUndeliveredPayload(detail=str(exc)))
             return
-        if self._active_escalation is not None:
+        if self._decision_escalation is not None:
             await self._retract_decision(
                 "superseded by a developer prompt", "Superseded by a developer prompt"
             )
@@ -1808,16 +1817,19 @@ class SessionBroker:
         """Tell the master the autonomous answer budget stands at ``count``."""
         await self._to_master(BudgetUpdatePayload(count=count))
 
-    def _end_active_escalation(self) -> None:
-        """Clear the active escalation and cancel any clarification bound to it.
+    def _end_decision_escalation(self) -> None:
+        """Clear the live decision escalation and cancel any clarification bound to it.
 
         Every path that ends an escalation (dispatch, out-of-band retract,
-        developer prompt, reactivation) routes here, so an in-flight clarify
-        LLM call can never outlive the escalation it is about.
+        developer prompt, reactivation, a newer raise, a fatal error) routes
+        here, so an in-flight clarify LLM call can never outlive the
+        escalation it is about.
         """
-        self._active_escalation = None
-        for task in self._clarify_tasks:
-            task.cancel()
+        escalation = self._decision_escalation
+        self._decision_escalation = None
+        if escalation is not None:
+            for task in escalation.clarify_tasks:
+                task.cancel()
 
     async def _reconcile(self) -> None:
         """Enqueue reconciliation work on watchdog expiry."""
@@ -1974,6 +1986,7 @@ class SessionBroker:
         """
         logger.error("fatal: %s: %s", error_class, detail)
         self._log(DecisionLogKind.ERROR, error_class, detail)
+        self._end_decision_escalation()
         self._set_state(SessionState.ERROR)
         try:
             await self._to_master(
